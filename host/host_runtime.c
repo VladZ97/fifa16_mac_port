@@ -283,12 +283,24 @@ static void game_alive_or_exit(void) {
         _exit(0);
     }
 }
+/* fifa-hybrid: restoring full access (read && write) never has to be waited for: a late
+ * unprotect only costs the game an extra fault, while the wait was a cross-process round trip
+ * (~0.2 ms) on the GPU command thread for every readback that landed. BB_PROTECT_SYNC_ALL=1
+ * restores the wait. The ring is in order, so a later waited call covers these too. */
+static int protect_sync_all = -1;
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
+    if (protect_sync_all < 0) {
+        const char *e = getenv("BB_PROTECT_SYNC_ALL");
+        protect_sync_all = e && e[0] == '1';
+    }
     pthread_mutex_lock(&protect_lock);
     const uint32_t seq = ++protect_seq;
     const BbGpuProtect record = {{BBGPU_REC_PROTECT, sizeof record}, address, size, (uint32_t)read, (uint32_t)write, seq, 0};
     while (bbgpu_ring_push(g_shared, &g_shared->protect, &record, UINT64_C(1000000000))) game_alive_or_exit();
     pthread_mutex_unlock(&protect_lock);
+    if ((read & 1) && write && !protect_sync_all) {
+        return;
+    }
     for (;;) {
         const uint32_t done = __atomic_load_n(&g_shared->protect_done, __ATOMIC_ACQUIRE);
         if ((int32_t)(done - seq) >= 0) return;

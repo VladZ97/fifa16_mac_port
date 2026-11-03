@@ -125,8 +125,12 @@ ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info
     void* source_texture = image.GetImage();
     const Metal::TextureDesc* source_desc = &desc;
     Metal::TextureDesc twin_desc;
-    const bool twin_view = !image.has_depth && image.depth_twin &&
-                           Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format);
+    // Only views in the promoted depth format (compare sampling: ImageViewInfo promotes R32 to
+    // D32 for T#s flagged is_depth) read the twin. Render-target, storage and plain sampled
+    // views of the R32 image keep the colour texture: R32 counts as "depth compatible", and
+    // redirecting those too sent FIFA's shadow-map pass into the twin (a D32 texture as colour
+    // attachment: nothing was written, the maps stayed at their clear value, no shadows).
+    const bool twin_view = !image.has_depth && image.depth_twin && format == vk::Format::eD32Sfloat;
     if (twin_view) {
         twin_desc = desc;
         twin_desc.pixel_format = Metal::VkToMtl::PixelFormat(vk::Format::eD32Sfloat);

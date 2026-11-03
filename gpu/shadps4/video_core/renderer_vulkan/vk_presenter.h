@@ -113,12 +113,20 @@ public:
     const PresentTiming& LastPresentTiming() const {
         return last_present;
     }
+    /// fifa-hybrid: Metal reports the time a drawable reached the display (presented handler);
+    /// delivered as PastPresentationTimingGOOGLE entries (presentID = present_id,
+    /// actualPresentTime = CLOCK_UPTIME_RAW ns, 0 when the drawable was never shown).
     bool IsDisplayTimingSupported() const {
-        return false;
+        return true;
     }
     std::vector<vk::PastPresentationTimingGOOGLE> TakePastTimings() {
-        return {};
+        std::scoped_lock lock{past_timings_mutex};
+        std::vector<vk::PastPresentationTimingGOOGLE> out;
+        out.swap(past_timings);
+        return out;
     }
+    std::mutex past_timings_mutex;
+    std::vector<vk::PastPresentationTimingGOOGLE> past_timings;
     /// The last presented frame again when it is back in the pool, else null (it is still being
     /// presented, so the screen shows it anyway).
     Frame* PrepareLastFrame();

@@ -122,6 +122,10 @@ inline std::atomic<std::uint64_t> order_waits{0}, order_encoders{0}, order_max_w
 inline std::atomic<std::uint64_t> busy_slot_reuses{0}, busy_motion_slot_reuses{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};
+/// fifa-hybrid: mid-frame command buffer commits (BB_MIDFRAME_FLUSH_MS).
+inline std::atomic<std::uint64_t> midframe_flushes{0};
+/// fifa-hybrid: on-demand image reads served to a buffer on the GPU (BB_ONDEMAND_GPU_BUFREAD).
+inline std::atomic<std::uint64_t> ondemand_gpu_bufreads{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},

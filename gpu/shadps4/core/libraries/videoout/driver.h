@@ -117,6 +117,12 @@ private:
     };
 
     void Flip(const Request& req);
+    /// fifa-hybrid: the flip's completion for the game (status, event, label), at the vblank tick
+    /// with BB_IMMEDIATE_FLIPS (see Flip).
+    void CompleteFlip(const Request& req);
+    static bool AsapFlips();
+    std::mutex deferred_flips_mutex;
+    std::vector<Request> deferred_flips;
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);

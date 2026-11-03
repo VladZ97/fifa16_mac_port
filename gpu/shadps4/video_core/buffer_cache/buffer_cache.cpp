@@ -831,7 +831,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     // fifa-hybrid: a GPU read of memory an on-demand image still owns (the guest reuses render
     // targets as vertex/constant data) would see stale RAM: download the image first.
-    if (!is_written && texture_cache.HasOndemandIn(device_addr, size)) {
+    if (!is_written && texture_cache.HasOndemandIn(device_addr, size) &&
+        texture_cache.HasOndemandOverlapping(device_addr, size)) {
         static const bool vb_log = std::getenv("BB_VB_LOG") != nullptr;
         static int n = 0;
         if (vb_log && n++ < 2000) {
@@ -839,7 +840,42 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                          (unsigned long long)device_addr, size, int(caller));
         }
         static const bool off = std::getenv("BB_RB_NOBUFRESOLVE") != nullptr;
-        if (!off) {
+        // fifa-hybrid: BB_ONDEMAND_GPU_BUFREAD (default on): the image bytes go to the buffer on
+        // the GPU (tiled into staging, copied into the arena range as a GPU write) instead of a
+        // synchronous download to RAM and an upload back (a full GPU drain per read: FIFA reads a
+        // 93x75 RGBA32F image as a buffer twice a frame -> 2.5 ms of GPU bubble a frame). The
+        // bytes still land in guest memory, later, for the CPU (pages stay protected until then).
+        static const bool gpu_read = [] {
+            const char* e = std::getenv("BB_ONDEMAND_GPU_BUFREAD");
+            return !(e && e[0] == '0');
+        }();
+        if (!off && gpu_read) {
+            TextureCache::CpuReadWork work;
+            texture_cache.DownloadImagesForCpuRead(device_addr, size, false, false, &work);
+            if (!work.copies.empty()) {
+                const auto [dst, dst_offset] =
+                    ObtainBuffer(device_addr, size, true, is_texel_buffer, note_use, caller);
+                for (const auto& c : work.copies) {
+                    const VAddr b = std::max<VAddr>(c.addr, device_addr);
+                    const VAddr e = std::min<VAddr>(c.addr + c.size, device_addr + size);
+                    if (e <= b) {
+                        continue;
+                    }
+                    const BufferCopy copy{.src_offset = c.download.offset + (b - c.addr),
+                                          .dst_offset = dst_offset + (b - device_addr),
+                                          .size = e - b};
+                    runtime.CopyBuffer(*c.download.buffer, *dst, std::span{&copy, 1});
+                }
+                BbStats::ondemand_gpu_bufreads.fetch_add(1, std::memory_order_relaxed);
+                work.tick = scheduler.CurrentTick();
+                scheduler.DeferPriorityOperation(
+                    [this, work = std::move(work)]() mutable { texture_cache.FinishCpuReadWork(work); });
+                return {dst, dst_offset};
+            }
+            if (!work.unprotect.empty()) {
+                texture_cache.FinishCpuReadWork(work);
+            }
+        } else if (!off) {
             texture_cache.DownloadImagesForCpuRead(device_addr, size, false, false);
             memory_tracker->InvalidateRegion(device_addr, size, [] {});
         }

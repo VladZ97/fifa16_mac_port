@@ -415,6 +415,24 @@ void TextureCache::LogOndemandWrite(VAddr addr, u64 size) {
     }
 }
 
+bool TextureCache::HasOndemandOverlapping(VAddr addr, u64 size) {
+    std::unique_lock lk{download_images_mutex};
+    if (ondemand_images.empty() || size == 0) {
+        return false;
+    }
+    for (const ImageId id : ondemand_images) {
+        if (!slot_images.is_allocated(id)) {
+            continue;
+        }
+        const Image& image = slot_images[id];
+        if (image.info.guest_address < addr + size &&
+            addr < image.info.guest_address + image.info.guest_size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool TextureCache::HasOndemandIn(VAddr addr, u64 size) {
     std::unique_lock lk{download_images_mutex};
     if ((ondemand_page_refs.empty() && ondemand_page_refs_plain.empty()) || size == 0) {
@@ -672,6 +690,86 @@ void TextureCache::DebugDumpVolume(ImageId image_id) {
 }
 
 std::set<VAddr> g_bb_dump_extra;
+void TextureCache::DepthProbe(VAddr addr) {
+    std::vector<ImageId> ids;
+    ForEachImageInRegion(addr, 4096, [&](ImageId id, Image& image) {
+        if (image.info.guest_address == addr) ids.push_back(id);
+    });
+    for (const ImageId id : ids) {
+        Image& image = slot_images[id];
+        if (!image.backing) continue;
+        const u32 w = image.info.size.width, h = image.info.size.height;
+        const u64 size = u64(w) * h * 4;
+        const auto dl = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16, false);
+        scheduler.EndRendering();
+        const bool depth = image.has_depth;
+        scheduler.Record([src = image.GetImage(), w, h, dst = dl.buffer->Ref(dl.offset), size, depth](Metal::Encoder& e) {
+            if (depth) e.CopyTextureToBuffer(src, 0, 0, {}, {w, h, 1}, dst, w * 4, u32(size), Metal::BlitAspect::Depth);
+            else e.CopyTextureToBuffer(src, 0, 0, {}, {w, h, 1}, dst, w * 4, u32(size));
+        });
+        scheduler.Finish();
+        const float* v = reinterpret_cast<const float*>(dl.mapped);
+        const size_t n = size_t(w) * h, stride = std::max<size_t>(1, n / 65536);
+        double sum = 0; float mn = 1e30f, mx = -1e30f; size_t zeros = 0, cnt = 0, ones = 0;
+        for (size_t i = 0; i < n; i += stride) { const float x = v[i]; sum += x; mn = std::min(mn, x); mx = std::max(mx, x); ++cnt; zeros += x == 0.0f; ones += x >= 1.0f; }
+        std::fprintf(stderr, "[DPROBE] %#llx %ux%u %s depth=%d serial %llu flags %#x: mean %.4f min %.4f max %.4f zero %.1f%% one %.1f%%\n",
+                     (unsigned long long)addr, w, h, vk::to_string(image.info.pixel_format).c_str(), int(depth),
+                     (unsigned long long)image.write_serial, u32(image.flags), cnt ? sum / cnt : 0.0, mn, mx,
+                     cnt ? 100.0 * zeros / cnt : 0.0, cnt ? 100.0 * ones / cnt : 0.0);
+    }
+    if (ids.empty()) std::fprintf(stderr, "[DPROBE] %#llx: no image\n", (unsigned long long)addr);
+}
+
+void TextureCache::TwinWatch() {
+    static const bool on = std::getenv("BB_TWIN_WATCH") != nullptr;
+    if (!on || twin_watch_ids.empty()) {
+        return;
+    }
+    static int round = 0;
+    ++round;
+    auto stats = [](const float* v, size_t n, size_t stride) {
+        double sum = 0; float mn = 1e30f, mx = -1e30f; size_t zeros = 0, cnt = 0, ones = 0;
+        for (size_t i = 0; i < n; i += stride) {
+            const float x = v[i];
+            sum += x; mn = std::min(mn, x); mx = std::max(mx, x); ++cnt;
+            zeros += x == 0.0f; ones += x >= 1.0f;
+        }
+        return fmt::format("mean {:.4f} min {:.4f} max {:.4f} zero {:.1f}% one {:.1f}%", cnt ? sum / cnt : 0.0, mn, mx,
+                           cnt ? 100.0 * zeros / cnt : 0.0, cnt ? 100.0 * ones / cnt : 0.0);
+    };
+    for (size_t k = 0; k < twin_watch_ids.size();) {
+        Image* image = TryGetImage(twin_watch_ids[k].first, twin_watch_ids[k].second);
+        if (!image || !image->depth_twin || !image->backing) {
+            std::fprintf(stderr, "[TWINWATCH] r%d entry %zu gone (image %p)\n", round, k, (void*)image);
+            twin_watch_ids.erase(twin_watch_ids.begin() + k);
+            continue;
+        }
+        const u32 w = image->info.size.width, h = image->info.size.height;
+        const u64 size = u64(w) * h * 4;
+        std::array<vk::BufferImageCopy, 1> copies{vk::BufferImageCopy{
+            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+            .imageExtent = {w, h, 1},
+        }};
+        const auto dl = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16, false);
+        copies[0].bufferOffset = dl.offset;
+        const u64 serial_before = image->write_serial, synced_before = image->depth_twin_synced;
+        runtime.DownloadImage(image, dl.buffer, copies);
+        const auto tdl = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16, false);
+        scheduler.Record([src = image->depth_twin.Get(), w, h, dst = tdl.buffer->Ref(tdl.offset), size](Metal::Encoder& e) {
+            e.CopyTextureToBuffer(src, 0, 0, {}, {w, h, 1}, dst, w * 4, u32(size), Metal::BlitAspect::Depth);
+        });
+        scheduler.Finish();
+        const size_t n = size_t(w) * h, stride = std::max<size_t>(1, n / 65536);
+        std::fprintf(stderr, "[TWINWATCH] r%d %#llx %ux%u serial %llu synced %llu flags %#x | src %s | twin %s\n", round,
+                     (unsigned long long)image->info.guest_address, w, h, (unsigned long long)serial_before,
+                     (unsigned long long)synced_before, u32(image->flags),
+                     stats(reinterpret_cast<const float*>(dl.mapped), n, stride).c_str(),
+                     stats(reinterpret_cast<const float*>(tdl.mapped), n, stride).c_str());
+        ++k;
+    }
+    std::fflush(stderr);
+}
+
 void TextureCache::DebugDumpTexture(ImageId image_id, bool shadowed) {
     // debug: BB_DUMP_TEXTURES=<dir> writes mip 0 of sampled 2D textures as the GPU holds them.
     static const char* textures_dir = std::getenv("BB_DUMP_TEXTURES");
@@ -1871,6 +1969,16 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         desc.info.props.is_depth && !twin_image.has_depth && DepthTwinEnabled() &&
         twin_image.DepthTwinEligible()) {
         runtime.SyncDepthTwin(&twin_image);
+        if (static const bool watch = std::getenv("BB_TWIN_WATCH") != nullptr; watch && twin_image.depth_twin) {
+            const std::pair<ImageId, u64> key{image_id, twin_image.image_uid};
+            if (std::ranges::find(twin_watch_ids, key) == twin_watch_ids.end()) {
+                twin_watch_ids.push_back(key);
+                std::fprintf(stderr, "[TWINWATCH] registered %#llx %ux%u serial %llu flags %#x\n",
+                             (unsigned long long)twin_image.info.guest_address, twin_image.info.size.width,
+                             twin_image.info.size.height, (unsigned long long)twin_image.write_serial,
+                             u32(twin_image.flags));
+            }
+        }
     }
 
     Image& image = slot_images[image_id];

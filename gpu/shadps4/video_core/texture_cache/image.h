@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
@@ -151,6 +153,9 @@ public:
     Metal::Object depth_twin;
     u64 depth_twin_synced = ~u64{0};
     u64 write_serial = 1; // read from the fault thread too (a stale read only costs a download)
+    /// fifa-hybrid diagnostics (BB_TWIN_WATCH): why write_serial moved since the last probe.
+    u32 diag_rt_writes = 0, diag_uploads = 0, diag_other_writes = 0;
+    std::chrono::steady_clock::time_point diag_last_probe{};
     /// fifa-hybrid: on-demand readback prefetch. Large GPU-written images awaiting a CPU read
     /// fault are also downloaded asynchronously right after their write; `prefetch_landed` holds
     /// the write_serial whose bytes reached guest memory (0 none). A fault that finds it equal

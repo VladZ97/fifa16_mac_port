@@ -226,9 +226,8 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         return (*slot_image_views)[view_id];
     }
     // fifa-hybrid: a depth view of a colour image is made on its D32 twin (created here if new).
-    if (!has_depth && DepthTwinEligible() &&
-        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(view_info.format)) {
-        runtime->SyncDepthTwin(this);
+    if (!has_depth && DepthTwinEligible() && view_info.format == vk::Format::eD32Sfloat) {
+        runtime->SyncDepthTwin(this); // (only the promoted depth format: see ImageView::ImageView)
     }
     if (const u32 needed = NeededUsage(view_info)) {
         if (Vulkan::BindHelper::OnHelper()) {

@@ -417,6 +417,9 @@ struct SpikeCounters {
     }
 };
 
+// fifa-hybrid latency stats (BB_FRAME_STATS=1): per-window sums of each stage of the flip path
+// (ns): game flip call -> host arrival -> flip packet -> queued -> flip -> submitted -> display.
+std::atomic<u64> lat_stage_ns[6], lat_stage_n;
 std::atomic<u32> spikes_game, spikes_flip, spikes_present, spikes_display, spikes_printed,
     frames_not_displayed;
 /// vkQueuePresent to the screen (display timing), for the 5 s summary.
@@ -536,6 +539,17 @@ public:
 
 private:
     void Evaluate(const FrameTrace& t) {
+        if (t.game_ns && t.arrival_ns >= t.game_ns && t.flip_packet_ns >= t.arrival_ns &&
+            t.queued_ns >= t.flip_packet_ns && t.flip_ns >= t.queued_ns &&
+            t.present.submitted >= t.flip_ns) {
+            lat_stage_ns[0] += t.arrival_ns - t.game_ns;
+            lat_stage_ns[1] += t.flip_packet_ns - t.arrival_ns;
+            lat_stage_ns[2] += t.queued_ns - t.flip_packet_ns;
+            lat_stage_ns[3] += t.flip_ns - t.queued_ns;
+            lat_stage_ns[4] += t.present.submitted - t.flip_ns;
+            lat_stage_ns[5] += t.display_ns > t.present.submitted ? t.display_ns - t.present.submitted : 0;
+            ++lat_stage_n;
+        }
         if (t.display_ns > t.present.presented && t.present.presented) {
             const u64 latency = t.display_ns - t.present.presented;
             latency_sum_ns.fetch_add(latency, std::memory_order_relaxed);
@@ -1008,6 +1022,18 @@ void VideoOutDriver::Flip(const Request& req) {
                             latency_sum_ns.exchange(0) / 1e6 / double(latency_frames),
                             latency_max_ns.exchange(0) / 1e6);
                 spike_counters.Rebase();
+                if (const u64 n = lat_stage_n.exchange(0)) {
+                    double st[6];
+                    for (int i = 0; i < 6; ++i) st[i] = lat_stage_ns[i].exchange(0) / 1e6 / double(n);
+                    std::printf("Latency (flip call -> on screen, mean of %llu frames): %.1f ms = "
+                                "game->host %.2f + host->flip packet %.2f + frame prep %.2f + queued "
+                                "%.2f + flip->submitted %.2f + submitted->display %.2f | flip_rate %u, "
+                                "midframe flushes %llu, gpu bufreads %llu\n",
+                                static_cast<unsigned long long>(n), st[0] + st[1] + st[2] + st[3] + st[4] + st[5],
+                                st[0], st[1], st[2], st[3], st[4], st[5], u32(main_port.flip_rate),
+                                static_cast<unsigned long long>(BbStats::midframe_flushes.exchange(0)),
+                                static_cast<unsigned long long>(BbStats::ondemand_gpu_bufreads.exchange(0)));
+                }
             }
             intervals.clear();
             window_start = now;
@@ -1016,6 +1042,24 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
+    // fifa-hybrid: BB_IMMEDIATE_FLIPS presents on arrival but completes the flip for the game at
+    // the next vblank tick (flip status, flip event, buffer label): the picture is on screen as
+    // early as possible while the game keeps the PS4's 60 Hz cadence (free-running completion
+    // made it render ~88 frames a second).
+    if (AsapFlips()) {
+        std::scoped_lock lk{deferred_flips_mutex};
+        deferred_flips.push_back(req);
+        return;
+    }
+    CompleteFlip(req);
+}
+
+bool VideoOutDriver::AsapFlips() {
+    static const bool asap = [] { const char* e = std::getenv("BB_IMMEDIATE_FLIPS"); return e && e[0] == '1'; }();
+    return asap;
+}
+
+void VideoOutDriver::CompleteFlip(const Request& req) {
     // Update flip status.
     auto* port = req.port;
     {
@@ -1182,7 +1226,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     // bbport: with a frame limit (uncapped presets) a queued flip is presented as soon as it
     // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    const bool immediate_flips = frame_limit != 0;
+    // fifa-hybrid: BB_IMMEDIATE_FLIPS=1 presents each flip the moment it arrives without the
+    // frame-limit slot pacing (ProMotion shows it at the next adaptive refresh).
+    const bool asap_flips = AsapFlips();
+    const bool immediate_flips = frame_limit != 0 || asap_flips;
 
     while (!token.stop_requested()) {
         timer.Start();
@@ -1197,7 +1244,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || now >= next_flip;
+        const bool flip_slot = !frame_limit || asap_flips || now >= next_flip;
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
@@ -1247,7 +1294,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             BbSplit::Post(&event);
         }
 
-        if (!immediate_flips || main_port.flip_rate != 0) {
+        if (asap_flips) {
+            // One completion per vblank tick: the game paces at exactly the vblank rate even when
+            // it queued two flips (completing both at once produced 60-80 ms hitches).
+            Request done{};
+            {
+                std::scoped_lock lk{deferred_flips_mutex};
+                if (!deferred_flips.empty()) {
+                    done = deferred_flips.front();
+                    deferred_flips.erase(deferred_flips.begin());
+                }
+            }
+            if (done) {
+                CompleteFlip(done);
+            }
+        }
+        if (!immediate_flips || (main_port.flip_rate != 0 && !asap_flips)) {
             timer.End();
             continue;
         }
@@ -1259,7 +1321,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     break; // next vblank
                 }
             }
-            if (std::chrono::steady_clock::now() < next_flip) {
+            if (!asap_flips && std::chrono::steady_clock::now() < next_flip) {
                 if (next_flip >= tick_deadline) {
                     break;
                 }

@@ -53,6 +53,8 @@ bool BbArenaSource(uintptr_t copy, u64* guest, u64* bytes);
 void BbArenaVerify(uintptr_t copy);
 }
 
+namespace Vulkan { bool BbSeqWindow(); extern std::atomic<u64> g_bb_draw_seq; }
+
 namespace AmdGpu {
 
 static const char* dcb_task_name{"DCB_TASK"};
@@ -570,10 +572,36 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 } // namespace
 
+// fifa-hybrid: a pending fence stays listed until its label holds the value: the pipe reaching
+// the packet is not the write (the recording thread signals it later, SignalAfterHostCopies), and
+// a WaitRegMem that found no pending entry spun on stale memory until the recorder caught up
+// (FIFA: ~9 dispatch+fence+wait sequences a frame, each a command-processor stall and a GPU
+// bubble). BB_FENCE_PIPE_POSITION=1 restores the position-based list.
+static bool FencePositionMode() {
+    static const bool v = [] { const char* e = std::getenv("BB_FENCE_PIPE_POSITION"); return e && e[0] == '1'; }();
+    return v;
+}
+static bool LabelHolds(VAddr address, u64 data, u32 num_bytes) {
+    u64 now = 0;
+    std::memcpy(&now, reinterpret_cast<const void*>(address), std::min<u32>(num_bytes, sizeof(now)));
+    const u64 mask = num_bytes >= 8 ? ~0ull : ((1ull << (num_bytes * 8)) - 1);
+    return (now & mask) == (data & mask);
+}
+
 void Liverpool::NotePendingFences(const auto& event) {
     const u64 position = rasterizer->DrawPipeHead();
-    while (!pending_fences.empty() && rasterizer->DrawPipeReached(pending_fences.front().position)) {
-        pending_fences.pop_front();
+    if (FencePositionMode()) {
+        while (!pending_fences.empty() && rasterizer->DrawPipeReached(pending_fences.front().position)) {
+            pending_fences.pop_front();
+        }
+    } else {
+        while (!pending_fences.empty() &&
+               (pending_fences.size() > 4096 ||
+                (rasterizer->DrawPipeReached(pending_fences.front().position) &&
+                 LabelHolds(pending_fences.front().address, pending_fences.front().data,
+                            pending_fences.front().num_bytes)))) {
+            pending_fences.pop_front();
+        }
     }
     constexpr bool is_eop = requires { event.SignalFence([](void*, u64, u32) {}, [] {}); };
     const auto note = [&](void* address, u64 data, u32 num_bytes) {
@@ -601,7 +629,7 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) {
-        if (rasterizer->DrawPipeReached(it->position)) {
+        if (FencePositionMode() && rasterizer->DrawPipeReached(it->position)) {
             break; // written already: memory holds it (or a later write)
         }
         if (address >= it->address && address + sizeof(u32) <= it->address + it->num_bytes) {
@@ -1426,6 +1454,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (Vulkan::BbSeqWindow()) {
+                    std::fprintf(stderr, "[SEQ] %llu gfx-eop %#llx data %#llx\n", (unsigned long long)Vulkan::g_bb_draw_seq.load(),
+                                 (unsigned long long)reinterpret_cast<uintptr_t>(event_eop->Address<u32>()), (unsigned long long)event_eop->DataQWord());
+                }
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
@@ -1515,6 +1547,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                if (Vulkan::BbSeqWindow() && wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                    u32 pv = 0; const bool pend = PendingFenceValue(wait_reg_mem->Address<VAddr>(), pv);
+                    std::fprintf(stderr, "[SEQ] %llu gfx-wait %#llx ref %#x mask %#x func %u now %#x pending %d/%#x met %d\n",
+                                 (unsigned long long)Vulkan::g_bb_draw_seq.load(), (unsigned long long)wait_reg_mem->Address<VAddr>(),
+                                 wait_reg_mem->ref, wait_reg_mem->mask, u32(wait_reg_mem->function.Value()),
+                                 *wait_reg_mem->Address<u32*>(), int(pend), pv, int(wait_reg_mem->Test(regs.reg_array)));
+                }
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
@@ -1893,6 +1932,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
+            if (Vulkan::BbSeqWindow()) {
+                std::fprintf(stderr, "[SEQ] %llu asc%u-dispatch-parsed\n", (unsigned long long)Vulkan::g_bb_draw_seq.load(), vqid);
+            }
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),
                                     [&] { rasterizer->DispatchDirect(); });
@@ -1949,8 +1991,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            const bool seqlog = Vulkan::BbSeqWindow();
+            if (seqlog && wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                std::fprintf(stderr, "[SEQ] %llu asc%u-wait %#llx ref %#x mask %#x func %u now %#x met %d\n",
+                             (unsigned long long)Vulkan::g_bb_draw_seq.load(), vqid, (unsigned long long)wait_reg_mem->Address<VAddr>(),
+                             wait_reg_mem->ref, wait_reg_mem->mask, u32(wait_reg_mem->function.Value()),
+                             *wait_reg_mem->Address<u32*>(), int(wait_reg_mem->Test(regs.reg_array)));
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
+            }
+            if (seqlog && wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                std::fprintf(stderr, "[SEQ] %llu asc%u-wait-done %#llx\n", (unsigned long long)Vulkan::g_bb_draw_seq.load(), vqid,
+                             (unsigned long long)wait_reg_mem->Address<VAddr>());
             }
             break;
         }
@@ -1964,6 +2017,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+            }
+            if (Vulkan::BbSeqWindow()) {
+                std::fprintf(stderr, "[SEQ] %llu asc%u-release %#llx data %#llx\n", (unsigned long long)Vulkan::g_bb_draw_seq.load(), vqid,
+                             (unsigned long long)release_mem->Address<u64>(), (unsigned long long)release_mem->DataQWord());
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

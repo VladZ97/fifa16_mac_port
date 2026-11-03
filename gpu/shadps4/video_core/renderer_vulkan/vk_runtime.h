@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -17,6 +18,12 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
+
+namespace Vulkan {
+/// fifa-hybrid diagnostics: draw/dispatch record counter and the BB_SEQ_AT=<s> one-second window.
+extern std::atomic<u64> g_bb_draw_seq;
+bool BbSeqWindow();
+} // namespace Vulkan
 
 namespace VideoCore {
 class BlitHelper;

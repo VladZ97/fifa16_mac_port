@@ -124,8 +124,10 @@ public:
     /// completed (also on error).
     /// `min_duration` > 0 (seconds): presentDrawable:afterMinimumDuration: (the previous drawable
     /// stays on screen at least that long), for even frame pacing on variable-refresh displays.
+    /// `on_presented` (fifa-hybrid latency stats): called from the drawable's presented handler
+    /// with the time it reached the display (CLOCK_UPTIME_RAW ns; 0 when it was never shown).
     void Commit(void* command_buffer, void* drawable, std::function<void()> on_complete,
-                double min_duration = 0);
+                double min_duration = 0, std::function<void(u64)> on_presented = {});
     /// Blocks until nothing is in flight.
     void WaitIdle();
     /// Blocks until nothing is in flight or `milliseconds` passed; true when idle.

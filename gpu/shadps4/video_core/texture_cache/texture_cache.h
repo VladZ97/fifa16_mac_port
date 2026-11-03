@@ -131,6 +131,12 @@ public:
     /// Diagnostics (BB_DUMP_VOLUMES): sync readback of a GPU-written volume to a file.
     void DebugDumpVolume(ImageId image_id);
     void DebugDumpTexture(ImageId image_id, bool shadowed = false);
+    /// fifa-hybrid diagnostics (BB_TWIN_WATCH=1): every 2 s, downloads each image that has a depth
+    /// twin and its twin, and logs [TWINWATCH] value statistics of both (dark-players hunt).
+    void TwinWatch();
+    /// fifa-hybrid diagnostics (BB_DEPTH_PROBE=<hex>): [DPROBE] value statistics of the depth image at addr.
+    void DepthProbe(VAddr addr);
+    std::vector<std::pair<ImageId, u64>> twin_watch_ids;
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -389,6 +395,10 @@ public:
     void DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write, bool have_lock,
                                   CpuReadWork* work = nullptr);
     void FinishCpuReadWork(CpuReadWork& work);
+    /// fifa-hybrid: whether an on-demand image's own bytes overlap [addr, addr + size): what a
+    /// GPU buffer read needs (HasOndemandIn is per page: a 40 KB constant buffer 128 bytes past a
+    /// 93x75 image on the same page made FIFA download that image every frame).
+    bool HasOndemandOverlapping(VAddr addr, u64 size);
     /// fifa-hybrid: resolves the pending on-demand images a CPU access touches without any GPU
     /// work when each one's prefetched download already landed in guest memory (or it was never
     /// GPU-modified): their watchers are lifted. False when one still needs the download.

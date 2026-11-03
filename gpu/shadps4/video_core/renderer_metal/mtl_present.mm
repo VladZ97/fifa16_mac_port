@@ -280,8 +280,16 @@ void PresentQueue::WaitForDeviceTick(void* command_buffer, u64 device_tick) {
 }
 
 void PresentQueue::Commit(void* command_buffer, void* drawable,
-                          std::function<void()> on_complete, double min_duration) {
+                          std::function<void()> on_complete, double min_duration,
+                          std::function<void(u64)> on_presented) {
     id<MTLCommandBuffer> cmd = (__bridge_transfer id<MTLCommandBuffer>)command_buffer;
+    if (drawable != nullptr && on_presented) {
+        // fifa-hybrid: the time the drawable was shown (presentedTime is CACurrentMediaTime
+        // based = CLOCK_UPTIME_RAW seconds), 0 when it was dropped.
+        [(__bridge id<CAMetalDrawable>)drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+          on_presented(u64(shown.presentedTime * 1e9));
+        }];
+    }
     if (drawable != nullptr && min_duration > 0) {
         [cmd presentDrawable:(__bridge id<CAMetalDrawable>)drawable
             afterMinimumDuration:min_duration];

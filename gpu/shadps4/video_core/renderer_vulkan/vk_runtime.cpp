@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <dlfcn.h>
 #include <array>
 #include <mutex>
 #include <string>
@@ -353,10 +354,30 @@ void Runtime::FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32
     AccessBuffer(&dst, offset, size, true);
 }
 
+std::atomic<u64> g_bb_draw_seq{0};
+static const auto g_bb_seq_t0 = std::chrono::steady_clock::now();
+bool BbSeqWindow() {
+    static const char* at = std::getenv("BB_SEQ_AT");
+    if (!at) return false;
+    static const double t_at = std::atof(at);
+    static const auto t0 = g_bb_seq_t0; // library load (the first call may be late in the match)
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return t >= t_at && t < t_at + 1.0;
+}
+
 void Runtime::AccessImage(VideoCore::Image* image, bool write) {
     BeforeImageAccess();
     if (write) {
         ++image->write_serial;
+        ++image->diag_other_writes; // (RT binds and uploads count themselves and subtract)
+        if (image->info.size.width == 2048 && image->info.pixel_format == vk::Format::eR32Sfloat && BbSeqWindow()) {
+            Dl_info info{};
+            void* ret = __builtin_return_address(0);
+            dladdr(ret, &info);
+            std::fprintf(stderr, "[SEQ] %llu access-write %#llx from %s+%#llx\n", (unsigned long long)g_bb_draw_seq.load(),
+                         (unsigned long long)image->info.guest_address, info.dli_sname ? info.dli_sname : "?",
+                         (unsigned long long)(reinterpret_cast<uintptr_t>(ret) - reinterpret_cast<uintptr_t>(info.dli_saddr)));
+        }
     }
     if (scene_targets) {
         scene_targets->NativeAccess(*image, write);
@@ -566,6 +587,7 @@ void Runtime::CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     ++dst->write_serial; // fifa-hybrid: the depth twin re-syncs
+    ++dst->diag_uploads;
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
@@ -986,6 +1008,11 @@ void Runtime::SyncDepthTwin(VideoCore::Image* image) {
         }
         LOG_INFO(Render_Vulkan, "depth twin for R32 image {:#x} {}x{} levels {}",
                  image->info.guest_address, sd.width, sd.height, sd.levels);
+        if (static const bool watch = std::getenv("BB_TWIN_WATCH") != nullptr; watch) {
+            std::fprintf(stderr, "[TWINWATCH] twin created for %#llx %ux%u serial %llu flags %#x\n",
+                         (unsigned long long)image->info.guest_address, sd.width, sd.height,
+                         (unsigned long long)image->write_serial, u32(image->flags));
+        }
     }
     scheduler.EndRendering();
     AccessImage(image, false);
@@ -1010,6 +1037,45 @@ void Runtime::SyncDepthTwin(VideoCore::Image* image) {
         }
     }
     image->depth_twin_synced = image->write_serial;
+    if (sd.width == 2048 && BbSeqWindow()) {
+        std::fprintf(stderr, "[SEQ] %llu sync %#llx serial %llu\n", (unsigned long long)g_bb_draw_seq.load(),
+                     (unsigned long long)image->info.guest_address, (unsigned long long)image->write_serial);
+    }
+    // fifa-hybrid diagnostics (BB_TWIN_WATCH=1): every 2 s per image, right after the sync:
+    // value statistics of the source and the twin, and what moved write_serial since the last probe.
+    if (static const bool watch = std::getenv("BB_TWIN_WATCH") != nullptr; watch) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - image->diag_last_probe >= std::chrono::seconds(2)) {
+            image->diag_last_probe = now;
+            const u32 w = sd.width, h = sd.height;
+            const u64 size = u64(w) * h * 4;
+            const auto dl = staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, false);
+            const auto tdl = staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, false);
+            scheduler.Record([src = image->GetImage(), twin = image->depth_twin.Get(), w, h, size,
+                              d1 = dl.buffer->Ref(dl.offset), d2 = tdl.buffer->Ref(tdl.offset)](Metal::Encoder& e) {
+                e.CopyTextureToBuffer(src, 0, 0, {}, {w, h, 1}, d1, w * 4, u32(size));
+                e.CopyTextureToBuffer(twin, 0, 0, {}, {w, h, 1}, d2, w * 4, u32(size), Metal::BlitAspect::Depth);
+            });
+            scheduler.Finish();
+            auto stats = [](const float* v, size_t n, size_t stride) {
+                double sum = 0; float mn = 1e30f, mx = -1e30f; size_t zeros = 0, cnt = 0, ones = 0;
+                for (size_t i = 0; i < n; i += stride) {
+                    const float x = v[i];
+                    sum += x; mn = std::min(mn, x); mx = std::max(mx, x); ++cnt;
+                    zeros += x == 0.0f; ones += x >= 1.0f;
+                }
+                return fmt::format("mean {:.4f} min {:.4f} max {:.4f} zero {:.1f}% one {:.1f}%", cnt ? sum / cnt : 0.0, mn, mx,
+                                   cnt ? 100.0 * zeros / cnt : 0.0, cnt ? 100.0 * ones / cnt : 0.0);
+            };
+            const size_t n = size_t(w) * h, stride = std::max<size_t>(1, n / 65536);
+            std::fprintf(stderr, "[TWINWATCH] sync %#llx %ux%u serial %llu flags %#x since last: rt %u up %u other %u | src %s | twin %s\n",
+                         (unsigned long long)image->info.guest_address, w, h, (unsigned long long)image->write_serial,
+                         u32(image->flags), image->diag_rt_writes, image->diag_uploads,
+                         image->diag_other_writes - image->diag_rt_writes - image->diag_uploads, stats(reinterpret_cast<const float*>(dl.mapped), n, stride).c_str(),
+                         stats(reinterpret_cast<const float*>(tdl.mapped), n, stride).c_str());
+            image->diag_rt_writes = image->diag_uploads = image->diag_other_writes = 0;
+        }
+    }
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {

@@ -23,6 +23,7 @@
 #include "video_core/renderer_metal/mtl_texture.h"
 #include "video_core/renderer_metal/vk_to_mtl.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -266,6 +267,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Flush frame creation commands.
     frame->ready_tick = draw_scheduler.CurrentTick();
     const u64 flush_start = bbport::CpuCycles();
+    // fifa-hybrid: the GPU profiler's frame boundary (NoteFrameStart only runs with the motion
+    // passes on, which FIFA has off): one frame per guest flip.
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->BeginFrame();
+    }
     draw_scheduler.Flush();
     const u64 flush_end = bbport::CpuCycles();
     BbStats::flip_submit_ns.fetch_add(bbport::CyclesToNs(flush_end - flush_start),
@@ -383,7 +389,7 @@ double PacingSeconds() {
 }
 } // namespace
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u32) {
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u32 present_id) {
     last_present = {NowNs(), 0, 0, 0};
     // nextDrawable and the present passes create autoreleased objects, and this thread
     // (bb:Present) has no pool of its own: without one, drawables never return to the layer.
@@ -456,7 +462,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                         std::fflush(stdout);
                     }).detach();
                 }
-            }, PacingSeconds());
+            }, PacingSeconds(),
+            present_id ? std::function<void(u64)>([this, present_id](u64 shown_ns) {
+                std::scoped_lock lock{past_timings_mutex};
+                if (past_timings.size() < 1024) {
+                    past_timings.push_back(vk::PastPresentationTimingGOOGLE{
+                        .presentID = present_id, .desiredPresentTime = 0,
+                        .actualPresentTime = shown_ns, .earliestPresentTime = 0, .presentMargin = 0});
+                }
+            }) : std::function<void(u64)>{});
         last_present.submitted = NowNs();
         last_present.presented = last_present.submitted;
     });

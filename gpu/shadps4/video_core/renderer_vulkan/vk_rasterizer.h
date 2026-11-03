@@ -326,6 +326,10 @@ private:
     void NoteFrameStart();
     /// BB_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
     void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
+    /// fifa-hybrid: BB_MIDFRAME_FLUSH_MS=<ms>: at a render-pass change, commits the command buffer
+    /// recorded so far when at least <ms> passed since the last commit (the GPU starts the frame
+    /// while the rest is still being recorded: lower flip-to-display latency).
+    void MidFrameFlush(const RenderState& state);
     /// bbport: obtains the draw's vertex streams (vertex_binds) and index buffer (index_bind);
     /// the draw binds them in its recorded command (bindings do not survive a submission).
     void ResolveVertexBuffers(const GraphicsPipeline* pipeline,
