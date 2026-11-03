@@ -123,7 +123,7 @@ private:
     static bool AsapFlips();
     std::mutex deferred_flips_mutex;
     std::vector<Request> deferred_flips;
-    bool complete_now = false; ///< fifa-hybrid: a slow frame's flip completes at once (PresentThread)
+    bool complete_now = false; ///< fifa-hybrid: the tick path's flip completes at once (PresentThread)
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);

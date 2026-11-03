@@ -1196,6 +1196,33 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     request_cv.notify_one();
 }
 
+// fifa-hybrid (BB_IMMEDIATE_FLIPS): the recent flip cadence decides the present path. Fast frames
+// (four-frame average receive gap <= BB_IMMEDIATE_FLIPS_SLOW_MS, default 24 ms) are shown on
+// arrival with the game-visible completion deferred to the vblank tick; slow frames (GPU-bound
+// replays and flyovers) go through the vblank tick path with the game's flip rate divider and
+// complete at once, the baseline's even 30 fps. (Deferring a slow frame's completion oscillated.)
+namespace {
+std::chrono::steady_clock::time_point g_last_receive{};
+double g_gaps[4] = {16.7, 16.7, 16.7, 16.7};
+u32 g_gap_i = 0;
+double SlowThresholdMs() {
+    static const double v = [] {
+        const char* e = std::getenv("BB_IMMEDIATE_FLIPS_SLOW_MS");
+        return e ? std::atof(e) : 24.0;
+    }();
+    return v;
+}
+void NoteFlipGap(std::chrono::steady_clock::time_point now) {
+    if (g_last_receive != std::chrono::steady_clock::time_point{}) {
+        g_gaps[g_gap_i++ & 3] = std::chrono::duration<double, std::milli>(now - g_last_receive).count();
+    }
+    g_last_receive = now;
+}
+bool SlowCadence() {
+    return (g_gaps[0] + g_gaps[1] + g_gaps[2] + g_gaps[3]) * 0.25 > SlowThresholdMs();
+}
+} // namespace
+
 void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());
@@ -1244,11 +1271,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || asap_flips || now >= next_flip;
+        const bool flip_slot = !frame_limit || (asap_flips ? SlowCadence() : now >= next_flip);
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
+            }
+            if (request && asap_flips) {
+                NoteFlipGap(now);
+                complete_now = true; // the tick path's flip completes at once (see above)
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -1260,6 +1291,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
+                complete_now = false;
                 FRAME_END;
             }
         }
@@ -1314,6 +1346,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
         while (!token.stop_requested()) {
+            if (asap_flips && SlowCadence()) {
+                break; // GPU-bound: the tick path presents on the vblank grid
+            }
             {
                 std::unique_lock lk{mutex};
                 if (!request_cv.wait_until(lk, tick_deadline,
@@ -1331,28 +1366,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto request = receive_request();
             if (request) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
-                // fifa-hybrid: a frame that took longer than a vblank period (the game is GPU-bound:
-                // replays, flyovers) is shown on the vblank grid, as the tick path did, so slow
-                // phases pace evenly (36-44 fps with 80 ms gaps otherwise) while fast frames are
-                // shown at once. BB_IMMEDIATE_FLIPS_SLOW_MS (default 24) is the threshold.
-                static const double slow_ms = [] {
-                    const char* e = std::getenv("BB_IMMEDIATE_FLIPS_SLOW_MS");
-                    return e ? std::atof(e) : 24.0;
-                }();
-                // (receive time, not Request::arrival_ns: that field exists only with BB_FRAME_STATS)
-                static std::chrono::steady_clock::time_point last_receive{};
-                const bool slow = asap_flips && last_receive != std::chrono::steady_clock::time_point{} &&
-                                  std::chrono::duration<double, std::milli>(now - last_receive).count() > slow_ms;
-                last_receive = now;
-                if (slow && std::chrono::steady_clock::now() < tick_deadline) {
-                    std::this_thread::sleep_until(tick_deadline);
-                }
-                // A slow frame also completes at once (the baseline's behaviour, an even 30 fps
-                // when GPU-bound); deferring its completion to the next tick oscillated (45-49 fps
-                // with 80 ms gaps).
-                complete_now = slow;
+NoteFlipGap(now);
                 Flip(request);
-                complete_now = false;
                 FRAME_END;
             }
         }
