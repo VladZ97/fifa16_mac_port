@@ -411,6 +411,7 @@ public:
     /// fifa-hybrid: true when a page of the range is read-watched for a pending on-demand image.
     bool HasOndemandIn(VAddr addr, u64 size);
     void LogOndemandWrite(VAddr addr, u64 size);
+    void PrintOndemandWriteCounts(); // fifa-hybrid diagnostics (BB_FAULT_STATS)
     void ForgetOndemandImagesIn(VAddr addr, u64 size, bool droppable_only);
 
 private:

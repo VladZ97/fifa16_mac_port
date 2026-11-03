@@ -4274,6 +4274,10 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+// fifa-hybrid diagnostics (BB_FAULT_STATS): the on-demand resolve of write faults, split into the
+// drop path (droppable image forgotten, no GPU round trip) and the download path.
+static std::atomic<u64> g_odw_drop_n{0}, g_odw_drop_us{0}, g_odw_dl_n{0}, g_odw_dl_us{0};
+
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     DrainDrawPipe();
     if (!IsMapped(addr, size)) {
@@ -4350,12 +4354,16 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
     } else if (now - ws >= 2000000000 && window_start.compare_exchange_strong(ws, now)) {
         const u64 cnt = n.exchange(0);
         std::printf("[WFAULT] n=%llu unmapped=%llu drain=%.1fms ondemand=%.1fms buffer=%.1fms "
-                    "(flushes %llu) texture=%.1fms extend=%.1fms\n",
+                    "(flushes %llu) texture=%.1fms extend=%.1fms | odw drop %llu (%.1fms) "
+                    "download %llu (%.1fms)\n",
                     (unsigned long long)cnt, (unsigned long long)unmapped.exchange(0),
                     t_drain.exchange(0) / 1e3, t_ondemand.exchange(0) / 1e3,
                     t_buffer.exchange(0) / 1e3,
                     (unsigned long long)buffer_cache.write_flushes.exchange(0),
-                    t_texture.exchange(0) / 1e3, t_extend.exchange(0) / 1e3);
+                    t_texture.exchange(0) / 1e3, t_extend.exchange(0) / 1e3,
+                    (unsigned long long)g_odw_drop_n.exchange(0), g_odw_drop_us.exchange(0) / 1e3,
+                    (unsigned long long)g_odw_dl_n.exchange(0), g_odw_dl_us.exchange(0) / 1e3);
+        texture_cache.PrintOndemandWriteCounts();
         std::fflush(stdout);
     }
     return mapped;
@@ -4399,12 +4407,34 @@ void Rasterizer::ResolveOndemandImages(VAddr addr, u64 size, bool for_write, boo
         const char* env = std::getenv("BB_ONDEMAND_WRITE_DROP");
         return !env || env[0] != '0';
     }();
+    const auto t_start = std::chrono::steady_clock::now();
+    const auto note = [&](std::atomic<u64>& n, std::atomic<u64>& us) {
+        if (stats) {
+            n.fetch_add(1, std::memory_order_relaxed);
+            us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - t_start)
+                                 .count()),
+                         std::memory_order_relaxed);
+        }
+    };
     if (for_write && drop_on_write) {
         texture_cache.ForgetOndemandImagesIn(addr, size, true);
         if (!texture_cache.HasOndemandIn(addr, size)) {
+            note(g_odw_drop_n, g_odw_drop_us);
             return;
         } // block-compressed images and their shadows below: downloaded before the write
     }
+    struct DlNote {
+        bool on;
+        std::atomic<u64>& n;
+        std::atomic<u64>& us;
+        decltype(note)& f;
+        ~DlNote() {
+            if (on) {
+                f(n, us);
+            }
+        }
+    } dl_note{stats && for_write, g_odw_dl_n, g_odw_dl_us, note};
     // fifa-hybrid: prefetched images need no round trip (TextureCache::ResolvePrefetchedOndemand).
     if (!assume_locks && texture_cache.ResolvePrefetchedOndemand(addr, size)) {
         return;

@@ -395,15 +395,54 @@ void TextureCache::ForgetOndemandImagesIn(VAddr addr, u64 size, bool droppable_o
 
 // fifa-hybrid diagnostics (BB_FAULT_STATS): names, once per image, the on-demand images a CPU
 // write fault lands in (each such write costs a GPU round trip).
+static std::mutex g_odw_counts_mutex;
+static std::unordered_map<VAddr, std::pair<u64, std::string>> g_odw_counts; // per image: writes, label
+
+void TextureCache::PrintOndemandWriteCounts() {
+    std::scoped_lock lk{g_odw_counts_mutex};
+    std::vector<std::pair<u64, std::string>> rows;
+    for (auto& [addr, v] : g_odw_counts) {
+        if (v.first) {
+            rows.emplace_back(v.first, v.second);
+        }
+        v.first = 0;
+    }
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string line = "[ODWC]";
+    for (size_t i = 0; i < rows.size() && i < 6; ++i) {
+        line += fmt::format(" {}x{}", rows[i].second, rows[i].first);
+    }
+    std::printf("%s\n", line.c_str());
+}
+
 void TextureCache::LogOndemandWrite(VAddr addr, u64 size) {
     static std::unordered_set<VAddr> seen;
     static u32 lines = 0;
     std::unique_lock lk{download_images_mutex};
     for (const auto& [index, range] : ondemand_ranges) {
-        if (range.first >= addr + size || range.first + range.second <= addr) {
+        // Page-granular overlap (as HasOndemandIn sees it); "P" marks writes that only share a
+        // page with the image (outside its bytes).
+        const VAddr page_lo = PageManager::GetPageAddr(range.first);
+        const VAddr page_hi = PageManager::GetNextPageAddr(range.first + range.second - 1);
+        if (page_lo >= addr + size || page_hi <= addr) {
             continue;
         }
+        const bool exact = range.first < addr + size && range.first + range.second > addr;
         const Image& image = slot_images[ImageId{index}];
+        {
+            std::scoped_lock ck{g_odw_counts_mutex};
+            auto& e = g_odw_counts[image.info.guest_address ^ (exact ? 0 : 1)];
+            ++e.first;
+            if (e.second.empty()) {
+                e.second = fmt::format("{}x{}f{}{}{}@{:x}", image.info.size.width,
+                                       image.info.size.height, u32(image.info.pixel_format),
+                                       range.droppable ? "d" : "D", exact ? "" : "P",
+                                       image.info.guest_address);
+            }
+        }
+        if (!exact) {
+            continue;
+        }
         if (lines < 80 && seen.insert(image.info.guest_address).second) {
             ++lines;
             std::fprintf(stderr, "[ODW] write %#llx in img %u addr=%#llx size=%u %ux%ux%u fmt=%u\n",

@@ -199,7 +199,7 @@ void InitRemote(BbGpuShared* shared) {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         BbGpuShared* s = g_shared;
         for (;;) {
-            const BbGpuRecord* r = bbgpu_ring_peek(s, &s->protect, Second);
+            const BbGpuRecord* r = bbgpu_ring_peek_spin(s, &s->protect, Second, s->relay_spin_ns);
             if (!r) {
                 if (!PeerAlive(s->host_pid)) {
                     PeerLost("GPU host");

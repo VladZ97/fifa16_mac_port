@@ -189,7 +189,7 @@ static void *fault_thread(void *unused) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     BbGpuShared *s = g_shared;
     for (;;) {
-        const BbGpuRecord *r = bbgpu_ring_peek(s, &s->faults, UINT64_C(1000000000));
+        const BbGpuRecord *r = bbgpu_ring_peek_spin(s, &s->faults, UINT64_C(1000000000), s->relay_spin_ns);
         if (!r) continue;
         const BbGpuFault fault = *(const BbGpuFault *)r;
         bbgpu_ring_pop(&s->faults, r);
@@ -321,6 +321,10 @@ static int map_shared(void) {
     if (g_shared->magic != BBGPU_SHARED_MAGIC || g_shared->version != BBGPU_SHARED_VERSION) {
         say("control block version %u, expected %u", g_shared->version, BBGPU_SHARED_VERSION);
         return EINVAL;
+    }
+    { /* fifa-hybrid: relay spin window (bbgpu_shared.h relay_spin_ns), BB_RELAY_SPIN_US, default 100 */
+        const char *e = getenv("BB_RELAY_SPIN_US");
+        __atomic_store_n(&g_shared->relay_spin_ns, (uint32_t)((e ? atoi(e) : 100) * 1000), __ATOMIC_RELEASE);
     }
     return 0;
 }

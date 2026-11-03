@@ -236,6 +236,12 @@ typedef struct {
     /* Mouse wheel steps while the window holds the cursor, counted up (the game turns each step
      * into a short press of whatever is bound to Wheel Up / Wheel Down, runtime_pad.c). */
     uint32_t mouse_wheel_up, mouse_wheel_down;
+    /* fifa-hybrid: how long (ns) the host's fault thread, the game's protect thread and a game
+     * thread waiting for a fault reply spin before sleeping on the word. The sleep/wake round
+     * trip cost ~0.6 ms per relayed fault (the host's handling itself ~10 us). Appended last and
+     * set by the host at setup from BB_RELAY_SPIN_US (default 100; the game's gpu_process.c
+     * copy predates the field and leaves it zero). 0: the old 200-iteration spin. */
+    BBGPU_ALIGNAS(BBGPU_CACHE_LINE) uint32_t relay_spin_ns, pad3;
 } BbGpuShared;
 
 #define BBGPU_SUBMIT_RING_OFFSET (UINT64_C(64) << 10)
@@ -283,16 +289,31 @@ static inline void bbgpu_cpu_relax(void) {
 #endif
 }
 
-/* Waits while *word == value, up to timeout_ns. 0 when the word changed (or was woken). */
-static inline int bbgpu_wait_word(uint32_t *word, uint32_t value, uint64_t timeout_ns) {
-    for (int i = 0; i < 200; ++i) {
-        if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != value) return 0;
-        bbgpu_cpu_relax();
+/* Waits while *word == value, up to timeout_ns. 0 when the word changed (or was woken).
+ * spin_ns: how long to poll before sleeping (0: 200 relax iterations). */
+static inline int bbgpu_wait_word_spin(uint32_t *word, uint32_t value, uint64_t timeout_ns, uint64_t spin_ns) {
+    if (spin_ns == 0) {
+        for (int i = 0; i < 200; ++i) {
+            if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != value) return 0;
+            bbgpu_cpu_relax();
+        }
+    } else {
+        const uint64_t spin_until = bbgpu_now_ns() + spin_ns;
+        for (;;) {
+            for (int i = 0; i < 64; ++i) {
+                if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != value) return 0;
+                bbgpu_cpu_relax();
+            }
+            if (bbgpu_now_ns() >= spin_until) break;
+        }
     }
     const int r = os_sync_wait_on_address_with_timeout(word, value, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
                                                        OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns ? timeout_ns : 1);
     if (r < 0 && errno == ETIMEDOUT) return __atomic_load_n(word, __ATOMIC_ACQUIRE) == value ? -1 : 0;
     return 0;
+}
+static inline int bbgpu_wait_word(uint32_t *word, uint32_t value, uint64_t timeout_ns) {
+    return bbgpu_wait_word_spin(word, value, timeout_ns, 0);
 }
 static inline void bbgpu_wake_word(uint32_t *word) {
     os_sync_wake_by_address_all(word, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED); /* ENOENT without waiters */
@@ -358,7 +379,7 @@ static inline int bbgpu_ring_push(BbGpuShared *s, BbGpuRing *ring, const void *r
 
 /* The next record, or NULL after timeout_ns with the ring empty. Skips PAD records. Valid until
  * bbgpu_ring_pop. Single consumer. */
-static inline const BbGpuRecord *bbgpu_ring_peek(BbGpuShared *s, BbGpuRing *ring, uint64_t timeout_ns) {
+static inline const BbGpuRecord *bbgpu_ring_peek_spin(BbGpuShared *s, BbGpuRing *ring, uint64_t timeout_ns, uint64_t spin_ns) {
     const uint64_t deadline = bbgpu_now_ns() + timeout_ns;
     for (;;) {
         const uint64_t tail = ring->tail; /* only this consumer writes tail */
@@ -377,10 +398,13 @@ static inline const BbGpuRecord *bbgpu_ring_peek(BbGpuShared *s, BbGpuRing *ring
                 __atomic_store_n(&ring->consumer_waiting, 0, __ATOMIC_RELAXED);
                 return NULL;
             }
-            bbgpu_wait_word(&ring->head_seq, seq, deadline - now < 50000000 ? deadline - now : 50000000);
+            bbgpu_wait_word_spin(&ring->head_seq, seq, deadline - now < 50000000 ? deadline - now : 50000000, spin_ns);
         }
         __atomic_store_n(&ring->consumer_waiting, 0, __ATOMIC_RELAXED);
     }
+}
+static inline const BbGpuRecord *bbgpu_ring_peek(BbGpuShared *s, BbGpuRing *ring, uint64_t timeout_ns) {
+    return bbgpu_ring_peek_spin(s, ring, timeout_ns, 0);
 }
 
 static inline void bbgpu_ring_pop(BbGpuRing *ring, const BbGpuRecord *record) {
@@ -422,7 +446,8 @@ static inline int bbgpu_reply_wait(BbGpuShared *s, int slot, int64_t *result, ui
     while (__atomic_load_n(&s->replies[slot].state, __ATOMIC_ACQUIRE) == 1) {
         const uint64_t now = bbgpu_now_ns();
         if (now >= deadline) return -1;
-        bbgpu_wait_word(&s->replies[slot].state, 1, deadline - now < 50000000 ? deadline - now : 50000000);
+        bbgpu_wait_word_spin(&s->replies[slot].state, 1, deadline - now < 50000000 ? deadline - now : 50000000,
+                             s->relay_spin_ns);
     }
     *result = s->replies[slot].result;
     __atomic_fetch_and(&s->reply_slots_used, ~(1u << slot), __ATOMIC_RELEASE);
