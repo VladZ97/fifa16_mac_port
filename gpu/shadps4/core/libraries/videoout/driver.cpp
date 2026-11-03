@@ -1046,7 +1046,7 @@ void VideoOutDriver::Flip(const Request& req) {
     // the next vblank tick (flip status, flip event, buffer label): the picture is on screen as
     // early as possible while the game keeps the PS4's 60 Hz cadence (free-running completion
     // made it render ~88 frames a second).
-    if (AsapFlips()) {
+    if (AsapFlips() && !complete_now) {
         std::scoped_lock lk{deferred_flips_mutex};
         deferred_flips.push_back(req);
         return;
@@ -1331,7 +1331,28 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto request = receive_request();
             if (request) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
+                // fifa-hybrid: a frame that took longer than a vblank period (the game is GPU-bound:
+                // replays, flyovers) is shown on the vblank grid, as the tick path did, so slow
+                // phases pace evenly (36-44 fps with 80 ms gaps otherwise) while fast frames are
+                // shown at once. BB_IMMEDIATE_FLIPS_SLOW_MS (default 24) is the threshold.
+                static const double slow_ms = [] {
+                    const char* e = std::getenv("BB_IMMEDIATE_FLIPS_SLOW_MS");
+                    return e ? std::atof(e) : 24.0;
+                }();
+                // (receive time, not Request::arrival_ns: that field exists only with BB_FRAME_STATS)
+                static std::chrono::steady_clock::time_point last_receive{};
+                const bool slow = asap_flips && last_receive != std::chrono::steady_clock::time_point{} &&
+                                  std::chrono::duration<double, std::milli>(now - last_receive).count() > slow_ms;
+                last_receive = now;
+                if (slow && std::chrono::steady_clock::now() < tick_deadline) {
+                    std::this_thread::sleep_until(tick_deadline);
+                }
+                // A slow frame also completes at once (the baseline's behaviour, an even 30 fps
+                // when GPU-bound); deferring its completion to the next tick oscillated (45-49 fps
+                // with 80 ms gaps).
+                complete_now = slow;
                 Flip(request);
+                complete_now = false;
                 FRAME_END;
             }
         }
