@@ -62,6 +62,14 @@ public:
                             });
     }
 
+    /// fifa-hybrid: the page the CPU keeps reading stays readable while GPU modified.
+    void SetHotRead(VAddr page_addr, u64 size) noexcept {
+        IteratePages<false>(page_addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->SetHotRead(offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,

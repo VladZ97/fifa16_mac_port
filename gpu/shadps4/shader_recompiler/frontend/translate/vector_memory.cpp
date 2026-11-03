@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -489,6 +491,9 @@ void Translator::IMAGE_STORE(bool has_mip, const GcnInst& inst) {
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
 
+    if (mimg.dmask != 0xF && std::getenv("BB_BCVIEW_LOG")) {
+        std::fprintf(stderr, "[STOREMASK] dmask=%#x\n", u32(mimg.dmask));
+    }
     boost::container::static_vector<IR::F32, 4> comps;
     for (u32 i = 0; i < 4; i++) {
         if (((mimg.dmask >> i) & 1) == 0) {

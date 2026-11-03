@@ -351,7 +351,7 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
-        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
+        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) || info.uses_group_quad ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
@@ -778,7 +778,7 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4],
-                                         U32[4], U32[4], U32[4], U32[2], U32[1], U32[1]),
+                                         U32[4], U32[4], U32[4], U32[2], U32[1], U32[1], U32[1]),
                               "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -807,6 +807,8 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 120U);
     MemberName(struct_type, PushData::SceneSizeIndex, "scene_size");
     MemberDecorate(struct_type, PushData::SceneSizeIndex, spv::Decoration::Offset, 124U);
+    MemberName(struct_type, PushData::DepthRemapIndex, "depth_remap");
+    MemberDecorate(struct_type, PushData::DepthRemapIndex, spv::Decoration::Offset, 128U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

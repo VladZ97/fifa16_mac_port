@@ -7,6 +7,7 @@
 #include <map>
 #include <unordered_map>
 #include <algorithm>
+#include <cstring>
 #include <bit>
 #include <condition_variable>
 #include <cstdio>
@@ -30,6 +31,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h" // fifa-hybrid: DrainDrawPipe
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -40,7 +42,18 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+namespace Vulkan {
+void VbNoteWrite(VAddr address, u64 size, char tag); // BB_VB_LOG debug
+}
+
 namespace VideoCore {
+
+std::atomic<u64> g_bb_bufwatch{[] {
+    const char* env = std::getenv("BB_BUFWATCH");
+    return env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+}()};
+
+using Vulkan::VbNoteWrite;
 
 // bbport: which build wrote a layout fallback: this library's size and modification time
 // (a new app version or rebuild has another).
@@ -441,6 +454,7 @@ BufferCache::~BufferCache() {
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
+        write_flushes.fetch_add(1, std::memory_order_relaxed);
         ReadMemory(device_addr, size, true, assume_locks);
     });
 }
@@ -467,6 +481,69 @@ void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
     BbCopy::QueueCopy(item);
 }
 
+void BufferCache::NoteReadFault(VAddr addr) {
+    static const u32 threshold = [] {
+        const char* env = std::getenv("BB_HOT_READ");
+        return env ? u32(std::strtoul(env, nullptr, 10)) : 8u;
+    }();
+    if (threshold == 0) {
+        return;
+    }
+    const VAddr page = addr & ~VAddr{0xFFF};
+    std::scoped_lock lk{hot_read_mutex};
+    if (++read_fault_counts[page] != threshold) {
+        return;
+    }
+    hot_read_pages.push_back(page);
+    memory_tracker->SetHotRead(page, 0x1000);
+    std::fprintf(stderr, "[HOTREAD] page %#llx (%zu hot pages)\n", (unsigned long long)page,
+                 hot_read_pages.size());
+}
+
+void BufferCache::FlushHotReadPages() {
+    // fifa-hybrid diagnostics: BB_HOT_PAGE=<hex> forces a page onto the hot list (its GPU writes are
+    // written back every submit, so BB_BUFWATCH can print them).
+    static bool forced = false;
+    if (!forced) {
+        forced = true;
+        if (const char* env = std::getenv("BB_HOT_PAGE")) {
+            const VAddr page = VAddr(std::strtoull(env, nullptr, 16)) & ~VAddr{0xFFF};
+            std::scoped_lock lk{hot_read_mutex};
+            hot_read_pages.push_back(page);
+            memory_tracker->SetHotRead(page, 0x1000);
+            std::fprintf(stderr, "[HOTREAD] forced page %#llx\n", (unsigned long long)page);
+        }
+    }
+    boost::container::small_vector<VAddr, 8> pages;
+    {
+        std::scoped_lock lk{hot_read_mutex};
+        pages.assign(hot_read_pages.begin(), hot_read_pages.end());
+    }
+    for (const VAddr page : pages) {
+        if (memory_tracker->IsRegionGpuModified(page, 0x1000)) {
+            DownloadSmallAsync(page, 0x1000);
+        }
+    }
+}
+
+void BufferCache::OnCpuWrite(VAddr addr, u64 size, VAddr fault) {
+    memory_tracker->ExtendWriteFault(addr, size);
+    const VAddr page = fault & ~VAddr{0xFFF};
+    if (memory_tracker->IsRegionGpuModified(page, 0x1000)) {
+        // The written page also holds GPU-written words not yet written back (a polled label
+        // page, say). The pending write-backs stay: they cover only the GPU-written bytes
+        // (gpu_modified_ranges), and dropping them lost the word the game was polling (match
+        // frozen at 60 fps). The page is CPU-modified too, so the next upload takes the CPU's bytes.
+        static const bool stats = std::getenv("BB_FAULT_STATS") != nullptr;
+        const u64 n = cpu_write_wins.fetch_add(1, std::memory_order_relaxed);
+        if (stats && n < 20) {
+            std::fprintf(stderr, "[CPUW] CPU write into a page with pending GPU writes at %#llx\n",
+                         (unsigned long long)fault);
+        }
+        memory_tracker->MarkRegionAsCpuModified(page, 0x1000);
+    }
+}
+
 void BufferCache::ExtendWriteFault(VAddr device_addr) {
     static const u64 window = [] {
         const char* env = std::getenv("BB_FAULT_WINDOW");
@@ -480,6 +557,9 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    if (!is_write && !assume_locks && memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        NoteReadFault(device_addr);
+    }
     // bbport: guest memory the arena does not cover holds no GPU data of this cache (every
     // GPU-modified range was bound through the arena): nothing to read back. A fault there
     // stopped the game in GetChunk before (texture watchers protect pages anywhere).
@@ -495,6 +575,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     const auto flush_request = [this, device_addr, size, is_write] {
+        // fifa-hybrid: the download must see every submitted draw and dispatch, including the
+        // ones still queued in the draw pipe (recorded by other threads): drain it first, or a
+        // guest polling a GPU-written counter reads a value from before the dispatch, the page
+        // is unprotected, and it spins forever (FIFA at the title screen).
+        if (auto* r = liverpool->GetRasterizer()) {
+            r->DrainDrawPipe();
+        }
         const auto* arena = GetChunk(device_addr, 1);
         BbArenaRuns::Note(BbArenaRuns::Caller::ReadBack, device_addr, size);
 
@@ -518,6 +605,91 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
+}
+
+void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
+    const VAddr page = addr & ~VAddr(0xFFF);
+    const VAddr end = Common::AlignUp(addr + size, 0x1000);
+    const auto* chunk = FindChunk(page, 1);
+    if (!chunk) {
+        return;
+    }
+    struct Download {
+        VAddr address;
+        u64 size;
+        u64 staging_offset;
+    };
+    boost::container::small_vector<BufferCopy, 2> copies;
+    boost::container::small_vector<Download, 2> downloads;
+    u64 total_size_bytes = 0;
+    const VAddr arena_base = chunk->cpu_addr;
+    const VAddr range_end = std::min<VAddr>(end, chunk->cpu_addr + chunk->size_bytes);
+    memory_tracker->ForEachDownloadRange<false>(page, range_end - page, [&](u64 address, u64 size) {
+        const auto add_download = [&](VAddr start, VAddr stop) {
+            const VAddr word_start = Common::AlignDown(start, 4);
+            const VAddr word_end = Common::AlignUp(stop, 4);
+            copies.push_back(BufferCopy{
+                .src_offset = word_start - arena_base,
+                .dst_offset = total_size_bytes,
+                .size = word_end - word_start,
+            });
+            downloads.push_back({start, stop - start, total_size_bytes + (start - word_start)});
+            constexpr u64 align = 64ULL;
+            total_size_bytes += (word_end - word_start + align - 1) & ~(align - 1ULL);
+        };
+        gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        gpu_modified_ranges.Subtract(address, size);
+    });
+    if (total_size_bytes == 0) {
+        return;
+    }
+    const auto download =
+        staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 64, true);
+    for (auto& copy : copies) {
+        copy.dst_offset += download.offset;
+    }
+    runtime.CopyBuffer(*chunk, *download.buffer, copies);
+    scheduler.DeferPriorityOperation([this, download, downloads = std::move(downloads)] {
+        const u64 watch = g_bb_bufwatch.load(std::memory_order_relaxed);
+        for (const auto& d : downloads) {
+            if (watch != 0 && (d.address & ~VAddr{0xFFF}) == (watch & ~VAddr{0xFFF})) {
+                static std::atomic<int> n{0};
+                static const int want_n = [] {
+                    const char* env = std::getenv("BB_BUFWATCH_N");
+                    return env ? std::atoi(env) : 0;
+                }();
+                if (want_n > 0 && n < 400) {
+                    // BB_BUFWATCH_N=<n>: also print n floats from the watched offset inside the download.
+                    const u64 off = watch > d.address ? watch - d.address : 0;
+                    if (off + 4 <= d.size) {
+                        const u8* src = download.mapped + d.staging_offset + off;
+                        const int cnt = int(std::min<u64>(u64(want_n), (d.size - off) / 4));
+                        std::string line = fmt::format("[BUFWATCH] floats @{:#x}:", (unsigned long long)(d.address + off));
+                        for (int i = 0; i < cnt; ++i) {
+                            float v;
+                            std::memcpy(&v, src + i * 4, 4);
+                            line += fmt::format(" {:g}", v);
+                        }
+                        std::fprintf(stderr, "%s\n", line.c_str());
+                    }
+                }
+                if (n++ < 60) {
+                    const u8* src = download.mapped + d.staging_offset;
+                    float f[4] = {};
+                    std::memcpy(f, src, std::min<u64>(d.size, sizeof f));
+                    u32 u[4] = {};
+                    std::memcpy(u, src, std::min<u64>(d.size, sizeof u));
+                    std::fprintf(stderr, "[BUFWATCH] writeback %#llx+%llu: %g %g %g %g (%#x %#x %#x %#x)\n",
+                                 (unsigned long long)d.address, (unsigned long long)d.size, f[0], f[1],
+                                 f[2], f[3], u[0], u[1], u[2], u[3]);
+                }
+            }
+            memory->TryWriteBacking(std::bit_cast<u8*>(d.address),
+                                    download.mapped + d.staging_offset, d.size);
+        }
+        staging_pool.FreeDeferred(download);
+    });
+    memory_tracker->UnmarkRegionAsGpuModified(page, range_end - page);
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -654,6 +826,24 @@ void PrintBufferStats() {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         bool note_use, BbArenaRuns::Caller caller) {
+    if (is_written) {
+        VbNoteWrite(device_addr, size, 'O');
+    }
+    // fifa-hybrid: a GPU read of memory an on-demand image still owns (the guest reuses render
+    // targets as vertex/constant data) would see stale RAM: download the image first.
+    if (!is_written && texture_cache.HasOndemandIn(device_addr, size)) {
+        static const bool vb_log = std::getenv("BB_VB_LOG") != nullptr;
+        static int n = 0;
+        if (vb_log && n++ < 2000) {
+            std::fprintf(stderr, "[RBQ] bufread addr=%#llx size=%#x caller=%d\n",
+                         (unsigned long long)device_addr, size, int(caller));
+        }
+        static const bool off = std::getenv("BB_RB_NOBUFRESOLVE") != nullptr;
+        if (!off) {
+            texture_cache.DownloadImagesForCpuRead(device_addr, size, false, false);
+            memory_tracker->InvalidateRegion(device_addr, size, [] {});
+        }
+    }
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();

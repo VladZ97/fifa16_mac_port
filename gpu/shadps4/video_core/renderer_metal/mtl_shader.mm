@@ -1124,6 +1124,12 @@ CompileResult ShaderCompiler::Compile(std::span<const u32> spirv, u64 hash, std:
         } catch (const std::exception& e) {
             return fail(CompileStatus::Failed, "SPIRV-Cross: " + FirstLine(e.what()));
         }
+        // DEBUG(bbport): BB_DUMP_MSL=<dir> writes every converted shader (temporary).
+        if (static const char* dump_msl = std::getenv("BB_DUMP_MSL"); dump_msl) {
+            WriteFileAtomic(std::filesystem::path{dump_msl} /
+                                fmt::format("{:016x}_{}{}.metal", hash, stage_name, tag),
+                            msl);
+        }
         objects = BuildLibrary(mtl_device, msl, shader->entry, label);
         if (!objects.error.empty()) {
             return fail(CompileStatus::Failed, objects.error);

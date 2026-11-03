@@ -205,17 +205,36 @@ private:
     template <bool track, bool is_read>
     void UpdateProtection() {
         RENDERER_TRACE;
-        RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
+        // fifa-hybrid: hot read pages (BufferCache::NoteReadFault) stay readable while GPU
+        // modified; their GPU writes are written back after every submission instead.
+        RegionBits mask = is_read ? ((~gpu | hot_read) ^ readable) : (cpu ^ writeable);
         if (mask.None()) {
             return;
         }
         if constexpr (is_read) {
-            readable = ~gpu;
+            readable = ~gpu | hot_read;
         } else {
             writeable = cpu;
         }
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
     }
+
+public:
+    /// fifa-hybrid: marks the tracker pages of [offset, offset + size) as hot read pages and
+    /// lifts their read protection now.
+    void SetHotRead(u64 offset, size_t size) {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            size_t(NUM_PAGES_PER_REGION));
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+        hot_read.SetRange(start_page, end_page);
+        UpdateProtection<false, true>();
+    }
+
+private:
 
     // bbport: pages the guest writes again and again (per-frame constants, skinning output)
     // cost a protection fault in the writing thread plus an mprotect with TLB shootdowns on
@@ -288,6 +307,7 @@ private:
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;
+    RegionBits hot_read; ///< fifa-hybrid: pages the CPU polls (written back after each submit)
 };
 
 } // namespace VideoCore

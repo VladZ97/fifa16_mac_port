@@ -32,6 +32,15 @@
 /* The mirrored guest range (identical to host/bbgpu_protocol.h). */
 #define BBGPU_GUEST_MIN UINT64_C(0x7000000000)
 #define BBGPU_GUEST_MAX UINT64_C(0xfc00000000)
+/* fifa-hybrid: shadPS4 places FIFA's GPU memory in its system-managed/reserved areas, moved
+ * above the arm64 shared region (SHAD_MAPPING_BASE=400000000); the arm64 GPU carveout
+ * [0x1000000000, 0x7000000000) between the two ranges is never mirrored. */
+#define BBGPU_GUEST_LOW_MIN UINT64_C(0x400000000)
+#define BBGPU_GUEST_LOW_MAX UINT64_C(0xfa0000000) /* 0xfa0000000-0xfc0000000 is taken in arm64 processes */
+static inline int bbgpu_guest_range_ok(uint64_t start, uint64_t end) {
+    return end >= start && ((start >= BBGPU_GUEST_LOW_MIN && end <= BBGPU_GUEST_LOW_MAX) ||
+                            (start >= BBGPU_GUEST_MIN && end <= BBGPU_GUEST_MAX));
+}
 
 #define BBGPU_SHARED_MAGIC 0x31424742u /* "BGB1" */
 #define BBGPU_SHARED_VERSION 7u /* 3: command buffer copy arena; 4: game fault counters; 5: benchmark; 6: mouse look; 7: mouse wheel */
@@ -70,6 +79,8 @@ enum {
     BBGPU_REC_VERIFY,              /* BbGpuVerifyRecord: mirror check, answered on the control port */
     BBGPU_REC_START,               /* BbGpuStart (request): start the renderer with the configuration */
     BBGPU_REC_TEXT_BEGIN,          /* BbGpuTextBegin (request): open the window's text entry (IME) */
+    BBGPU_REC_CPU_WRITE,           /* BbGpuCpuWrite: fifa-hybrid, the game lifted the write protection of these
+                                      upload-tracked pages itself and wrote them (ordered before later submits) */
     BBGPU_REC_COUNT,
 };
 
@@ -107,6 +118,7 @@ typedef struct {
 typedef struct { BbGpuRecord r; uint32_t vqid, next_offs_dw; } BbGpuDingDong;
 typedef struct { BbGpuRecord r; int64_t a, b; double f; } BbGpuScalar;
 typedef struct { BbGpuRecord r; uint64_t address, size; } BbGpuRange;
+typedef struct { BbGpuRecord r; uint64_t address, size, fault; } BbGpuCpuWrite; /* fault: the written address */
 typedef struct {
     BbGpuRecord r;
     uint32_t slot, pipe_id, queue_id, ring_size_dw;

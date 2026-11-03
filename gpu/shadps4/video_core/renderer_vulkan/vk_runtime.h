@@ -101,6 +101,8 @@ public:
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);
+    /// fifa-hybrid: byte copy between a block-compressed image and its one-texel-per-block view.
+    void CopyBlockBytes(VideoCore::Image* src, VideoCore::Image* dst);
 
     void CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                           const VideoCore::SubresourceRange& sub_range);
@@ -112,6 +114,9 @@ public:
                     const vk::ClearValue& clear_value);
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
+    /// fifa-hybrid: brings the image's D32 twin (Image::depth_twin) up to date with its colour
+    /// backing (created on first use).
+    void SyncDepthTwin(VideoCore::Image* image);
     /// bbport: gives an image both lazy usages (VideoCore::Image::allowed_shader_write), `needed`
     /// (Usage*) being the ones a binding asked for: a new backing with them, the current one's
     /// contents copied (all levels and layers); the old texture and its views are released once

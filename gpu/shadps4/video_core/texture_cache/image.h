@@ -13,7 +13,9 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
+#include <memory>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
@@ -112,6 +114,7 @@ public:
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< bbport: SceneTargets holds a reduced-size proxy of it
+    bool gl_depth = false;    ///< fifa-hybrid: depth target of a [-1, 1] viewport pass (PushData::depth_remap)
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address
@@ -121,6 +124,12 @@ public:
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
     ImageId depth_id{};
+    /// fifa-hybrid: Metal has no uncompressed views of block-compressed textures. A one-texel-per-
+    /// block view (BC3 as RGBA32Uint, GPU texture compression) uses this separate image instead.
+    ImageId block_shadow{};
+    ImageId shadow_of{};       ///< set on a shadow: its block-compressed image
+    bool shadow_newer = false; ///< the shadow was written after the last copy into the image
+    bool shadow_current = false; ///< the shadow holds the image's blocks (no copy needed)
     u64 depth_uid{};
     u64 image_uid{};
 
@@ -130,6 +139,31 @@ public:
     Metal::Device* device;
     bool has_depth = false;
     bool has_stencil = false;
+    /// fifa-hybrid: the backing's stencil plane was never written (a fresh texture holds
+    /// undefined data, 0xff on Apple GPUs). PS4 memory starts zeroed and FIFA's UI masks (write
+    /// bit 0, test EQUAL 1, write 0) assume it: the first pass that binds the stencil clears it to 0.
+    bool stencil_undefined = false;
+    /// fifa-hybrid: a colour R32 image that shaders compare-sample as depth (FIFA's shadow maps:
+    /// R32 colour targets read with image_sample_c). Metal's sample_compare needs a depth pixel
+    /// format, so the image keeps a D32 twin texture synced from the colour backing whenever it
+    /// was written since (write_serial counts GPU writes and uploads). Replaces recreating the
+    /// image as D32 and back every frame through 16 MB copies (undefined content at times).
+    Metal::Object depth_twin;
+    u64 depth_twin_synced = ~u64{0};
+    u64 write_serial = 1; // read from the fault thread too (a stale read only costs a download)
+    /// fifa-hybrid: on-demand readback prefetch. Large GPU-written images awaiting a CPU read
+    /// fault are also downloaded asynchronously right after their write; `prefetch_landed` holds
+    /// the write_serial whose bytes reached guest memory (0 none). A fault that finds it equal
+    /// to write_serial needs no GPU round trip (TextureCache::ResolvePrefetchedOndemand).
+    std::shared_ptr<std::atomic<u64>> prefetch_landed;
+    [[nodiscard]] bool PrefetchLanded() const {
+        return prefetch_landed && prefetch_landed->load(std::memory_order_acquire) != 0 &&
+               prefetch_landed->load(std::memory_order_acquire) == write_serial;
+    }
+    [[nodiscard]] bool DepthTwinEligible() const {
+        return !has_depth && info.pixel_format == vk::Format::eR32Sfloat && info.num_samples == 1 &&
+               !info.props.is_block && !info.props.is_volume;
+    }
     /// Sample counts the device supports for textures: `mask & N` for N = 1, 2, 4, 8 (the bits of
     /// vk::SampleCountFlags).
     u32 supported_samples_mask = 1;

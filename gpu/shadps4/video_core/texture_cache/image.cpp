@@ -130,6 +130,7 @@ Image::Image(Metal::Device& device_, Vulkan::Runtime& runtime_,
     }
 
     backing = &CreateBacking(info.num_samples);
+    stencil_undefined = has_stencil;
 }
 
 Image::~Image() = default;
@@ -179,6 +180,7 @@ void Image::ApplyNewUsage(u32 needed) {
     const u32 samples = backing->num_samples;
     backing_images.clear();
     backing = &CreateBacking(samples);
+    stencil_undefined = has_stencil;
 }
 
 u32 Image::NeededUsage(const ImageViewInfo& view_info) const {
@@ -222,6 +224,11 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         backing->last_view = static_cast<u32>(std::distance(view_infos.begin(), it));
         const auto view_id = backing->image_view_ids[backing->last_view];
         return (*slot_image_views)[view_id];
+    }
+    // fifa-hybrid: a depth view of a colour image is made on its D32 twin (created here if new).
+    if (!has_depth && DepthTwinEligible() &&
+        Vulkan::LiverpoolToVK::IsFormatDepthCompatible(view_info.format)) {
+        runtime->SyncDepthTwin(this);
     }
     if (const u32 needed = NeededUsage(view_info)) {
         if (Vulkan::BindHelper::OnHelper()) {

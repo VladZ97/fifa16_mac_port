@@ -368,6 +368,9 @@ public:
     }
 
     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
+    /// Length of the runtime array that is member `array_member` of `structure`.
+    Id OpArrayLength(Id result_type, Id structure, std::uint32_t array_member);
+
     Id OpAccessChain(Id result_type, Id base, std::span<const Id> indexes = {});
 
     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.

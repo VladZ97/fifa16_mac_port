@@ -455,6 +455,16 @@ struct Encoder::Impl {
     id<MTLComputeCommandEncoder> compute;
     id<MTLBlitCommandEncoder> blit;
     std::vector<Object> keep;
+    std::string shader_trace; ///< pipelines used in this command buffer (watchdog report)
+    std::unordered_set<const void*> traced_pipelines;
+    void NoteShader(const void* pipeline, NSString* label) {
+        if (!Device::TraceShaders() || pipeline == nullptr || shader_trace.size() > 6000 ||
+            !traced_pipelines.insert(pipeline).second) {
+            return;
+        }
+        shader_trace += label ? label.UTF8String : "?";
+        shader_trace += "; ";
+    }
 
     // Ordering of untracked buffers (mtl_order.h); `order` is null with hazard tracking.
     OrderTracker* order;
@@ -775,6 +785,11 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         if (FenceCheck::Get().On()) {
             FenceCheck::Get().Committed((__bridge void*)c);
         }
+        if (!shader_trace.empty()) {
+            c.label = [NSString stringWithUTF8String:shader_trace.c_str()];
+            shader_trace.clear();
+            traced_pipelines.clear();
+        }
         u64 tick = 0;
         if (tracked) {
             tick = device.Commit((__bridge void*)c);
@@ -929,6 +944,8 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         id<MTLComputeCommandEncoder> e = Compute(compute_access, compute_lane);
         if (compute_pipeline_dirty) {
             [e setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_pipeline];
+            NoteShader(compute_pipeline,
+                       ((__bridge id<MTLComputePipelineState>)compute_pipeline).label);
             compute_pipeline_dirty = false;
         }
         StageState& s = compute_stage;
@@ -1034,6 +1051,8 @@ kernel void fill_u32(device uint* dst [[buffer(0)]], constant uint2& args [[buff
         const u32 d = render_dirty;
         if (d & BitPipeline) {
             [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)render_pipeline];
+            NoteShader(render_pipeline,
+                       ((__bridge id<MTLRenderPipelineState>)render_pipeline).label);
         }
         if (d & BitDepthStencil) {
             // Metal takes no nil state: "none" is a state that always passes and writes nothing.

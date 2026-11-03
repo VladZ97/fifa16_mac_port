@@ -107,7 +107,7 @@ void host_view_apply(uint32_t op, uint32_t prot, uint64_t address, uint64_t size
     GpuRange hook = NULL;
     pthread_rwlock_wrlock(&table_lock);
     ++events_applied;
-    if (!size || (start | size) % BBGPU_GUEST_PAGE || start < BBGPU_GUEST_MIN || end > BBGPU_GUEST_MAX || end < start) {
+    if (!size || (start | size) % BBGPU_GUEST_PAGE || !bbgpu_guest_range_ok(start, end)) {
         fail_view(op, address, size, phys, "range check", EINVAL);
         pthread_rwlock_unlock(&table_lock);
         return;

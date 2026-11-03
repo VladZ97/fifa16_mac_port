@@ -1,3 +1,8 @@
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <set>
+#include <unordered_set>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -32,8 +37,31 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+namespace VideoCore {
+extern std::set<VAddr> g_bb_dump_volume_addrs;
+}
+
 namespace Vulkan {
 static int PassLabels();
+static u64 g_probe_key = 0; // DEBUG(bbport): compute key of the pipeline being bound
+
+// fifa-hybrid: a pass whose clip space is [-w, w] stores window depth in [-1, 1] on the PS4
+// (viewport zoffset 0, zscale 1); Metal clamps the viewport to [0, 1] and the vertex stage
+// stores (z + 1) / 2 instead, so shaders reading such a depth target get the inverse mapping
+// (PushData::depth_remap). BB_DEPTH_REMAP=0 disables.
+static bool DepthRemapEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_DEPTH_REMAP"); // opt-in: it blurred close-ups (DOF
+        return env && env[0] == '1';                       // reads the remapped depth) and did not
+                                                           // change the brightness
+    }();
+    return enabled;
+}
+
+static bool GlDepthPass(const AmdGpu::Regs& regs) {
+    return DepthRemapEnabled() &&
+           regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -88,7 +116,7 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
     scheduler.SetPassEndHook(
         [](void* self) { FlushDeferredCopies(*static_cast<Rasterizer*>(self)); }, this);
     // bbport: the frame capture's event trace also lists the SRT walkers' guest reads.
-    if (std::getenv("BB_CAPTURE_TRIGGER")) {
+    if (([] { static const bool v = std::getenv("BB_CAPTURE_TRIGGER") != nullptr; return v; }())) {
         Shader::srt_read_hook = [](u64 address, u32 size) {
             if (FrameCapture::Tracing()) {
                 FrameCapture::Trace(fmt::format("W {:#x} {}", address, size));
@@ -272,6 +300,9 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
     return image_id;
 }
 
+}
+namespace VideoCore { extern std::set<VAddr> g_bb_dump_extra; }
+namespace Vulkan {
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
@@ -286,6 +317,24 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         auto& [image_id, desc] = cb_descs[cb];
         const auto& col_buf = regs.color_buffers[cb];
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
+        if (([] { static const bool v = std::getenv("BB_BCVIEW_LOG") != nullptr; return v; }()) && col_buf && col_buf.Address() >= 0x250000000ull &&
+            col_buf.Address() < 0x259000000ull) {
+            static std::set<u64> seen_rt;
+            const auto* ps_i = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            const u64 ps_h = ps_i ? ps_i->pgm_hash : 0;
+            u32 bcr; std::memcpy(&bcr, &regs.blend_control[cb], 4);
+            const u64 k = col_buf.Address() ^ (u64(col_buf.GetDataFmt()) << 40) ^ (u64(target_mask) << 48) ^ (ps_h * 31) ^ (u64(bcr) << 8);
+            if (seen_rt.insert(k).second && seen_rt.size() < 80) {
+                std::fprintf(stderr, "[STAGERT] ps %016llx blend %#x bypass %d cb%d at %#llx dfmt %u nfmt %u pitch %u h %u mask %#x mrt %#x skip %d export %#x tile %u\n",
+                             (unsigned long long)ps_h, bcr, int(col_buf.info.blend_bypass),
+                             cb, (unsigned long long)col_buf.Address(), u32(col_buf.GetDataFmt()),
+                             u32(col_buf.GetNumberFmt()), col_buf.Pitch(), col_buf.Height(), target_mask,
+                             key.mrt_mask, int(skip_cb_binding), u32(regs.color_export_format.raw), u32(col_buf.GetTileMode()));
+                if (ps_i) for (const auto& r : ps_i->images) { const auto rt = r.GetSharp(*ps_i);
+                    if (u32(rt.GetDataFmt()) >= 35 && u32(rt.GetDataFmt()) <= 41) VideoCore::g_bb_dump_extra.insert(rt.Address());
+                    std::fprintf(stderr, "[STAGEPS]   tex %#llx f%u n%u %ux%u t%u sel%u%u%u%u mips%u\n", (unsigned long long)rt.Address(), u32(rt.GetDataFmt()), u32(rt.GetNumberFmt()), rt.width + 1, rt.height + 1, u32(rt.tiling_index), u32(rt.dst_sel_x), u32(rt.dst_sel_y), u32(rt.dst_sel_z), u32(rt.dst_sel_w), u32(rt.last_level - rt.base_level + 1)); }
+            }
+        }
         if (skip_cb_binding || !col_buf || !target_mask || (key.mrt_mask & (1 << cb)) == 0) {
             image_id = {};
             continue;
@@ -498,7 +547,35 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     return tid == liverpool->GetGpuCommandProcessorThreadId();
 }
 
+namespace {
+std::mutex vb_w_mutex;
+std::vector<std::tuple<VAddr, u64, char>> vb_w_ranges;
+} // namespace
+
+void VbNoteWrite(VAddr address, u64 size, char tag) {
+    static const bool vb_log_w = std::getenv("BB_VB_LOG") != nullptr;
+    if (vb_log_w && size != 0) {
+        std::scoped_lock lk{vb_w_mutex};
+        if (vb_w_ranges.size() < 400000) {
+            vb_w_ranges.emplace_back(address, size, tag);
+        }
+    }
+}
+
 void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
+    static const bool vb_log_w = std::getenv("BB_VB_LOG") != nullptr;
+    if (vb_log_w) {
+        std::scoped_lock lk{vb_w_mutex};
+        if (vb_w_ranges.size() < 400000) {
+            vb_w_ranges.emplace_back(address, size, 'P');
+        }
+    }
+    if (size != 0 && size <= 64) {
+        // fifa-hybrid: tiny shader-written buffers (occlusion counters, flags) that the guest
+        // polls are written back after the submission (FlushTinyWritten).
+        std::scoped_lock lk{tiny_written_mutex};
+        tiny_written.emplace_back(address, size);
+    }
     if (!draw_pipe || !size) {
         return;
     }
@@ -602,6 +679,16 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         // written by the GPU (now or by work still queued for the recording thread).
         if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD ||
             buffer_cache.IsRegionGpuModified(address, size) || PendingWriteOverlaps(address, size)) {
+            continue;
+        }
+        // fifa-hybrid: memory a GPU-written image still owns (on-demand readback pending) is
+        // stale in RAM; leave it to ObtainBuffer, which downloads the image first.
+        if (!([] { static const bool v = std::getenv("BB_RB_RINGOLD") != nullptr; return v; }()) && texture_cache.HasOndemandIn(address, size)) {
+            static int rn = 0;
+            if (([] { static const bool v = std::getenv("BB_VB_LOG") != nullptr; return v; }()) && rn++ < 2000) {
+                std::fprintf(stderr, "[RBQ] ring-skip addr=%#llx size=%#llx\n",
+                             (unsigned long long)address, (unsigned long long)size);
+            }
             continue;
         }
         copy(index, nullptr, address, size);
@@ -1058,6 +1145,134 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
     }
+    // bbport debug: BB_SKIP_PS="hash,hash" drops the draws using these pixel shaders.
+    static const std::vector<u64> skip_ps = [] {
+        std::vector<u64> out;
+        if (const char* s = std::getenv("BB_SKIP_PS")) {
+            for (char* e = nullptr; *s; s = *e ? e + 1 : e) {
+                out.push_back(std::strtoull(s, &e, 16));
+            }
+        }
+        return out;
+    }();
+    // DEBUG(bbport): BB_LIST_PS=1 logs each pixel shader the first time it is drawn (temporary).
+    static const bool list_ps = std::getenv("BB_LIST_PS") != nullptr;
+    if (list_ps) {
+        static std::unordered_set<u64> seen;
+        static const auto t0 = std::chrono::steady_clock::now();
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        if (ps && seen.insert(ps->pgm_hash).second) {
+            std::fprintf(stderr, "[LISTPS] t=%.1f ps %llx vs %llx rt0 %#llx fmt %u mrt %x\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                             .count(),
+                         (unsigned long long)ps->pgm_hash,
+                         (unsigned long long)(vs ? vs->pgm_hash : 0),
+                         (unsigned long long)(regs.color_buffers[0] ? regs.color_buffers[0].Address()
+                                                                    : 0),
+                         u32(regs.color_buffers[0].GetDataFmt()),
+                         pipeline->GetGraphicsKey().mrt_mask);
+        }
+    }
+    if (!skip_ps.empty()) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        if (ps && std::find(skip_ps.begin(), skip_ps.end(), ps->pgm_hash) != skip_ps.end()) {
+            return;
+        }
+    }
+    // fifa-hybrid diagnostics: BB_RESOLVE_LOG=1 prints the EQAA resolve's constants (ps 92176db0:
+    // buffer 0 dwords 0-3 = colour samples, coverage samples, fmask bits, fmask mask; buffer 1
+    // dword 4 = weight) once a second.
+    if (static const bool resolve_log = std::getenv("BB_RESOLVE_LOG") != nullptr; resolve_log) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        if (ps && (ps->pgm_hash & 0xffffffffull) == 0x92176db0ull && ps->buffers.size() >= 2) {
+            static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::milliseconds(1000)) {
+                last = now;
+                const auto s0 = ps->buffers[0].GetSharp(*ps), s1 = ps->buffers[1].GetSharp(*ps);
+                if (s0.base_address && s1.base_address && memory->IsValidGpuMapping(s0.base_address, 0) &&
+                    memory->IsValidGpuMapping(s1.base_address, 0)) {
+                    const auto* d0 = reinterpret_cast<const u32*>(s0.base_address);
+                    const auto* d1 = reinterpret_cast<const u32*>(s1.base_address);
+                    float w;
+                    std::memcpy(&w, &d1[4], sizeof w);
+                    std::fprintf(stderr, "[RESOLVE] b0[0..3]=%u %u %u %#x b1[4]=%g (aa=%u cb_samples=%u) b1=%#llx\n",
+                                 d0[0], d0[1], d0[2], d0[3], w, u32(regs.aa_config.NumSamples()),
+                                 u32(regs.color_buffers[0].NumSamples()), (unsigned long long)s1.base_address);
+                    // BB_RESOLVE_WATCH=1: watch b1[4] (who writes it, write-back values).
+                    if (static const bool rw = std::getenv("BB_RESOLVE_WATCH") != nullptr; rw) {
+                        VideoCore::g_bb_bufwatch.store(u64(s1.base_address) + 16, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
+    // fifa-hybrid diagnostics: BB_TONE_LOG=1 prints the tonemapper's constants once a second
+    // (pixel shader c37c824e7df, buffer 1 dwords: 29 exposure, 30 curve mode).
+    static const bool tone_log = std::getenv("BB_TONE_LOG") != nullptr;
+    if (tone_log) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        // The tonemapper: five buffers, eight images of which images 3-6 are the 3D grading LUTs.
+        const auto is_tonemapper = [&] {
+            if (!ps || ps->buffers.size() != 5 || ps->images.size() != 8) {
+                return false;
+            }
+            for (u32 i = 3; i <= 6; ++i) {
+                if (ps->images[i].GetSharp(*ps).GetType() != AmdGpu::ImageType::Color3D) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (is_tonemapper()) {
+            static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::milliseconds(1000)) {
+                last = now;
+                const auto sharp = ps->buffers[1].GetSharp(*ps);
+                const VAddr address = sharp.base_address;
+                if (address != 0 && memory->IsValidGpuMapping(address, 0)) {
+                    const auto* d = reinterpret_cast<const u32*>(address);
+                    const auto f = [&](u32 i) {
+                        float v;
+                        std::memcpy(&v, &d[i], sizeof v);
+                        return v;
+                    };
+                    std::fprintf(stderr,
+                                 "[TONE] ps %llx buf=%#llx size=%u d9=%g d11=%g d12=%g d28=%g "
+                                 "exp(d29)=%g mode(d30)=%u d31=%g d32=%g\n",
+                                 (unsigned long long)ps->pgm_hash, (unsigned long long)address,
+                                 sharp.GetSize(), f(9), f(11), f(12), f(28), f(29), d[30], f(31),
+                                 f(32));
+                    for (u32 i = 0; i < ps->images.size(); ++i) {
+                        const auto tsharp = ps->images[i].GetSharp(*ps);
+                        const VideoCore::ImageInfo info{tsharp, ps->images[i]};
+                        if (tsharp.GetType() == AmdGpu::ImageType::Color3D) {
+                            VideoCore::g_bb_dump_volume_addrs.insert(tsharp.Address());
+                        }
+                        std::fprintf(stderr,
+                                     "[TONE]   img%u addr=%#llx %ux%ux%u type=%u data_fmt=%u "
+                                     "num_fmt=%u -> %s mips=%u tile=%u dst_sel=%u,%u,%u,%u\n",
+                                     i, (unsigned long long)tsharp.Address(), tsharp.width,
+                                     tsharp.height, tsharp.depth, u32(tsharp.GetType()),
+                                     u32(tsharp.GetDataFmt()), u32(tsharp.GetNumberFmt()),
+                                     vk::to_string(info.pixel_format).c_str(),
+                                     info.resources.levels, u32(tsharp.tiling_index),
+                                     u32(tsharp.dst_sel_x), u32(tsharp.dst_sel_y),
+                                     u32(tsharp.dst_sel_z), u32(tsharp.dst_sel_w));
+                    }
+                }
+            }
+        }
+    }
+    // fifa-hybrid A/B (temporary): BB_SKIP_SQUARE_DEPTH=1 drops depth-only draws into square
+    // targets (the shadow maps), so the scene renders against shadow maps left at their clear value.
+    static const bool skip_square_depth = std::getenv("BB_SKIP_SQUARE_DEPTH") != nullptr;
+    if (skip_square_depth && pipeline->GetGraphicsKey().mrt_mask == 0 &&
+        regs.depth_buffer.DepthValid() && regs.depth_buffer.Pitch() == regs.depth_buffer.Height()) {
+        return;
+    }
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
@@ -1077,6 +1292,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
     const bool bound = BindResources(pipeline);
+    // fifa-hybrid diagnostics: BB_DUMP_R32=<dir> dumps the bound small R32 images through the
+    // memoized binding path too (DebugDumpTexture self-limits per address).
+    if (static const bool dump_r32 = std::getenv("BB_DUMP_R32") != nullptr; dump_r32 && bound) {
+        for (const auto image_id : bound_images) {
+            if (image_id) {
+                const auto& info = texture_cache.GetImage(image_id).info;
+                if (info.pixel_format == vk::Format::eR32Sfloat && info.size.width <= 1024) {
+                    static std::map<VAddr, std::chrono::steady_clock::time_point> seen;
+                    const auto now = std::chrono::steady_clock::now();
+                    auto [it, fresh] = seen.try_emplace(info.guest_address, now);
+                    if (fresh || now - it->second > std::chrono::seconds(30)) {
+                        it->second = now;
+                        std::fprintf(stderr, "[R32LOOP] bound %#llx %ux%u\n",
+                                     (unsigned long long)info.guest_address, info.size.width, info.size.height);
+                    }
+                    texture_cache.DebugDumpTexture(image_id);
+                }
+            }
+        }
+    }
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
@@ -1217,6 +1452,167 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             runs->Draw(e, DrawPipelines(*pipeline), draw_state, resources, draw_args);
         },
         IsTessellated(*pipeline));
+    // fifa-hybrid diagnostics: BB_DUMP_PS=<hash,...> writes colour target 0 after every draw of
+    // these pixel shaders (from BB_DUMP_PS_AT seconds after the first draw, at most BB_DUMP_PS_MAX
+    // (60) files) as <BB_DUMP_DIR>/dNNN_ps<hash>_<w>x<h>.raw; BB_DUMP_PS_RECT=x,y,w,h crops.
+    // 4-byte formats only (raw RGBA/BGRA order as the format says).
+    {
+        static const std::vector<u64> dump_ps = [] {
+            std::vector<u64> out;
+            if (const char* s = std::getenv("BB_DUMP_PS")) {
+                for (char* e = nullptr; *s; s = *e ? e + 1 : e) {
+                    out.push_back(std::strtoull(s, &e, 16));
+                    if (e == s) break;
+                }
+            }
+            return out;
+        }();
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        // BB_DUMP_PS=all: every draw (its state is logged; a file only with a 4-byte target).
+        static const bool dump_all = [] {
+            const char* s = std::getenv("BB_DUMP_PS");
+            return s && std::strcmp(s, "all") == 0;
+        }();
+        // BB_DUMP_RT=<hex guest address>: also every draw into that colour target.
+        static const u64 dump_rt = [] {
+            const char* s = std::getenv("BB_DUMP_RT");
+            return s ? std::strtoull(s, nullptr, 16) : 0ull;
+        }();
+        const bool rt_match = dump_rt != 0 && regs.color_buffers[0] &&
+                              regs.color_buffers[0].Address() == dump_rt;
+        if (dump_all || rt_match || (!dump_ps.empty() && ps &&
+            std::find(dump_ps.begin(), dump_ps.end(), ps->pgm_hash) != dump_ps.end())) {
+            static const double at = [] {
+                const char* e = std::getenv("BB_DUMP_PS_AT");
+                return e ? std::atof(e) : 0.0;
+            }();
+            static const int max_files = [] {
+                const char* e = std::getenv("BB_DUMP_PS_MAX");
+                return e ? std::atoi(e) : 60;
+            }();
+            static const std::array<u32, 4> rect = [] {
+                std::array<u32, 4> r{0, 0, 0, 0};
+                if (const char* e = std::getenv("BB_DUMP_PS_RECT")) {
+                    std::sscanf(e, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
+                }
+                return r;
+            }();
+            static const std::string dir = [] {
+                const char* env = std::getenv("BB_DUMP_DIR");
+                return std::string{env && env[0] ? env : "out/dump"};
+            }();
+            static const auto t0 = std::chrono::steady_clock::now();
+            static int written = 0;
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            // BB_DUMP_PS_TRIGGER=<file>: dumps start once the file exists (checked every 64 draws).
+            static const char* trigger = std::getenv("BB_DUMP_PS_TRIGGER");
+            static bool triggered = trigger == nullptr;
+            static u32 polls = 0;
+            if (!triggered && (++polls % 64) == 0) {
+                if (FILE* f = std::fopen(trigger, "rb")) {
+                    std::fclose(f);
+                    triggered = true;
+                }
+            }
+            // BB_DUMP_PS_LOGONLY=1: the state lines only, no pass ends or copies.
+            static const bool log_only = std::getenv("BB_DUMP_PS_LOGONLY") != nullptr;
+            if (now >= at && written < max_files && triggered) {
+                const auto& dc = regs.depth_control;
+                const auto& sr = regs.stencil_ref_front;
+                const auto& sc = regs.stencil_control;
+                const auto& bc = regs.blend_control[0];
+                std::fprintf(stderr,
+                             "[DUMPPS] draw t=%.1f ps %llx vs %llx rt0 %#llx db %#llx st %#llx idx %u inst %u "
+                             "stencil en=%u func=%u ref=%u mask=%#x wmask=%#x fail=%u zpass=%u zfail=%u "
+                             "depth en=%u w=%u blend en=%u src=%u dst=%u fn=%u asrc=%u adst=%u sep=%u cmask=%#x\n",
+                             now, (unsigned long long)(ps ? ps->pgm_hash : 0),
+                             (unsigned long long)vs_info.pgm_hash,
+                             (unsigned long long)(regs.color_buffers[0] ? regs.color_buffers[0].Address() : 0),
+                             (unsigned long long)regs.depth_buffer.DepthAddress(),
+                             (unsigned long long)regs.depth_buffer.StencilAddress(), num_indices, num_instances,
+                             u32(dc.stencil_enable), u32(dc.stencil_ref_func), u32(sr.stencil_test_val),
+                             u32(sr.stencil_mask), u32(sr.stencil_write_mask), u32(sc.stencil_fail_front),
+                             u32(sc.stencil_zpass_front), u32(sc.stencil_zfail_front), u32(dc.depth_enable),
+                             u32(dc.depth_write_enable), u32(bc.enable), u32(bc.color_src_factor),
+                             u32(bc.color_dst_factor), u32(bc.color_func), u32(bc.alpha_src_factor),
+                             u32(bc.alpha_dst_factor), u32(bc.separate_alpha_blend),
+                             u32(regs.color_target_mask.raw));
+                const auto& vp = regs.viewports[0];
+                const auto& ss = regs.screen_scissor;
+                std::fprintf(stderr, "[DUMPPS]   viewport %g %g %g %g scissor %d,%d-%d,%d opval=%u sclear=%u zclear=%u sclearval=%u bound=%u/%u\n",
+                             vp.xscale, vp.xoffset, vp.yscale, vp.yoffset, int(ss.top_left_x),
+                             int(ss.top_left_y), int(ss.bottom_right_x), int(ss.bottom_right_y),
+                             u32(sr.stencil_op_val), u32(regs.depth_render_control.stencil_clear_enable),
+                             u32(regs.depth_render_control.depth_clear_enable), u32(regs.stencil_clear),
+                             u32(BoundDepthAttachment(regs).HasDepth()), u32(BoundDepthAttachment(regs).HasStencil()));
+            }
+            // BB_DUMP_PS_STENCIL=1: the stencil attachment after the draw too (sNNN_..., 1 byte/px).
+            static const bool dump_stencil = std::getenv("BB_DUMP_PS_STENCIL") != nullptr;
+            if (dump_stencil && !log_only && now >= at && written < max_files && triggered && db_desc.first) {
+                auto& dimage = texture_cache.GetImage(db_desc.first);
+                if (dimage.GetImage() && regs.depth_buffer.StencilValid()) {
+                    const u32 x = std::min(rect[0], dimage.info.size.width - 1);
+                    const u32 y = std::min(rect[1], dimage.info.size.height - 1);
+                    const u32 w = rect[2] ? std::min(rect[2], dimage.info.size.width - x) : dimage.info.size.width - x;
+                    const u32 h = rect[3] ? std::min(rect[3], dimage.info.size.height - y) : dimage.info.size.height - y;
+                    const u64 size = u64(w) * h;
+                    scheduler.EndRendering();
+                    auto buffer = std::make_shared<VideoCore::Buffer>(device, VideoCore::MemoryType::HostCached, 0, size, "Stencil dump");
+                    scheduler.Record([texture = dimage.GetImage(), x, y, w, h, dst = buffer->Ref(), size](Metal::Encoder& e) {
+                        e.CopyTextureToBuffer(texture, 0, 0, {x, y, 0}, {w, h, 1}, dst, w, u32(size), Metal::BlitAspect::Stencil);
+                    });
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/s%03d_%ux%u.raw", dir.c_str(), written, w, h);
+                    scheduler.DeferPriorityOperation([buffer, size, file = std::string{path}] {
+                        if (FILE* f = std::fopen(file.c_str(), "wb")) {
+                            std::fwrite(buffer->mapped_data.data(), 1, size, f);
+                            std::fclose(f);
+                        }
+                    });
+                }
+            }
+            if (log_only && now >= at && written < max_files && triggered) {
+                ++written;
+            }
+            if (cb_descs[0].first && triggered && !log_only) {
+            auto& image = texture_cache.GetImage(cb_descs[0].first);
+            const bool four_bytes = image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+                                    image.info.pixel_format == vk::Format::eB8G8R8A8Unorm ||
+                                    image.info.pixel_format == vk::Format::eR8G8B8A8Srgb ||
+                                    image.info.pixel_format == vk::Format::eB8G8R8A8Srgb ||
+                                    image.info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 ||
+                                    image.info.pixel_format == vk::Format::eB10G11R11UfloatPack32 ||
+                                    image.info.pixel_format == vk::Format::eR32Sfloat;
+            if (now >= at && written < max_files && four_bytes && image.GetImage()) {
+                const u32 x = std::min(rect[0], image.info.size.width - 1);
+                const u32 y = std::min(rect[1], image.info.size.height - 1);
+                const u32 w = rect[2] ? std::min(rect[2], image.info.size.width - x) : image.info.size.width - x;
+                const u32 h = rect[3] ? std::min(rect[3], image.info.size.height - y) : image.info.size.height - y;
+                const u32 row = w * 4;
+                const u64 size = u64(row) * h;
+                scheduler.EndRendering();
+                auto buffer = std::make_shared<VideoCore::Buffer>(device, VideoCore::MemoryType::HostCached, 0, size, "Draw dump");
+                scheduler.Record([texture = image.GetImage(), x, y, w, h, dst = buffer->Ref(), row, size](Metal::Encoder& e) {
+                    e.CopyTextureToBuffer(texture, 0, 0, {x, y, 0}, {w, h, 1}, dst, row, u32(size));
+                });
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/d%03d_ps%08x_%ux%u_%s.raw", dir.c_str(), written,
+                              u32(ps->pgm_hash), w, h, vk::to_string(image.info.pixel_format).c_str());
+                std::fprintf(stderr, "[DUMPPS] %d t=%.1f ps %llx vs %llx rt %#llx %ux%u idx %u inst %u -> %s\n", written, now,
+                             (unsigned long long)ps->pgm_hash, (unsigned long long)vs_info.pgm_hash,
+                             (unsigned long long)image.info.guest_address, image.info.size.width,
+                             image.info.size.height, num_indices, num_instances, path);
+                scheduler.DeferPriorityOperation([buffer, size, file = std::string{path}] {
+                    if (FILE* f = std::fopen(file.c_str(), "wb")) {
+                        std::fwrite(buffer->mapped_data.data(), 1, size, f);
+                        std::fclose(f);
+                    }
+                });
+                ++written;
+            }
+            }
+        }
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1413,6 +1809,95 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
         return;
     }
+    if (([] { static const bool v = std::getenv("BB_BCVIEW_LOG") != nullptr; return v; }())) {
+        static std::set<u64> seen_w;
+        const auto in_stage = [](u64 a, u64 n = 1) { return (a < 0x26a200000ull && a + n > 0x269c00000ull) || (a < 0x258e48000ull && a + n > 0x257e48000ull); };
+        for (const auto& b : cs.buffers) {
+            if (b.IsSpecial() || !b.is_written) continue;
+            const auto v = b.GetSharp(cs);
+            if (in_stage(v.base_address, v.GetSize()) && seen_w.insert(cs.pgm_hash ^ (v.base_address << 1)).second)
+                std::fprintf(stderr, "[STAGEW] cs %016llx buffer at %#llx size %u stride %u dfmt %u nfmt %u fmtd %d grid %ux%ux%u\n",
+                             (unsigned long long)cs.pgm_hash, (unsigned long long)v.base_address,
+                             u32(v.GetSize()), u32(v.GetStride()), u32(v.GetDataFmt()), u32(v.GetNumberFmt()),
+                             int(b.is_formatted), cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        }
+        for (const auto& d : cs.images) {
+            const auto t = d.GetSharp(cs);
+            if (d.is_written && in_stage(t.Address(), u64(t.width + 1) * (t.height + 1) * 32) &&
+                seen_w.insert(cs.pgm_hash ^ (t.Address() << 1)).second)
+                std::fprintf(stderr, "[STAGEW] cs %016llx image at %#llx fmt %u nfmt %u %ux%u\n",
+                             (unsigned long long)cs.pgm_hash, (unsigned long long)t.Address(),
+                             u32(t.GetDataFmt()), u32(t.GetNumberFmt()), t.width + 1, t.height + 1);
+        }
+        if (cs.pgm_hash == 0x52abaae0ull) {
+            static std::atomic<u32> nc{0};
+            if (nc++ < 400) {
+                std::string s;
+                for (const auto& r : cs.images) {
+                    const auto rt = r.GetSharp(cs);
+                    s += fmt::format(" [{} {:#x} f{} n{} {}x{} sel{}{}{}{} t{}]", r.is_written ? "W" : "R",
+                                     rt.Address(), u32(rt.GetDataFmt()), u32(rt.GetNumberFmt()),
+                                     rt.width + 1, rt.height + 1, u32(rt.dst_sel_x), u32(rt.dst_sel_y),
+                                     u32(rt.dst_sel_z), u32(rt.dst_sel_w), u32(rt.tiling_index));
+                }
+                std::fprintf(stderr, "[CPYCS] grid %ux%u%s\n", cs_program.dim_x, cs_program.dim_y, s.c_str());
+                static u64 last_kit = 0;
+                static std::atomic<u32> nd{0};
+                for (const auto& r : cs.images) {
+                    const auto rt = r.GetSharp(cs);
+                    if (r.is_written && rt.GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8 &&
+                        rt.width + 1 == 2048) {
+                        last_kit = rt.Address();
+                    }
+                    if (!r.is_written && last_kit && rt.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32_32 &&
+                        rt.tiling_index == 8 && memory->IsValidGpuMapping(last_kit, 2048 * 2048 * 4)) {
+                        const u8* g = reinterpret_cast<const u8*>(last_kit);
+                        u64 sum[4] = {}, nz[4] = {};
+                        for (u32 i = 0; i < 2048 * 2048; ++i)
+                            for (u32 k = 0; k < 4; ++k) { sum[k] += g[i * 4 + k]; nz[k] += g[i * 4 + k] != 0; }
+                        std::fprintf(stderr, "[KITCPU] %#llx nz %llu %llu %llu %llu mean %llu %llu %llu %llu\n",
+                                     (unsigned long long)last_kit, nz[0], nz[1], nz[2], nz[3], sum[0] >> 22,
+                                     sum[1] >> 22, sum[2] >> 22, sum[3] >> 22);
+                        if (nd++ < 3) {
+                            const auto p = fmt::format("/Users/me/fifa_metal/dumps/kitcpu{}_R8G8B8A8_2048x2048_t8.bin", nd.load());
+                            if (FILE* f = std::fopen(p.c_str(), "wb")) { std::fwrite(g, 1, 2048 * 2048 * 4, f); std::fclose(f); }
+                        }
+                        last_kit = 0;
+                    }
+                }
+            }
+        }
+        for (const auto& d : cs.images) {
+            const auto t = d.GetSharp(cs);
+            if (d.is_written && t.GetDataFmt() == AmdGpu::DataFormat::Format32_32_32_32) {
+                static std::set<u64> seen_cs;
+                if (seen_cs.insert(cs.pgm_hash ^ t.Address()).second && seen_cs.size() < 12) {
+                    std::fprintf(stderr, "[ENCCS] cs %016llx writes 128b at %#llx %ux%u grid %ux%ux%u nimg=%zu\n",
+                                 (unsigned long long)cs.pgm_hash,
+                                 (unsigned long long)t.Address(), t.width + 1, t.height + 1,
+                                 cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, cs.images.size());
+                    for (const auto& r : cs.images) {
+                        const auto rt = r.GetSharp(cs);
+                        if (!r.is_written && memory->IsValidGpuMapping(rt.Address(), 16)) {
+                            const u32* g = reinterpret_cast<const u32*>(rt.Address());
+                            const u32 n = (rt.width + 1) * (rt.height + 1);
+                            u32 c[4] = {};
+                            for (u32 i = 0; i < n; ++i)
+                                for (u32 k = 0; k < 4; ++k) c[k] += g[i * 4 + k] != 0;
+                            for (u32 i = 0; i < 4; ++i)
+                                std::fprintf(stderr, "[ENCCS]   t%u %08x %08x %08x %08x\n", i * 37,
+                                             g[i * 148], g[i * 148 + 1], g[i * 148 + 2], g[i * 148 + 3]);
+                            std::fprintf(stderr, "[ENCCS]   guest src nz x=%u y=%u z=%u w=%u of %u tile=%u\n",
+                                         c[0], c[1], c[2], c[3], n, u32(rt.tiling_index));
+                        }
+                        std::fprintf(stderr, "[ENCCS]   img w=%d fmt=%u nfmt=%u %ux%u at %#llx\n", int(r.is_written),
+                                     u32(rt.GetDataFmt()), u32(rt.GetNumberFmt()), rt.width + 1, rt.height + 1,
+                                     (unsigned long long)rt.Address());
+                    }
+                }
+            }
+        }
+    }
 
     SetDrawEncoders(*pipeline);
     if (!BindResources(pipeline)) {
@@ -1509,8 +1994,31 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::FlushTinyWritten() {
+    buffer_cache.FlushHotReadPages(); // fifa-hybrid
+    std::vector<std::pair<VAddr, u64>> pending;
+    {
+        std::scoped_lock lk{tiny_written_mutex};
+        pending.swap(tiny_written);
+    }
+    if (pending.empty()) {
+        return;
+    }
+    std::sort(pending.begin(), pending.end());
+    VAddr last_page = ~VAddr(0);
+    for (const auto& [addr, size] : pending) {
+        const VAddr page = addr & ~VAddr(0xFFF);
+        if (page == last_page) {
+            continue;
+        }
+        last_page = page;
+        buffer_cache.DownloadSmallAsync(addr, size);
+    }
+}
+
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
+    FlushTinyWritten(); // fifa-hybrid
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -1638,6 +2146,8 @@ void Rasterizer::JoinBindHelper(void* context) {
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     pipeline_is_compute = pipeline->IsCompute();
+    g_probe_key = pipeline_is_compute
+                      ? static_cast<const ComputePipeline*>(pipeline)->KeyValue() : 0;
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1957,6 +2467,63 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             .stride = buffer.GetStride(),
         };
     }
+    static const bool vb_log = std::getenv("BB_VB_LOG") != nullptr;
+    static std::atomic<u32> vb_logged{};
+    if (vb_log && fetch->attributes.size() == 6 && vb_logged.fetch_add(1) < 400) {
+        const auto [vb_vo, vb_io] =
+            GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), fetch);
+        std::string s = fmt::format("[VBLOG] ready={} sr0={} sr1={} vo={} io={} ni={}",
+                                    ready != nullptr, regs.vgt_instance_step_rate_0,
+                                    regs.vgt_instance_step_rate_1, vb_vo, vb_io,
+                                    regs.num_instances.NumInstances());
+        for (u32 i = 0; i < guest_buffers.size(); ++i) {
+            const auto& b = guest_buffers[i];
+            const auto& at = fetch->attributes[i];
+            const u32 loc = at.semantic;
+            u32 first = 0;
+            if (b.base_address) {
+                std::memcpy(&first, reinterpret_cast<const void*>(b.base_address), 4);
+            }
+            if (i == 5 && b.base_address && b.GetStride()) {
+                u32 nz = 0, cnt = b.num_records, firstnz = ~0u;
+                for (u32 k = 0; k < cnt; ++k) {
+                    u32 v;
+                    std::memcpy(&v, reinterpret_cast<const void*>(b.base_address + k * b.GetStride()), 4);
+                    if (v != 0 && firstnz == ~0u) firstnz = k;
+                    nz += v != 0;
+                }
+                s += fmt::format(" | a5nz {}/{} first={} gpumod={}", nz, cnt, firstnz,
+                                 buffer_cache.IsRegionGpuModified(b.base_address, b.GetSize()));
+                std::scoped_lock lk{vb_w_mutex};
+                u32 hits = 0;
+                for (const auto& [wa, ws, wt] : vb_w_ranges) {
+                    if (wa < b.base_address + b.GetSize() && b.base_address < wa + ws && hits++ < 6) {
+                        s += fmt::format(" W{}[{:#x}+{:#x}]", wt, wa, ws);
+                    }
+                }
+                s += fmt::format(" whits={}", hits);
+                if (b.GetStride() == 16) {
+                    const u8* rp = reinterpret_cast<const u8*>(b.base_address) - 12;
+                    for (u32 r = 0; r < 3; ++r) {
+                        s += " R[";
+                        for (u32 k = 0; k < 16; ++k) s += fmt::format("{:02x}", rp[r * 16 + k]);
+                        s += "]";
+                    }
+                    const u8* mid = rp + (cnt / 2) * 16;
+                    s += " M[";
+                    for (u32 k = 0; k < 16; ++k) s += fmt::format("{:02x}", mid[k]);
+                    s += "]";
+                }
+            }
+            s += fmt::format(" | a{} loc{} step{} dfmt{} nfmt{} base={:#x} stride={} n={} "
+                             "w0={:#x} host={}",
+                             i, loc, u32(at.GetStepRate()), u32(b.GetDataFmt()),
+                             u32(b.GetNumberFmt()), u64(b.base_address), u32(b.GetStride()),
+                             u32(b.num_records), first,
+                             loc < streams.size() && streams[loc].buffer.buffer != nullptr);
+        }
+        std::fprintf(stderr, "%s\n", s.c_str());
+    }
 }
 
 void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
@@ -2190,6 +2757,40 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding, Shader::PushData& push_data) {
     const u64 alignment = device.GetLimits().storage_alignment;
+    // fifa-hybrid diagnostics: BB_BUFWATCH=<hex address> names, once per stage, the buffers a
+    // shader writes that cover the address (who produces the value the game polls there).
+    if (const u64 watch = VideoCore::g_bb_bufwatch.load(std::memory_order_relaxed); watch != 0) {
+        static std::set<u64> seen;
+        for (u32 i = 0; i < stage.buffers.size(); ++i) {
+            const auto sharp = stage.buffers[i].GetSharp(stage);
+            const u64 base = sharp.base_address, size = sharp.GetSize();
+            if (base <= watch && watch < base + size && seen.insert(stage.pgm_hash * 16 + i).second) {
+                std::fprintf(stderr, "[BUFWATCH] stage %08llx (%s) buf%u addr=%#llx size=%llu written=%d\n",
+                             (unsigned long long)stage.pgm_hash,
+                             stage.sw_stage == Shader::SwStage::Compute ? "cs" : stage.sw_stage == Shader::SwStage::Fragment ? "ps" : "vs",
+                             i, (unsigned long long)base, (unsigned long long)size,
+                             int(stage.buffers[i].is_written));
+            }
+        }
+    }
+    // fifa-hybrid diagnostics: BB_BUF_LOG=<hex pgm hash> prints that stage's buffer bindings once.
+    if (static const u64 want = [] {
+            const char* env = std::getenv("BB_BUF_LOG");
+            return env ? std::strtoull(env, nullptr, 16) : 0ull;
+        }();
+        want != 0 && (stage.pgm_hash & 0xffffffffull) == want) {
+        static bool printed = false;
+        if (!printed) {
+            printed = true;
+            for (u32 i = 0; i < stage.buffers.size(); ++i) {
+                const auto sharp = stage.buffers[i].GetSharp(stage);
+                std::fprintf(stderr, "[BUF] %08llx buf%u addr=%#llx size=%u written=%d stride=%u\n",
+                             (unsigned long long)stage.pgm_hash, i,
+                             (unsigned long long)sharp.base_address, sharp.GetSize(),
+                             int(stage.buffers[i].is_written), sharp.GetStride());
+            }
+        }
+    }
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         auto& element = BoundAt(binding.unified++);
@@ -2318,6 +2919,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                 stage.pgm_hash);
                 }
                 push_data.AddOffset(binding.buffer, adjust);
+                // DEBUG(bbport): BB_PROBE_SHADER=<hash> logs this shader's buffers (temporary).
+                static const u64 probe_hash = [] {
+                    const char* e = std::getenv("BB_PROBE_SHADER");
+                    return e ? std::strtoull(e, nullptr, 16) : 0ull;
+                }();
+                if (probe_hash != 0 && (stage.pgm_hash == probe_hash || g_probe_key == probe_hash)) {
+                    static std::atomic<int> probes{0};
+                    if (probes.fetch_add(1) < 48) {
+                        const auto* w = reinterpret_cast<const u32*>(vsharp.base_address);
+                        u32 mx = 0;
+                        const u32 n = std::min<u64>(size / 64, 4096);
+                        for (u32 i = 0; i < n; ++i) {
+                            mx = std::max(mx, w[i * 16]);
+                        }
+                        std::fprintf(stderr,
+                                     "[PROBE] cs %#llx b%u addr %#llx size %llu stride %u w%d "
+                                     "adj %llu off %llu | w0..3 %08x %08x %08x %08x max(w[16i]) %u "
+                                     "over %u\n",
+                                     (unsigned long long)stage.pgm_hash, buffer_index,
+                                     (unsigned long long)vsharp.base_address,
+                                     (unsigned long long)size, u32(vsharp.GetStride()),
+                                     int(desc.is_written), (unsigned long long)adjust,
+                                     (unsigned long long)offset, w[0], w[1], w[2], w[3], mx, n);
+                    }
+                }
                 element = {.buffer = buffer->Ref(offset_aligned), .size = size + adjust};
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
                                            stage.sw_stage == Shader::SwStage::Fragment ||
@@ -2380,10 +3006,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                               Shader::Backend::Bindings& binding, bool on_helper) {
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
+    u32 depth_remap_mask = 0; // fifa-hybrid: images flagged gl_depth (PushData::depth_remap)
     if (!on_helper && BindTexturesFromSet(stage, prepared, set_slot)) {
         // One element per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage.images.size(); ++i) {
             BoundAt(binding.unified++) = image_infos[first_image_idx + i];
+        }
+        if (stage.sw_stage == Shader::SwStage::Fragment || stage.sw_stage == Shader::SwStage::Compute) {
+            push_data.depth_remap = set_depth_remap;
         }
         BindSamplers(stage, prepared, binding);
         return;
@@ -2479,6 +3109,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     image_id = depth_image_id;
                     image = &texture_cache.GetImage(image_id);
                 }
+                if (image->gl_depth && image_index < 32) {
+                    depth_remap_mask |= 1u << image_index; // fifa-hybrid: PushData::depth_remap
+                }
+                if (static const bool depth_log = std::getenv("BB_DEPTHBIND_LOG") != nullptr; depth_log) {
+                    static std::set<std::tuple<u64, u32, VAddr>> seen;
+                    if (seen.emplace(stage.pgm_hash, image_index, image->info.guest_address).second &&
+                        seen.size() < 400 && image->info.size.width >= 256) {
+                        std::fprintf(stderr, "[DEPTHBIND] ps %08llx img%u addr %#llx %ux%u %s gl_depth=%d\n",
+                                     (unsigned long long)stage.pgm_hash, image_index,
+                                     (unsigned long long)image->info.guest_address, image->info.size.width,
+                                     image->info.size.height, vk::to_string(image->info.pixel_format).c_str(),
+                                     int(image->gl_depth));
+                std::fprintf(stderr, "[DEPTHBIND]   samples=%u sharp_type=%u\n", image->info.num_samples, u32(tsharp.GetType()));
+                    }
+                }
                 debug_native(*image);
                 if (image->binding.is_bound) {
                     image->binding.force_general |= image_desc.is_written;
@@ -2517,7 +3162,61 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
             }
+            if (image->gl_depth && image_index < 32) {
+                depth_remap_mask |= 1u << image_index; // fifa-hybrid: PushData::depth_remap
+            }
+            if (static const bool depth_log = std::getenv("BB_DEPTHBIND_LOG") != nullptr; depth_log) {
+                static std::set<std::tuple<u64, u32, VAddr>> seen;
+                if (seen.emplace(stage.pgm_hash, image_index, image->info.guest_address).second &&
+                    seen.size() < 400 && image->info.size.width >= 256) {
+                    std::fprintf(stderr, "[DEPTHBIND] ps %08llx img%u addr %#llx %ux%u %s gl_depth=%d\n",
+                                 (unsigned long long)stage.pgm_hash, image_index,
+                                 (unsigned long long)image->info.guest_address, image->info.size.width,
+                                 image->info.size.height, vk::to_string(image->info.pixel_format).c_str(),
+                                 int(image->gl_depth));
+                std::fprintf(stderr, "[DEPTHBIND]   samples=%u sharp_type=%u\n", image->info.num_samples, u32(tsharp.GetType()));
+                }
+            }
             debug_native(*image);
+            if (static const bool pl = std::getenv("BB_PROBE_LUM") != nullptr;
+                pl && image->info.pixel_format == vk::Format::eB10G11R11UfloatPack32 &&
+                image->info.resources.levels == 5 && image->info.size.width == 256) {
+                static std::map<u32, u32> binds;
+                const u32 nb = ++binds[image_id.index];
+                if (nb == 1 || nb == 600 || nb == 6000) {
+                    texture_cache.DebugProbeImage(image_id, nb == 1 ? "first" : "later");
+                }
+            }
+            if (static const bool binds = std::getenv("BB_IMG_BINDS") != nullptr; binds) {
+                // debug: one line per (shader, image, written) binding
+                static std::set<std::tuple<u64, VAddr, bool>> ib;
+                if (ib.emplace(stage.pgm_hash, image->info.guest_address, image_desc.is_written)
+                        .second) {
+                    std::fprintf(stderr, "IMGBIND %#llx %s %ux%u mips=%u %s %#llx written=%d\n",
+                                 (unsigned long long)image->info.guest_address,
+                                 vk::to_string(image->info.pixel_format).c_str(),
+                                 image->info.size.width, image->info.size.height,
+                                 image->info.resources.levels,
+                                 stage.sw_stage == Shader::SwStage::Compute ? "cs" : "gfx",
+                                 (unsigned long long)stage.pgm_hash, int(image_desc.is_written));
+                }
+            }
+            if (image->info.props.is_volume) {
+                texture_cache.DebugDumpVolume(image_id); // fifa-hybrid: self-limited (BB_DUMP_VOLUMES)
+            }
+            if (image->info.props.is_volume && ([] { static const bool v = std::getenv("BB_IMG_FORMATS") != nullptr; return v; }())) {
+                static std::set<std::tuple<u64, VAddr, bool>> vb;
+                if (vb.emplace(stage.pgm_hash, image->info.guest_address, image_desc.is_written)
+                        .second) {
+                    std::fprintf(stderr, "VOLBIND %#llx %s %#llx written=%d\n",
+                                 (unsigned long long)image->info.guest_address,
+                                 stage.sw_stage == Shader::SwStage::Compute ? "cs" : "gfx",
+                                 (unsigned long long)stage.pgm_hash, int(image_desc.is_written));
+                    if (!image_desc.is_written) {
+                        texture_cache.DebugDumpVolume(image_id);
+                    }
+                }
+            }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
                 // need to force general layout on it.
@@ -2527,6 +3226,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
+    }
+
+    // fifa-hybrid: one-texel-per-block views of block-compressed images bind a shadow image.
+    for (u32 binding_index = 0; binding_index < image_bindings.size(); ++binding_index) {
+        auto& [image_id, desc_ptr] = image_bindings[binding_index];
+        if (!image_id || !texture_cache.GetImage(image_id).info.props.is_block ||
+            desc_ptr->info.props.is_block) {
+            continue;
+        }
+        const auto shadow_id = texture_cache.ResolveBlockShadow(image_id, *desc_ptr);
+        if (shadow_id != image_id) {
+            image_id = shadow_id;
+            image_binding_entries[binding_index] = nullptr;
+            set_ok = false;
+        }
     }
 
     // bbport: a lazy usage upgrade replaces the image's texture. Every binding of this stage gets
@@ -2559,6 +3273,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 auto& rebind_desc = image_desc_storage.emplace_back(desc);
                 desc_ptr = &rebind_desc;
                 image_id = texture_cache.FindImage(rebind_desc);
+                if (texture_cache.GetImage(image_id).info.props.is_block &&
+                    !rebind_desc.info.props.is_block) {
+                    image_id = texture_cache.ResolveBlockShadow(image_id, rebind_desc);
+                }
                 memo_entry = nullptr;
                 set_ok = false;
             }
@@ -2569,6 +3287,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             const auto binding = image.binding;
+            if (!is_storage || ([] { static const bool v = std::getenv("BB_DUMP_ADDRS") != nullptr; return v; }())) {
+                texture_cache.DebugDumpTexture(image_id);
+            }
 
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:
             // no resample to the native size (the native image is not touched).
@@ -2617,6 +3338,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         set_slot->generation = texture_cache.RegistryGeneration();
         set_slot->scene_generation = scene_targets->Generation();
         set_slot->count = static_cast<u32>(stage.images.size());
+        set_slot->depth_remap = depth_remap_mask;
         std::copy_n(resolved.begin(), set_slot->count, set_slot->entries.begin());
     } else if (set_slot) {
         set_slot->key = 0;
@@ -2632,6 +3354,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         binding.unified += array_size;
     }
 
+    if (stage.sw_stage == Shader::SwStage::Fragment || stage.sw_stage == Shader::SwStage::Compute) {
+        push_data.depth_remap = depth_remap_mask;
+        // fifa-hybrid plumbing test: BB_DEPTH_REMAP_ALL=1 remaps every sampled image (the picture
+        // must break visibly; if it does not, the push constant does not reach the shaders).
+        static const bool remap_all = std::getenv("BB_DEPTH_REMAP_ALL") != nullptr;
+        if (remap_all) {
+            push_data.depth_remap = 0xFFFFFFFFu;
+        }
+    }
+    // fifa-hybrid diagnostics: BB_REMAP_LOG=1 prints each (shader, mask) once.
+    if (static const bool remap_log = std::getenv("BB_REMAP_LOG") != nullptr; remap_log) {
+        static std::set<std::pair<u64, u32>> seen;
+        if (seen.emplace(stage.pgm_hash, depth_remap_mask).second && seen.size() < 300) {
+            std::fprintf(stderr, "[REMAP] %s %08llx mask=%#x images=%zu set=%d\n",
+                         stage.sw_stage == Shader::SwStage::Fragment ? "ps" : "stage",
+                         (unsigned long long)stage.pgm_hash, depth_remap_mask, stage.images.size(),
+                         int(set_slot != nullptr));
+        }
+    }
     BindSamplers(stage, prepared, binding);
 }
 
@@ -2762,7 +3503,10 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         if (!entry.id) {
             continue;
         }
-        const auto& image = texture_cache.GetImage(entry.id);
+        auto& image = texture_cache.GetImage(entry.id);
+        if (image.depth_twin) {
+            runtime.SyncDepthTwin(&image); // fifa-hybrid: the twin follows the colour writes
+        }
         // Proxy entries need a current proxy; native entries of a proxied image go through
         // BindTextures, which may sample the proxy instead.
         const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
@@ -2781,6 +3525,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     }
     ++texture_set_hits;
     slot = nullptr;
+    set_depth_remap = 0; // fifa-hybrid: recomputed per hit, the gl_depth flag changes after memoization
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
@@ -2789,6 +3534,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         }
         texture_cache.MarkFound(entry.id);
         auto& image = texture_cache.GetImage(entry.id);
+        if (image.gl_depth && i < 32) {
+            set_depth_remap |= 1u << i;
+        }
         image.binding.is_bound = 1u;
         bound_images.emplace_back(entry.id);
         image.usage.texture = 1u;
@@ -2958,7 +3706,81 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
+        if (static const bool rt_log = std::getenv("BB_RT_LOG") != nullptr; rt_log) {
+            // diagnostics: each distinct (address, format, view format) colour target once
+            const auto& cbuf = regs.color_buffers[cb];
+            static std::set<std::tuple<u64, u32, u32, int>> seen_rt;
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            if (seen_rt.emplace(image->info.guest_address, u32(cbuf.GetDataFmt()) << 8 | u32(cbuf.GetNumberFmt()),
+                                ps ? u32(ps->pgm_hash) : 0u, int(cb)).second && seen_rt.size() < 3000) {
+                const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+                std::fprintf(stderr, "[RTFMT] vs %08x cb%u ps %08x addr %#llx %ux%u dfmt %u nfmt %u image %s view %s\n",
+                             vs ? u32(vs->pgm_hash) : 0u, cb, ps ? u32(ps->pgm_hash) : 0u,
+                             (unsigned long long)image->info.guest_address, image->info.size.width,
+                             image->info.size.height, u32(cbuf.GetDataFmt()), u32(cbuf.GetNumberFmt()),
+                             vk::to_string(image->info.pixel_format).c_str(),
+                             vk::to_string(image_view.info.format).c_str());
+                std::fprintf(stderr, "[RTFMT]   samples=%u key_samples=%u aa=%u addr %#llx\n", image->info.num_samples, u32(key.color_samples[cb]), u32(regs.aa_config.NumSamples()), (unsigned long long)image->info.guest_address);
+            }
+        }
 
+        // fifa-hybrid diagnostics: BB_TRACE_AT=<s>[,<s>...] logs every colour-target binding (one
+        // line per draw with cb0) for the next BB_TRACE_DRAWS (default 2500) draws after each listed
+        // second since the first draw: a per-frame pass list to diff open play against a replay.
+        if (cb == 0) {
+            static const std::vector<double> trace_at = [] {
+                std::vector<double> out;
+                if (const char* e = std::getenv("BB_TRACE_AT")) {
+                    for (char* end = nullptr; *e; e = *end ? end + 1 : end) {
+                        out.push_back(std::strtod(e, &end));
+                        if (end == e) break;
+                    }
+                }
+                return out;
+            }();
+            if (!trace_at.empty()) {
+                static const int trace_draws = [] {
+                    const char* e = std::getenv("BB_TRACE_DRAWS");
+                    return e ? std::atoi(e) : 2500;
+                }();
+                static const auto t0 = std::chrono::steady_clock::now();
+                static size_t next = 0;
+                static int left = 0;
+                const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (next < trace_at.size() && now >= trace_at[next]) {
+                    std::fprintf(stderr, "[TR] ---- trace %zu at %.1fs ----\n", next, now);
+                    ++next;
+                    left = trace_draws;
+                }
+                if (left > 0) {
+                    --left;
+                    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                    const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+                    const auto& db = regs.depth_buffer;
+                    std::fprintf(stderr, "[TR] ps %08x vs %08x cb0 %#llx %ux%u %s n%u db %#llx\n",
+                                 ps ? u32(ps->pgm_hash) : 0u, vs ? u32(vs->pgm_hash) : 0u,
+                                 (unsigned long long)image->info.guest_address, image->info.size.width,
+                                 image->info.size.height, vk::to_string(image->info.pixel_format).c_str(),
+                                 state.num_colors, (unsigned long long)(db.DepthAddress()));
+                }
+            }
+        }
+        // fifa-hybrid diagnostics: BB_BLEND_LOG=1 logs the blend state of each (ps, state) drawing
+        // into the HDR scene target (B10G11R11), once.
+        if (static const bool blend_log = std::getenv("BB_BLEND_LOG") != nullptr;
+            blend_log && image->info.pixel_format == vk::Format::eB10G11R11UfloatPack32) {
+            const auto& bc = regs.blend_control[cb];
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            static std::set<std::tuple<u64, u32, u32>> seen;
+            if (seen.emplace(ps ? ps->pgm_hash : 0, std::bit_cast<u32>(bc), u32(regs.color_buffers[cb].info.blend_bypass)).second && seen.size() < 300) {
+                std::fprintf(stderr, "[BLEND] ps %08llx cb%u %ux%u enable=%u src=%u dst=%u func=%u asrc=%u adst=%u afunc=%u sep=%u bypass=%u\n",
+                             (unsigned long long)(ps ? ps->pgm_hash : 0), cb, image->info.size.width,
+                             image->info.size.height, u32(bc.enable), u32(bc.color_src_factor),
+                             u32(bc.color_dst_factor), u32(bc.color_func), u32(bc.alpha_src_factor),
+                             u32(bc.alpha_dst_factor), u32(bc.alpha_func), u32(bc.separate_alpha_blend),
+                             u32(regs.color_buffers[cb].info.blend_bypass));
+            }
+        }
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
@@ -2982,6 +3804,13 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         auto& attachment = state.colors[cb];
         attachment = {};
         attachment.texture = image_view.Texture();
+        // fifa-hybrid: a 2D view of a 3D image is the 3D texture itself (image_view.cpp), so
+        // the slice the colour buffer selects must become the render pass's depth plane, or
+        // every slice of a volume rendered slice by slice (FIFA's colour grading LUT) lands in
+        // plane 0.
+        if (image->info.type == AmdGpu::ImageType::Color3D) {
+            attachment.depth_plane = slice;
+        }
         attachment.clear = is_clear;
         if (is_clear) {
             attachment.clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
@@ -3008,15 +3837,32 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+        const auto& image_view = texture_cache.FindDepthTarget(image_id, desc, GlDepthPass(regs));
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
+        if (static const bool rt_log = std::getenv("BB_RT_LOG") != nullptr; rt_log) {
+            // diagnostics: each distinct (address, size, layers, slice) depth target once
+            static std::set<std::tuple<u64, u32, u32, u32>> seen_db;
+            if (seen_db.emplace(image.info.guest_address,
+                                image.info.size.width << 16 | image.info.size.height,
+                                image.info.resources.layers, slice).second &&
+                seen_db.size() < 600) {
+                const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+                std::fprintf(stderr, "[DBFMT] vs %08x addr %#llx %ux%u layers %u slice %u fmt %s view %s\n",
+                             vs ? u32(vs->pgm_hash) : 0u,
+                             (unsigned long long)image.info.guest_address, image.info.size.width,
+                             image.info.size.height, image.info.resources.layers, slice,
+                             vk::to_string(image.info.pixel_format).c_str(),
+                             vk::to_string(image_view.info.format).c_str());
+            }
+        }
         const bool is_depth_clear =
             (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
              regs.depth_control.depth_write_enable) ||
             texture_cache.IsMetaCleared(htile_address, slice);
-        const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        u32 stencil_clear_value = regs.stencil_clear;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
@@ -3038,13 +3884,29 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.has_depth = bound.HasDepth();
         state.has_stencil = bound.HasStencil();
         state.stencil_only = state.has_stencil && !state.has_depth;
+        // fifa-hybrid: a never-written stencil plane starts at 0 like PS4 memory (the UI's
+        // stencil masks are written relative to it; undefined = 0xff inverted them: the
+        // scoreboard's shine outside its shape). BB_STENCIL_ZERO=0 disables.
+        static const bool stencil_zero = [] {
+            const char* e = std::getenv("BB_STENCIL_ZERO");
+            return !(e && e[0] == '0');
+        }();
+        if (stencil_zero && state.has_stencil && image.stencil_undefined) {
+            image.stencil_undefined = false;
+            if (!is_stencil_clear) {
+                is_stencil_clear = true;
+                stencil_clear_value = 0;
+            }
+            LOG_INFO(Render_Vulkan, "Zeroing the fresh stencil of depth target {:#x} {}x{}",
+                     image.info.guest_address, image.info.size.width, image.info.size.height);
+        }
         if (state.has_depth) {
             attachment.clear = is_depth_clear;
             attachment.clear_value.depthStencil.depth = is_depth_clear ? regs.depth_clear : 0.0f;
         }
         if (state.has_stencil) {
             attachment.clear_stencil = is_stencil_clear;
-            attachment.clear_value.depthStencil.stencil = is_stencil_clear ? regs.stencil_clear : 0u;
+            attachment.clear_value.depthStencil.stencil = is_stencil_clear ? stencil_clear_value : 0u;
         }
 
         if (reduced) {
@@ -3099,7 +3961,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             }
             if (depth_redirected) {
                 state.depth.texture =
-                    texture_cache.FindDepthTarget(db_desc.first, db_desc.second).Texture();
+                    texture_cache.FindDepthTarget(db_desc.first, db_desc.second, GlDepthPass(regs)).Texture();
             }
         } else {
             state.width = redirect.width;
@@ -3208,6 +4070,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
             return; // bbport: nothing to fill; no empty blit
         }
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            texture_cache.DropOndemandCovered(address, num_bytes);
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -3235,6 +4098,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            texture_cache.DropOndemandCovered(dst, num_bytes);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
@@ -3277,28 +4141,160 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    ResolveOndemandImages(addr, size, true, assume_locks);
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
 
-bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
+void Rasterizer::OnCpuWrite(VAddr addr, u64 size, VAddr fault) {
+    // The game already wrote: no readback may land on this range now. Pages the host tracked for
+    // upload become CPU-modified (as ExtendWriteFault); on the written page a pending GPU write
+    // (a label written back asynchronously) is dropped, the CPU's later write wins.
     DrainDrawPipe();
-    if (!InvalidateMemory(addr, 8, assume_locks)) {
-        return false;
+    if (!IsMapped(addr, size)) {
+        return;
     }
-    buffer_cache.ExtendWriteFault(addr);
-    return true;
+    // Images: only the written bytes, as the relayed path did (InvalidateMemory(fault, 8)). The
+    // whole window dirtied GPU-only render targets sharing it (the MSAA scene depth was then
+    // re-uploaded from stale guest memory and the depth resolve saw the clear value).
+    texture_cache.InvalidateMemory(fault, 8);
+    buffer_cache.OnCpuWrite(addr, size, fault);
+}
+
+bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
+    // fifa-hybrid diagnostics: BB_FAULT_STATS=1 times the phases of a write fault (host side).
+    static const bool stats = std::getenv("BB_FAULT_STATS") != nullptr;
+    if (!stats) {
+        DrainDrawPipe();
+        if (!InvalidateMemory(addr, 8, assume_locks)) {
+            return false;
+        }
+        buffer_cache.ExtendWriteFault(addr);
+        return true;
+    }
+    using Clock = std::chrono::steady_clock;
+    static std::atomic<u64> n{0}, unmapped{0}, t_drain{0}, t_ondemand{0}, t_buffer{0}, t_texture{0},
+        t_extend{0};
+    static std::atomic<s64> window_start{0};
+    const auto t0 = Clock::now();
+    DrainDrawPipe();
+    const auto t1 = Clock::now();
+    bool mapped = IsMapped(addr, 8);
+    auto t2 = t1, t3 = t1, t4 = t1, t5 = t1;
+    if (mapped) {
+        ResolveOndemandImages(addr, 8, true, assume_locks);
+        t2 = Clock::now();
+        buffer_cache.InvalidateMemory(addr, 8, assume_locks);
+        t3 = Clock::now();
+        texture_cache.InvalidateMemory(addr, 8);
+        t4 = Clock::now();
+        buffer_cache.ExtendWriteFault(addr);
+        t5 = Clock::now();
+    } else {
+        unmapped.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto us = [](auto a, auto b) {
+        return u64(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
+    n.fetch_add(1, std::memory_order_relaxed);
+    t_drain.fetch_add(us(t0, t1), std::memory_order_relaxed);
+    t_ondemand.fetch_add(us(t1, t2), std::memory_order_relaxed);
+    t_buffer.fetch_add(us(t2, t3), std::memory_order_relaxed);
+    t_texture.fetch_add(us(t3, t4), std::memory_order_relaxed);
+    t_extend.fetch_add(us(t4, t5), std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count();
+    s64 ws = window_start.load(std::memory_order_relaxed);
+    if (ws == 0) {
+        window_start.compare_exchange_strong(ws, now);
+    } else if (now - ws >= 2000000000 && window_start.compare_exchange_strong(ws, now)) {
+        const u64 cnt = n.exchange(0);
+        std::printf("[WFAULT] n=%llu unmapped=%llu drain=%.1fms ondemand=%.1fms buffer=%.1fms "
+                    "(flushes %llu) texture=%.1fms extend=%.1fms\n",
+                    (unsigned long long)cnt, (unsigned long long)unmapped.exchange(0),
+                    t_drain.exchange(0) / 1e3, t_ondemand.exchange(0) / 1e3,
+                    t_buffer.exchange(0) / 1e3,
+                    (unsigned long long)buffer_cache.write_flushes.exchange(0),
+                    t_texture.exchange(0) / 1e3, t_extend.exchange(0) / 1e3);
+        std::fflush(stdout);
+    }
+    return mapped;
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+    static const bool log_reads = std::getenv("BB_LOG_READFAULTS") != nullptr;
+    if (log_reads) {
+        static std::atomic<u64> count{0};
+        const u64 n = count.fetch_add(1);
+        if (n < 300 || (n % 500) == 0) {
+            std::fprintf(stderr, "[RF] #%llu addr=%#llx size=%llu locks=%d gpumod=%d ondemand=%d\n",
+                         (unsigned long long)n, (unsigned long long)addr, (unsigned long long)size,
+                         int(assume_locks), int(buffer_cache.IsRegionGpuModified(addr, size)),
+                         int(texture_cache.HasOndemandIn(addr, size)));
+        }
+    }
     DrainDrawPipe();
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    ResolveOndemandImages(addr, size, false, assume_locks);
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
+}
+
+// fifa-hybrid: images awaiting an on-demand readback that overlap a CPU access are downloaded
+// now, on the GPU command thread (the download records a tiling dispatch and drains the GPU).
+void Rasterizer::ResolveOndemandImages(VAddr addr, u64 size, bool for_write, bool assume_locks) {
+    // Most faults touch no pending image; the round trip to the GPU thread below waited for its
+    // whole command list (several ms per write fault in matches).
+    if (!texture_cache.HasOndemandIn(addr, size)) {
+        return;
+    }
+    static const bool stats = std::getenv("BB_FAULT_STATS") != nullptr;
+    if (stats && for_write) {
+        texture_cache.LogOndemandWrite(addr, size);
+    }
+    static const bool drop_on_write = [] {
+        const char* env = std::getenv("BB_ONDEMAND_WRITE_DROP");
+        return !env || env[0] != '0';
+    }();
+    if (for_write && drop_on_write) {
+        texture_cache.ForgetOndemandImagesIn(addr, size, true);
+        if (!texture_cache.HasOndemandIn(addr, size)) {
+            return;
+        } // block-compressed images and their shadows below: downloaded before the write
+    }
+    // fifa-hybrid: prefetched images need no round trip (TextureCache::ResolvePrefetchedOndemand).
+    if (!assume_locks && texture_cache.ResolvePrefetchedOndemand(addr, size)) {
+        return;
+    }
+    if (assume_locks) {
+        texture_cache.DownloadImagesForCpuRead(addr, size, for_write, true);
+        return;
+    }
+    // fifa-hybrid: the GPU thread records the downloads and submits; this (fault) thread waits
+    // for the device and writes guest memory, so frames keep flowing meanwhile. The warm-up
+    // drill's asset loading faulted 10-40 times per 2 s with a full drain each on the GPU
+    // thread. BB_READBACK_GPUWAIT=1 restores the drain on the GPU thread.
+    static const bool gpu_wait = [] {
+        const char* env = std::getenv("BB_READBACK_GPUWAIT");
+        return env && env[0] == '1';
+    }();
+    if (gpu_wait) {
+        liverpool->SendCommand<true>([this, addr, size, for_write] {
+            DrainDrawPipe();
+            texture_cache.DownloadImagesForCpuRead(addr, size, for_write, false);
+        });
+        return;
+    }
+    VideoCore::TextureCache::CpuReadWork work;
+    liverpool->SendCommand<true>([this, addr, size, for_write, &work] {
+        DrainDrawPipe();
+        texture_cache.DownloadImagesForCpuRead(addr, size, for_write, false, &work);
+    });
+    texture_cache.FinishCpuReadWork(work);
 }
 
 void Rasterizer::ProcessDownloadImages() {
@@ -3426,6 +4422,16 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.maxDepth = zoffset + zscale;
         }
 
+        // fifa-hybrid diagnostics: BB_VP_LOG=1 prints each distinct viewport depth mapping once.
+        if (static const bool vp_log = std::getenv("BB_VP_LOG") != nullptr; vp_log) {
+            static std::set<std::tuple<float, float, int>> seen;
+            if (seen.emplace(zoffset, zscale, int(regs.clipper_control.clip_space)).second &&
+                seen.size() < 40) {
+                std::fprintf(stderr, "[VP] zoffset=%g zscale=%g clip_space=%d -> min=%g max=%g\n",
+                             zoffset, zscale, int(regs.clipper_control.clip_space), viewport.minDepth,
+                             viewport.maxDepth);
+            }
+        }
         // Metal has no unrestricted depth range (nor had MoltenVK): restrict to [0, 1].
         viewport.minDepth = std::max(viewport.minDepth, 0.f);
         viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
@@ -3530,10 +4536,24 @@ void Rasterizer::UpdateDepthStencilState() const {
     dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
     if (depth_bias_enabled) {
         const bool front = regs.polygon_control.enable_polygon_offset_front;
-        dynamic_state.SetDepthBias(
-            front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset,
-            regs.poly_offset.depth_bias,
-            (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
+        // fifa-hybrid A/B: BB_BIAS_SCALE=<f> scales the polygon offset (0 disables, -1 flips).
+        static const float bias_scale = [] {
+            const char* env = std::getenv("BB_BIAS_SCALE");
+            return env ? float(std::atof(env)) : 1.0f;
+        }();
+        static const bool bias_log = std::getenv("BB_BIAS_LOG") != nullptr;
+        const float constant = front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
+        const float slope = (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f;
+        if (bias_log) {
+            static std::set<std::pair<float, float>> seen;
+            if (seen.emplace(constant, slope).second && seen.size() < 40) {
+                std::fprintf(stderr, "[BIAS] constant=%g slope=%g clamp=%g front=%d depth fmt %u\n",
+                             constant, slope, regs.poly_offset.depth_bias, int(front),
+                             u32(regs.depth_buffer.z_info.format));
+            }
+        }
+        dynamic_state.SetDepthBias(constant * bias_scale, regs.poly_offset.depth_bias,
+                                   slope * bias_scale);
     }
 
     const auto stencil_test_enabled =
@@ -3720,9 +4740,13 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
     if (pass_labels) {
         std::string targets;
         for (u32 cb = 0; cb < state.num_colors; ++cb) {
-            targets += cb_descs[cb].first
-                           ? vk::to_string(texture_cache.GetImage(cb_descs[cb].first).info.pixel_format)
-                           : std::string{"-"};
+            if (cb_descs[cb].first) {
+                const auto& info = texture_cache.GetImage(cb_descs[cb].first).info;
+                targets += fmt::format("{}@{:x}", vk::to_string(info.pixel_format),
+                                       info.guest_address);
+            } else {
+                targets += '-';
+            }
             targets += ' ';
         }
         const auto* ps_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];

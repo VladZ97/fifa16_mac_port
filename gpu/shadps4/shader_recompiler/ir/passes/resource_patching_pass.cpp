@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <limits>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -290,8 +291,14 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         switch (inst.GetOpcode()) {
         case IR::Opcode::ImageRead:
         case IR::Opcode::ImageSampleRaw: {
-            IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(0x76543210));
-            IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(0xfedcba98));
+            // fifa-hybrid: BB_FMASK=<hex> overrides the emulated FMASK word (experiment: FIFA's
+            // EQAA 4:2 resolve weights samples by this; the identity pattern gives 1/4 brightness).
+            static const u32 fmask_pattern = [] {
+                const char* env = std::getenv("BB_FMASK");
+                return env ? u32(std::strtoul(env, nullptr, 16)) : 0x76543210u;
+            }();
+            IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(fmask_pattern));
+            IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(fmask_pattern == 0x76543210u ? 0xfedcba98u : fmask_pattern));
             inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));
             return;
         }

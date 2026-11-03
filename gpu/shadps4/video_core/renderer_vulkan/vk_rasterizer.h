@@ -36,6 +36,8 @@ class Device;
 
 namespace Vulkan {
 
+void VbNoteWrite(VAddr address, u64 size, char tag); // BB_VB_LOG debug
+
 class GraphicsPipeline;
 class Runtime;
 
@@ -130,6 +132,9 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
+    void FlushTinyWritten(); // fifa-hybrid
+    std::mutex tiny_written_mutex;
+    std::vector<std::pair<VAddr, u64>> tiny_written; ///< fifa-hybrid: <=64-byte buffers bound as written
     /// Before a guest-visible write: fences deferred earlier are written first. The wait kicks
     /// the recorder (the recording chunk): on the GPU command thread not while the draw
     /// recording thread runs (every caller drained already; kept local to the invariant).
@@ -146,6 +151,9 @@ public:
     bool IsGpuSideThreadId(u32 tid) const;
     /// A guest write hit a protected page.
     bool OnWriteFault(VAddr addr, bool assume_locks);
+    /// fifa-hybrid: the game lifted the write protection of this range itself (BBGPU_REC_CPU_WRITE).
+    void OnCpuWrite(VAddr addr, u64 size, VAddr fault);
+    void ResolveOndemandImages(VAddr addr, u64 size, bool for_write, bool assume_locks); // fifa-hybrid
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
@@ -294,7 +302,9 @@ private:
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
         std::array<TextureSetEntry, MaxImages> entries{};
+        u32 depth_remap = 0; ///< fifa-hybrid: PushData::depth_remap of the set's images
     };
+    u32 set_depth_remap = 0; ///< of the last memoized set hit
     std::array<TextureSet, 32768> texture_sets{};
     u64 texture_set_hits = 0, texture_set_misses = 0;
     std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new

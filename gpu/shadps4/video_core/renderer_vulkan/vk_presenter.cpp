@@ -252,8 +252,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         input = fsr_pass->Render(draw_scheduler, std::move(input), {image_width, image_height},
                                  {frame->width, frame->height}, fsr_settings, frame->is_hdr);
     }
+    // fifa-hybrid: BB_GAMMA=<factor> scales the game's display gamma (above 1 brightens).
+    static const float user_gamma = [] {
+        const char* env = std::getenv("BB_GAMMA");
+        const float value = env ? std::strtof(env, nullptr) : 1.0f;
+        return value > 0.1f && value < 3.0f ? value : 1.0f;
+    }();
+    auto settings = pp_settings;
+    settings.gamma *= user_gamma;
     pp_pass.Render(draw_scheduler, std::move(input), Metal::Object::Retain(frame->texture.Get()),
-                   frame->width, frame->height, pp_settings);
+                   frame->width, frame->height, settings);
 
     // Flush frame creation commands.
     frame->ready_tick = draw_scheduler.CurrentTick();
@@ -453,6 +461,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         last_present.presented = last_present.submitted;
     });
     BbGpuCapture::OnPresent(device.NativeDevice()); // bbport: BB_GPU_CAPTURE one-frame capture
+    { // bbport: [FSTAT] present-interval stats every 2 s (fps, p99, worst, hitches > 50 ms)
+        static std::vector<double> iv;
+        static auto prev = std::chrono::steady_clock::now(), win = prev;
+        static u64 busy0 = device.GpuBusyNs();
+        const auto now = std::chrono::steady_clock::now();
+        iv.push_back(std::chrono::duration<double, std::milli>(now - prev).count());
+        prev = now;
+        if (now - win >= std::chrono::seconds(2)) {
+            const double secs = std::chrono::duration<double>(now - win).count();
+            std::sort(iv.begin(), iv.end());
+            const size_t hitches = iv.end() - std::upper_bound(iv.begin(), iv.end(), 50.0);
+            const u64 busy = device.GpuBusyNs();
+            std::printf("[FSTAT] fps=%.1f p50=%.1f p99=%.1f max=%.1f hitches=%zu gpu=%.1fms\n",
+                        iv.size() / secs, iv[iv.size() / 2], iv[iv.size() * 99 / 100], iv.back(),
+                        hitches, (busy - busy0) / 1e6 / iv.size());
+            busy0 = busy;
+            std::fflush(stdout);
+            iv.clear();
+            win = now;
+        }
+    }
 
     if (!is_reusing_frame) {
         std::scoped_lock lock{pool->mutex};

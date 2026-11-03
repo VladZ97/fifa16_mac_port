@@ -141,6 +141,7 @@ public:
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
     }
+    Vulkan::Rasterizer* GetRasterizer() const { return rasterizer; } // fifa-hybrid
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {

@@ -193,6 +193,14 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         info.hw.fs.motion_vectors = sel.motion;
+        // fifa-hybrid: see HwFragmentRuntimeInfo::gl_depth (BB_DEPTH_REMAP=0 disables).
+        info.hw.fs.gl_depth = [&] {
+            static const bool enabled = [] {
+                const char* env = std::getenv("BB_DEPTH_REMAP"); // opt-in, see vk_rasterizer.cpp
+                return env && env[0] == '1';
+            }();
+            return enabled && regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        }();
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -571,6 +579,21 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         color_buffer.num_conversion = col_buf.GetNumberConversion();
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
+        if (std::getenv("BB_BCVIEW_LOG") &&
+            col_buf.Address() >= 0x269c00000ull && col_buf.Address() < 0x26a200000ull) {
+            static int n = 0;
+            if (n++ < 30) {
+                std::fprintf(stderr, "[ENCRT] cb%d dfmt=%u nfmt=%u pitch=%u export=%u", cb,
+                             u32(color_buffer.data_format), u32(color_buffer.num_format),
+                             u32(col_buf.Pitch()), u32(color_buffer.export_format));
+                std::fprintf(stderr, " export=%u mask=%#x swz=%u addr=%#llx ps=%#llx\n", cb,
+                             u32(color_buffer.export_format), u32(regs.color_target_mask.raw),
+                             u32(color_buffer.swizzle.r) | (u32(color_buffer.swizzle.g) << 4) |
+                                 (u32(color_buffer.swizzle.b) << 8) | (u32(color_buffer.swizzle.a) << 12),
+                             (unsigned long long)col_buf.Address(),
+                             (unsigned long long)regs.ps_program.Address<uintptr_t>());
+            }
+        }
 
         const auto& bc = regs.blend_control[cb];
         color_buffer.blend_self_scale =
@@ -976,7 +999,16 @@ std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,
 
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage,
                                size_t perm_idx, std::string_view ext) {
-    if (!EmulatorSettings.IsDumpShaders()) {
+    // DEBUG(bbport): BB_DUMP_SHADERS=<hash,...> dumps only those programs (temporary).
+    static const char* dump_list = std::getenv("BB_DUMP_SHADERS");
+    if (dump_list) {
+        if (!std::strstr(dump_list, fmt::format("{:x}", hash).c_str())) {
+            return;
+        }
+        std::fprintf(stderr, "[DUMPMAP] pgm %llx perm %zu perm_hash %llx\n",
+                     (unsigned long long)hash, perm_idx,
+                     (unsigned long long)HashCombine(hash, perm_idx));
+    } else if (!EmulatorSettings.IsDumpShaders()) {
         return;
     }
 

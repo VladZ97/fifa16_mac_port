@@ -33,6 +33,16 @@ void EmitBarrier(EmitContext& ctx) {
                          ctx.ConstU32(static_cast<u32>(memory_semantics)));
 }
 
+// fifa-hybrid (from upstream shadPS4): GCN waves use shared memory between invocations without
+// barriers because they run in lockstep; a subgroup-scope memory barrier keeps the host compiler
+// from reordering those accesses.
+void EmitSubgroupBarrier(EmitContext& ctx) {
+    const auto semantics{static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease |
+                                          spv::MemorySemanticsMask::WorkgroupMemory)};
+    ctx.OpMemoryBarrier(ctx.ConstU32(static_cast<u32>(spv::Scope::Subgroup)),
+                        ctx.ConstU32(semantics));
+}
+
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
     MemoryBarrier(ctx, spv::Scope::Workgroup);
 }

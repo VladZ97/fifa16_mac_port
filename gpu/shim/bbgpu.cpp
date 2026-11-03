@@ -44,6 +44,7 @@ extern "C" {
 // runtime_memory.c
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
+int runtime_memory_read_backing(uintptr_t address, void* out, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
@@ -142,8 +143,11 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             end = source + size;
         }
         const u64 n = std::min<u64>(size, end - source);
-        if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
-        else std::memset(dest, 0, n);
+        // fifa-hybrid: read through the unprotected backing alias when the runtime has one, so a
+        // renderer thread never takes a read fault on a page the precise readback mode protects
+        // (the fault handler would wait for this very thread: deadlock).
+        if (!mapped) std::memset(dest, 0, n);
+        else if (!runtime_memory_read_backing(source, dest, n)) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         source += n; dest += n; size -= n;
     }
 }
@@ -162,7 +166,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, BbWriteLog::Backing);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
 }
-void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
+void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms, u32 flags) {
     BbStats::Timer timer{BbStats::t_protect};
     const u64 pages = (size + 4095) / 4096;
     BbStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
@@ -171,12 +175,15 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
         BbStats::protect_revoke_calls.fetch_add(1, std::memory_order_relaxed);
         BbStats::protect_revoke_pages.fetch_add(pages, std::memory_order_relaxed);
     }
-    runtime_memory_gpu_protect(virtual_addr, size, True(perms & MemoryPermission::Read),
+    // fifa-hybrid: `read` bit 1 = an image write-tracks the pages, bit 2 = unreadable only for
+    // image readbacks the host drops on a write (bbport_split.cpp decides local handling).
+    runtime_memory_gpu_protect(virtual_addr, size,
+                               int(True(perms & MemoryPermission::Read)) | int(flags << 1),
                                True(perms & MemoryPermission::Write));
 }
 boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
     boost::icl::interval_set<VAddr> set;
-    set += boost::icl::interval<VAddr>::right_open(0x10'0000'0000ULL, 0xfc'0000'0000ULL);
+    set += boost::icl::interval<VAddr>::right_open(0x400000ULL, 0xfc'0000'0000ULL) /* fifa-hybrid: shadPS4's whole guest range */;
     return set;
 }
 } // namespace Core
@@ -311,7 +318,30 @@ extern "C" int bbgpu_host_fault(uint64_t address, int write) {
     }
     BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
     BbStats::Timer timer{BbStats::t_read_faults};
-    return rasterizer->ReadMemory(address, 8, false) ? 1 : 0;
+    static const bool stats = std::getenv("BB_FAULT_STATS") != nullptr;
+    if (!stats) {
+        return rasterizer->ReadMemory(address, 8, false) ? 1 : 0;
+    }
+    // fifa-hybrid diagnostics: [RFAULT] read-fault count and host time per 2 s.
+    static std::atomic<u64> n{0}, us{0};
+    static std::atomic<s64> window_start{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    const int handled = rasterizer->ReadMemory(address, 8, false) ? 1 : 0;
+    n.fetch_add(1, std::memory_order_relaxed);
+    us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0).count()),
+                 std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+    s64 ws = window_start.load(std::memory_order_relaxed);
+    if (ws == 0) {
+        window_start.compare_exchange_strong(ws, now);
+    } else if (now - ws >= 2000000000 && window_start.compare_exchange_strong(ws, now)) {
+        const u64 c = n.exchange(0);
+        std::printf("[RFAULT] n=%llu host=%.1fms\n", (unsigned long long)c, us.exchange(0) / 1e3);
+        std::fflush(stdout);
+    }
+    return handled;
 }
 
 extern "C" int bbgpu_host_dispatch(const void* record) {
@@ -335,6 +365,13 @@ extern "C" int bbgpu_host_dispatch(const void* record) {
     if (r->type == BBGPU_REC_INVALIDATE) {
         const auto* range = static_cast<const BbGpuRange*>(record);
         Core::Memory::Instance()->InvalidateMemory(range->address, range->size);
+        return 1;
+    }
+    if (r->type == BBGPU_REC_CPU_WRITE) {
+        const auto* w = static_cast<const BbGpuCpuWrite*>(record);
+        if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+            rasterizer->OnCpuWrite(w->address, w->size, w->fault);
+        }
         return 1;
     }
     return Libraries::GnmDriver::BbSplitHost(r) || Libraries::VideoOut::BbSplitHost(r) ? 1 : 0;
@@ -466,6 +503,15 @@ extern "C" int bbgpu_flush_caches(unsigned timeout_ms) {
 static void OpenWindow(const BbGpuConfig* config) {
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
+    if (config->metal_layer) {
+        // fifa-hybrid: the host application (shadPS4) owns the window and its Metal layer.
+        auto* window = new Frontend::WindowSDL(width, height, config->metal_layer,
+                                               config->layer_scale > 0 ? config->layer_scale : 1.0f);
+        std::scoped_lock lock{g_window_mutex};
+        g_window = window;
+        g_window_ready = true;
+        return;
+    }
 #ifdef __APPLE__
     g_window_width = width;
     g_window_height = height;
@@ -526,6 +572,37 @@ static void OpenWindow(const BbGpuConfig* config) {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
+}
+
+// fifa-hybrid: the host runtime (shadPS4) drives the renderer's memory tracking directly, with
+// the same four calls it makes on its own rasterizer, instead of the map/unmap/invalidate hooks.
+// The run table (BbArenaRuns, the "runs" arena layout) is fed and refreshed here too: there is no
+// ring thread in this mode, so the view event and the refresh happen on the mapping thread.
+namespace {
+std::mutex g_fifa_memory_mutex;
+}
+extern "C" void bbgpu_memory_register(uint64_t address, uint64_t size) {
+    if (auto* r = Core::Memory::Instance()->GetRasterizer()) r->RegisterMemory(address, size);
+}
+extern "C" void bbgpu_memory_map(uint64_t address, uint64_t size) {
+    std::scoped_lock lock{g_fifa_memory_mutex};
+    BbArenaRuns::OnMap(address, size);
+    if (auto* r = Core::Memory::Instance()->GetRasterizer()) r->MapMemory(address, size);
+    BbArenaRuns::Refresh();
+}
+extern "C" void bbgpu_memory_unmap(uint64_t address, uint64_t size) {
+    std::scoped_lock lock{g_fifa_memory_mutex};
+    BbArenaRuns::OnUnmap(address, size);
+    if (auto* r = Core::Memory::Instance()->GetRasterizer()) r->UnmapMemory(address, size);
+    BbArenaRuns::Refresh();
+}
+extern "C" void bbgpu_memory_invalidate(uint64_t address, uint64_t size) {
+    if (auto* r = Core::Memory::Instance()->GetRasterizer()) r->InvalidateMemory(address, size);
+}
+extern "C" void bbgpu_memory_protect(uint64_t address, uint64_t size) {
+    std::scoped_lock lock{g_fifa_memory_mutex};
+    BbArenaRuns::OnProtect(address, size);
+    BbArenaRuns::Refresh();
 }
 
 namespace Libraries::Kernel { void StartKernelService(); }

@@ -355,6 +355,9 @@ void Runtime::FillBuffer(const VideoCore::Buffer& dst, u64 offset, u64 size, u32
 
 void Runtime::AccessImage(VideoCore::Image* image, bool write) {
     BeforeImageAccess();
+    if (write) {
+        ++image->write_serial;
+    }
     if (scene_targets) {
         scene_targets->NativeAccess(*image, write);
     }
@@ -562,6 +565,8 @@ void Runtime::CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& 
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
+    ++dst->write_serial; // fifa-hybrid: the depth twin re-syncs
+
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image upload", *dst};
@@ -620,6 +625,18 @@ void Runtime::CopyRegions(VideoCore::Image* src, VideoCore::Image* dst,
             Metal::SafeViewPixelFormat(own.pixel_format, wanted, true) == wanted) {
             UpgradeUsage(side, VideoCore::Image::UsageFormatViews);
             break;
+        }
+    }
+    if (dst->info.props.is_block && std::getenv("BB_BCVIEW_LOG")) {
+        static int n = 0;
+        if (n++ < 60) {
+            std::fprintf(stderr, "[BCGPU] copy %s %ux%u lv%u at %#llx <- %s %ux%u lv%u at %#llx\n",
+                         vk::to_string(dst->info.pixel_format).c_str(), dst->info.size.width,
+                         dst->info.size.height, dst->info.resources.levels,
+                         (unsigned long long)dst->info.guest_address,
+                         vk::to_string(src->info.pixel_format).c_str(), src->info.size.width,
+                         src->info.size.height, src->info.resources.levels,
+                         (unsigned long long)src->info.guest_address);
         }
     }
     const Metal::TextureDesc& sd = src->backing->desc;
@@ -835,21 +852,36 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                          "image copy through a buffer not possible: skipped (destination)");
         return;
     }
-    const Metal::Size3 size{std::min(sd.width, dd.width), std::min(sd.height, dd.height),
-                            std::min(sd.depth, dd.depth)};
-    const u32 src_row = Common::DivCeil(size.width, sb.width) * sb.bytes;
-    const u32 src_image = src_row * Common::DivCeil(size.height, sb.height);
-    const u32 dst_row = Common::DivCeil(size.width, db.width) * db.bytes;
-    const u32 dst_image = dst_row * Common::DivCeil(size.height, db.height);
+    Metal::Size3 size{std::min(sd.width, dd.width), std::min(sd.height, dd.height),
+                      std::min(sd.depth, dd.depth)};
+    Metal::Size3 src_size = size;
+    Metal::Size3 dst_size = size;
+    if (sb.bytes == db.bytes && (sb.width != db.width || sb.height != db.height)) {
+        // fifa-hybrid: a block-compressed image and an uncompressed image with one texel per
+        // block (BC3 <-> RGBA32Uint): the same bytes, copied block for block.
+        const u32 bw = std::min(Common::DivCeil(sd.width, sb.width),
+                                Common::DivCeil(dd.width, db.width));
+        const u32 bh = std::min(Common::DivCeil(sd.height, sb.height),
+                                Common::DivCeil(dd.height, db.height));
+        src_size = {std::min(bw * sb.width, sd.width), std::min(bh * sb.height, sd.height),
+                    size.depth};
+        dst_size = {std::min(bw * db.width, dd.width), std::min(bh * db.height, dd.height),
+                    size.depth};
+        size = src_size;
+    }
+    const u32 src_row = Common::DivCeil(src_size.width, sb.width) * sb.bytes;
+    const u32 src_image = src_row * Common::DivCeil(src_size.height, sb.height);
+    const u32 dst_row = Common::DivCeil(dst_size.width, db.width) * db.bytes;
+    const u32 dst_image = dst_row * Common::DivCeil(dst_size.height, db.height);
     const u32 layers = std::min({num_layers, sd.layers, dd.layers});
 
     const u64 staging_size = u64(std::max(src_image, dst_image)) * size.depth * layers;
     BeginStagingRoundTrip(buffer, offset, staging_size);
     scheduler.Record([src_texture = src->GetImage(), dst_texture = dst->GetImage(),
-                      ref = buffer->Ref(offset), size, layers, src_row, src_image, dst_row,
-                      dst_image, src_aspect, dst_aspect](Metal::Encoder& e) {
+                      ref = buffer->Ref(offset), size, src_size, dst_size, layers, src_row,
+                      src_image, dst_row, dst_image, src_aspect, dst_aspect](Metal::Encoder& e) {
         for (u32 layer = 0; layer < layers; ++layer) {
-            e.CopyTextureToBuffer(src_texture, 0, layer, {}, size,
+            e.CopyTextureToBuffer(src_texture, 0, layer, {}, src_size,
                                   {ref.buffer, ref.offset + u64(layer) * src_image * size.depth},
                                   src_row, src_image, src_aspect);
         }
@@ -859,7 +891,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         WaitForOwnCopies(e);
         for (u32 layer = 0; layer < layers; ++layer) {
             e.CopyBufferToTexture({ref.buffer, ref.offset + u64(layer) * dst_image * size.depth},
-                                  dst_row, dst_image, dst_texture, 0, layer, {}, size,
+                                  dst_row, dst_image, dst_texture, 0, layer, {}, dst_size,
                                   dst_aspect);
         }
     });
@@ -884,12 +916,100 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     AccessImage(src, false);
     AccessImage(dst, true);
 
-    const TextureRegion region{
-        0, 0, 0, mip, slice, 0, src->info.size.width, src->info.size.height, src->info.size.depth};
-    CopyRegions(src, dst, std::span{&region, 1});
+    // Every layer of the source, as the Vulkan copy does (cube faces rendered one mip at a time).
+    const auto [src_layers, dst_layers] =
+        SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
+    const u32 layers = std::min(src_layers, dst_layers > slice ? dst_layers - slice : 1u);
+    boost::container::small_vector<TextureRegion, 8> regions;
+    for (u32 layer = 0; layer < layers; ++layer) {
+        regions.push_back({0, layer, 0, mip, slice + layer, 0, src->info.size.width,
+                           src->info.size.height, src->info.size.depth});
+    }
+    CopyRegions(src, dst, regions);
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+void Runtime::CopyBlockBytes(VideoCore::Image* src, VideoCore::Image* dst) {
+    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    if (num_mips > 1 || src->info.resources.layers > 1) {
+        // Mip chains (GPU-compressed kits) and arrays (player textures): each level and layer
+        // block for block, through CopyRegions' staging bounce.
+        if (!HasMetalFormat(*src) || !HasMetalFormat(*dst)) {
+            return;
+        }
+        SetBackingSamples(dst, dst->info.num_samples, false);
+        SetBackingSamples(src, src->info.num_samples);
+        scheduler.EndRendering();
+        AccessImage(src, false);
+        AccessImage(dst, true);
+        const u32 layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+        boost::container::small_vector<TextureRegion, 16> regions;
+        for (u32 mip = 0; mip < num_mips; ++mip) {
+            const u32 w = std::max(src->info.size.width >> mip, 1u);
+            const u32 h = std::max(src->info.size.height >> mip, 1u);
+            for (u32 layer = 0; layer < layers; ++layer) {
+                regions.push_back({mip, layer, 0, mip, layer, 0, w, h, 1});
+            }
+        }
+        CopyRegions(src, dst, regions);
+        dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+        dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+        return;
+    }
+    const u64 size = std::max<u64>(std::max(src->info.guest_size, dst->info.guest_size), 64_KB);
+    const auto copy_ref = staging_pool.Request(size, VideoCore::MemoryType::DeviceLocal);
+    CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
+}
+
+void Runtime::SyncDepthTwin(VideoCore::Image* image) {
+    if (!image->DepthTwinEligible()) {
+        return;
+    }
+    if (image->depth_twin && image->depth_twin_synced == image->write_serial) {
+        return;
+    }
+    const Metal::TextureDesc& sd = image->backing->desc;
+    if (!image->depth_twin) {
+        Metal::TextureDesc d = sd;
+        d.pixel_format = Metal::VkToMtl::PixelFormat(vk::Format::eD32Sfloat);
+        d.render_target = false;
+        d.shader_write = false;
+        d.shader_atomic = false;
+        d.format_views = false;
+        image->depth_twin = Metal::CreateTexture(device, d, "depth twin", nullptr);
+        if (!image->depth_twin) {
+            LOG_ERROR(Render_Vulkan, "depth twin of {:#x} {}x{} not created", image->info.guest_address,
+                      sd.width, sd.height);
+            return;
+        }
+        LOG_INFO(Render_Vulkan, "depth twin for R32 image {:#x} {}x{} levels {}",
+                 image->info.guest_address, sd.width, sd.height, sd.levels);
+    }
+    scheduler.EndRendering();
+    AccessImage(image, false);
+    if (static const bool tlog = std::getenv("BB_TWIN_LOG") != nullptr; tlog) {
+        static int n = 0;
+        if (n++ % 100 == 0) {
+            std::fprintf(stderr, "[TWIN] sync #%d image %#llx %ux%u serial %llu\n", n,
+                         (unsigned long long)image->info.guest_address, sd.width, sd.height,
+                         (unsigned long long)image->write_serial);
+        }
+    }
+    for (u32 level = 0; level < sd.levels; ++level) {
+        const u32 w = std::max(1u, sd.width >> level), h = std::max(1u, sd.height >> level);
+        for (u32 layer = 0; layer < sd.layers; ++layer) {
+            const u64 size = u64(w) * h * 4;
+            const auto staging = staging_pool.Request(size, VideoCore::MemoryType::DeviceLocal, 256);
+            scheduler.Record([src = image->GetImage(), dst = image->depth_twin.Get(), ref = staging.buffer->Ref(staging.offset),
+                              w, h, level, layer, size](Metal::Encoder& e) {
+                e.CopyTextureToBuffer(src, level, layer, {}, {w, h, 1}, ref, w * 4, u32(size));
+                e.CopyBufferToTexture(ref, w * 4, u32(size), dst, level, layer, {}, {w, h, 1});
+            });
+        }
+    }
+    image->depth_twin_synced = image->write_serial;
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
@@ -1001,6 +1121,14 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {
     SetBackingSamples(dst, 1, false);
+    if (std::getenv("BB_MSAA_LOG")) { // MSAALOG
+        static int n = 0;
+        if (n++ < 400)
+            std::fprintf(stderr, "[MSAALOG] resolve src=%#llx %ux%u s=%u -> dst=%#llx fmt=%d\n",
+                         (unsigned long long)src->info.guest_address, src->info.size.width,
+                         src->info.size.height, src->backing->desc.samples,
+                         (unsigned long long)dst->info.guest_address, (int)dst->info.pixel_format);
+    }
     scheduler.EndRendering();
     AccessImage(src, false);
     AccessImage(dst, true);
@@ -1140,6 +1268,14 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing = std::addressof(*it);
     }
 
+    if (std::getenv("BB_MSAA_LOG")) { // MSAALOG
+        static int n = 0;
+        if (n++ < 400)
+            std::fprintf(stderr, "[MSAALOG] swap %#llx %ux%u %u->%u copy=%d guest=%u fmt=%d\n",
+                         (unsigned long long)info.guest_address, info.size.width,
+                         info.size.height, backing->num_samples, num_samples, (int)copy_backing,
+                         info.num_samples, (int)info.pixel_format);
+    }
     if (copy_backing) {
         scheduler.EndRendering();
         ASSERT(image->info.resources.levels == 1 && image->info.resources.layers == 1);

@@ -46,10 +46,23 @@ constexpr size_t PM_PAGE_BITS = 12;
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers : 7;
+        u8 num_write_watchers;
         // At the moment only buffer cache can request read watchers.
         // And buffers cannot overlap, thus only 1 can exist per page.
-        u8 num_read_watchers : 1;
+        u8 num_read_watchers; // fifa-hybrid: buffer cache (Precise) + texture cache on-demand readbacks both watch reads; a 1-bit count wrapped to 0 and silently unprotected the page
+        u8 num_image_watchers; // fifa-hybrid: write watchers that belong to images (the game relays
+                               // their faults; buffer-only pages it handles itself, bbport_split.cpp)
+
+        u8 num_image_read_watchers; // of num_read_watchers, those of images awaiting a readback
+
+        u32 Key() const noexcept { // protection plus the flags: ranges split on all of them
+            // 0x100: an image write-tracks the page. 0x200: unreadable only for image readbacks
+            // (no buffer data pending), so a CPU write may drop them (BB_ONDEMAND_WRITE_DROP).
+            return u32(Perms()) | (num_image_watchers ? 0x100u : 0u) |
+                   (num_image_read_watchers && num_image_read_watchers == num_read_watchers
+                        ? 0x200u
+                        : 0u);
+        }
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -105,7 +118,7 @@ struct PageManager::Impl {
         // No-op
     }
 
-    virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+    virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms, u32 flags) = 0;
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
@@ -125,7 +138,7 @@ struct PageManager::Impl {
         return false;
     }
 
-    template <bool track, bool is_read>
+    template <bool track, bool is_read, bool image = false>
     void UpdatePageWatchers(VAddr addr, u64 size) {
         RENDERER_TRACE;
 
@@ -137,7 +150,7 @@ struct PageManager::Impl {
         const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
         Common::RangeLockGuard lk(lock_start, lock_end);
 
-        auto perms = cached_pages[page].Perms();
+        auto perms = cached_pages[page].Key();
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -146,7 +159,8 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                Protect(range_begin << PM_PAGE_BITS, range_bytes,
+                        Core::MemoryPermission(perms & 0xffu), (perms >> 8) & 3u);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -166,8 +180,24 @@ struct PageManager::Impl {
 
             // Apply the change to the page state
             const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
+            bool image_edge = false;
+            if constexpr (image && !is_read) {
+                if constexpr (track) {
+                    image_edge = ++state.num_image_watchers == 1;
+                } else {
+                    ASSERT_MSG(state.num_image_watchers > 0, "Not enough image watchers");
+                    image_edge = --state.num_image_watchers == 0;
+                }
+            } else if constexpr (image && is_read) {
+                if constexpr (track) {
+                    image_edge = ++state.num_image_read_watchers == 1;
+                } else {
+                    ASSERT_MSG(state.num_image_read_watchers > 0, "Not enough image read watchers");
+                    image_edge = --state.num_image_read_watchers == 0;
+                }
+            }
 
-            if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
+            if (auto new_perms = state.Key(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
@@ -176,8 +206,8 @@ struct PageManager::Impl {
                 potential_range_bytes += PM_PAGE_SIZE;
             }
 
-            // Only start a new range if the page must be (un)protected
-            if ((new_count == 0 && !track) || (new_count == 1 && track)) {
+            // Only start a new range if the page must be (un)protected (or re-flagged)
+            if ((new_count == 0 && !track) || (new_count == 1 && track) || image_edge) {
                 if (range_bytes == 0) {
                     // Start a new potential range
                     range_begin = page;
@@ -202,13 +232,13 @@ struct PageManager::Impl {
             // if all pages are contiguous, use the regular UpdatePageWatchers
             const VAddr start_addr = base_addr + (start_range.first << PM_PAGE_BITS);
             const u64 size = (start_range.second - start_range.first) << PM_PAGE_BITS;
-            return UpdatePageWatchers<track, is_read>(start_addr, size);
+            return UpdatePageWatchers<track, is_read, false>(start_addr, size);
         }
 
         size_t base_page = (base_addr >> PM_PAGE_BITS);
         ASSERT(base_page % PAGES_PER_LOCK == 0);
         std::scoped_lock lk(locks[base_page / PAGES_PER_LOCK]);
-        auto perms = cached_pages[base_page + start_range.first].Perms();
+        auto perms = cached_pages[base_page + start_range.first].Key();
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -217,7 +247,8 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                Protect((range_begin << PM_PAGE_BITS), range_bytes,
+                        Core::MemoryPermission(perms & 0xffu), (perms >> 8) & 3u);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -232,7 +263,7 @@ struct PageManager::Impl {
             const u8 new_count =
                 update ? state.AddDelta<track ? 1 : -1, is_read>() : state.AddDelta<0, is_read>();
 
-            if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
+            if (auto new_perms = state.Key(); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
@@ -420,13 +451,25 @@ struct SignalImpl : public PageManager::Impl {
                                                                   priority);
     }
 
-    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms, u32 flags) override {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
-        impl.Protect(address, size, perms);
+        // The game may only write image-readback pages itself when the host drops the readback.
+        static const bool drop_on_write = [] {
+            const char* env = std::getenv("BB_ONDEMAND_WRITE_DROP");
+            return !env || env[0] != '0';
+        }();
+        if (!drop_on_write) {
+            flags &= ~2u;
+        }
+        // fifa-hybrid: a region with only a read watcher (image awaiting an on-demand readback)
+        // would need write-only protection, which does not exist. Block both; a write fault is
+        // handled by InvalidateMemory like any other CPU write.
+        if (perms == Core::MemoryPermission::Write) {
+            perms = Core::MemoryPermission::None;
+        }
+        impl.Protect(address, size, perms, flags);
     }
 
 };
@@ -459,13 +502,22 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
-    impl->UpdatePageWatchers<track, false>(addr, size);
+    impl->UpdatePageWatchers<track, false, true>(addr, size); // the texture cache's images
 }
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const {
     impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
+
+template <bool track, bool image>
+void PageManager::UpdateReadWatchers(VAddr addr, u64 size) const {
+    impl->UpdatePageWatchers<track, true, image>(addr, size);
+}
+template void PageManager::UpdateReadWatchers<true, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdateReadWatchers<false, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdateReadWatchers<true, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdateReadWatchers<false, false>(VAddr addr, u64 size) const;
 
 template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;

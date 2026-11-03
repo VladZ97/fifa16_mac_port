@@ -237,6 +237,13 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     }
     is_rendering = true;
     render_state = new_state;
+    // fifa-hybrid diagnostics: BB_STENCIL_LOG=1 prints every pass begin with its depth/stencil.
+    if (static const bool slog = std::getenv("BB_STENCIL_LOG") != nullptr; slog) {
+        std::fprintf(stderr, "[SPASS] begin colors=%u c0=%p depth=%p has_depth=%d has_stencil=%d clear_d=%d clear_s=%d %ux%u\n",
+                     new_state.num_colors, new_state.colors[0].texture, new_state.depth.texture,
+                     int(new_state.has_depth), int(new_state.has_stencil), int(new_state.depth.clear),
+                     int(new_state.depth.clear_stencil), new_state.width, new_state.height);
+    }
     Record([desc = render_state.ToDesc()](Metal::Encoder& e) { e.BeginRenderPass(desc); });
 }
 

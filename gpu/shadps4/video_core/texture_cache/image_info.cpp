@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -185,6 +186,16 @@ void ImageInfo::UpdateSize() {
                 ASSERT(!props.is_block);
                 std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
                     mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
+                // bbport: ImageSizeMacroTiled lays a mip smaller than a macro tile out micro-tiled
+                // (as the hardware does); the tiling kernels must address it that way too, else
+                // those mips come out scrambled (FIFA 16's shirt names at a distance).
+                if (mip > 0) {
+                    const auto [pitch_align, height_align] =
+                        GetMacroTileExtents(tile_mode, num_bits, num_samples, alt_tile);
+                    if (mip_w < pitch_align || mip_h < height_align) {
+                        micro_tiled_mips |= 1u << mip;
+                    }
+                }
             } else {
                 std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
                     ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
@@ -205,7 +216,10 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         return -1;
     }
 
-    if (info.array_mode != array_mode) {
+    // bbport: small mips of a 2D-tiled chain degrade to 1D tiling, so a render target of one of
+    // them has another array mode than the whole chain; address, pitch and size still decide.
+    static const bool strict_mode = std::getenv("BB_MIPOF_STRICT") != nullptr;
+    if (strict_mode && info.array_mode != array_mode) {
         return -1;
     }
 

@@ -35,6 +35,7 @@
 #include <mach-o/dyld.h>
 #include <libproc.h>
 #include <mach-o/loader.h>
+#include <pthread/qos.h>
 
 void say(const char *format, ...) {
     char line[512];
@@ -137,7 +138,8 @@ static void verify(const BbGpuVerifyRecord *v) {
 static void start_renderer(const BbGpuStart *request) {
     BbGpuShared *s = g_shared;
     s->title[sizeof s->title - 1] = s->serial[sizeof s->serial - 1] = s->user_dir[sizeof s->user_dir - 1] = 0;
-    const BbGpuConfig config = {s->title, s->serial, s->user_dir, s->sdk_version, s->psf_attributes, s->width, s->height};
+    const BbGpuConfig config = {s->title, s->serial, s->user_dir, s->sdk_version, s->psf_attributes, s->width, s->height,
+                               NULL, 0.0f}; /* the host opens its own window */
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     const int rc = started ? -1 : bbgpu_host_start(&config, s);
     __atomic_store_n(&started, rc == 0, __ATOMIC_RELEASE);
@@ -183,6 +185,8 @@ static void *ring_thread(void *unused) {
  * own thread: a fault must never wait behind GPU work on the submit ring. */
 static void *fault_thread(void *unused) {
     (void)unused;
+    /* fifa-hybrid: the game's render thread waits for every answer; wake this thread first. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     BbGpuShared *s = g_shared;
     for (;;) {
         const BbGpuRecord *r = bbgpu_ring_peek(s, &s->faults, UINT64_C(1000000000));
@@ -346,42 +350,49 @@ static void report_guest_range(void) {
  * range is taken over only if nothing but that segment is in it, so no foreign mapping is
  * overwritten. The plain bbgpu-host (no segment: on macOS 26 a pinned zero-fill segment breaks
  * dyld) keeps the mmap hint, which is enough there. bb-probe picks the host by macOS version. */
-static int reserve_guest_range(void) {
-    const uint64_t span = BBGPU_GUEST_MAX - BBGPU_GUEST_MIN;
+static int reserve_range(uint64_t lo, uint64_t hi, const char *segname) {
+    const uint64_t span = hi - lo;
     const struct mach_header_64 *image = (const struct mach_header_64 *)_dyld_get_image_header(0);
     const struct segment_command_64 *seg = NULL;
     const struct load_command *cmd = (const struct load_command *)(image + 1);
     for (uint32_t i = 0; i < image->ncmds; ++i, cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize))
-        if (cmd->cmd == LC_SEGMENT_64 && !strncmp(((const struct segment_command_64 *)cmd)->segname, "__GUESTRSV", 16))
+        if (cmd->cmd == LC_SEGMENT_64 && !strncmp(((const struct segment_command_64 *)cmd)->segname, segname, 16))
             seg = (const struct segment_command_64 *)cmd;
     if (!seg) { /* built without the segment: the reservation from main() alone */
-        void *reserved = mmap((void *)BBGPU_GUEST_MIN, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-        if (reserved == (void *)BBGPU_GUEST_MIN) return 0;
-        say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 " (got %p)", BBGPU_GUEST_MIN, BBGPU_GUEST_MAX, reserved);
+        void *reserved = mmap((void *)lo, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (reserved == (void *)lo) return 0;
+        say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 " (got %p)", lo, hi, reserved);
         if (reserved != MAP_FAILED) munmap(reserved, span);
         return ENOMEM;
     }
     const uint64_t own_lo = seg->vmaddr + (uint64_t)_dyld_get_image_vmaddr_slide(0), own_hi = own_lo + seg->vmsize;
-    for (mach_vm_address_t at = BBGPU_GUEST_MIN; at < BBGPU_GUEST_MAX;) {
+    for (mach_vm_address_t at = lo; at < hi;) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t object = MACH_PORT_NULL;
         if (mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count,
-                           &object) != KERN_SUCCESS || at >= BBGPU_GUEST_MAX)
+                           &object) != KERN_SUCCESS || at >= hi)
             break;
         if (at < own_lo || at + size > own_hi || info.protection != VM_PROT_NONE) {
-            say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 ": 0x%llx-0x%llx is in use",
-                BBGPU_GUEST_MIN, BBGPU_GUEST_MAX, (unsigned long long)at, (unsigned long long)(at + size));
+            say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 ": 0x%llx-0x%llx is in use", lo, hi,
+                (unsigned long long)at, (unsigned long long)(at + size));
             return ENOMEM;
         }
         at += size;
     }
-    void *reserved =
-        mmap((void *)BBGPU_GUEST_MIN, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
-    if (reserved == (void *)BBGPU_GUEST_MIN) return 0;
-    say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 ": %s", BBGPU_GUEST_MIN, BBGPU_GUEST_MAX, strerror(errno));
+    void *reserved = mmap((void *)lo, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (reserved == (void *)lo) return 0;
+    say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 ": %s", lo, hi, strerror(errno));
     return ENOMEM;
+}
+
+/* fifa-hybrid: two ranges, the Bloodborne/user range (__GUESTRSV) and shadPS4's system areas
+ * above the arm64 shared region (__GUESTLOW, BBGPU_GUEST_LOW_*). */
+static int reserve_guest_range(void) {
+    int status = reserve_range(BBGPU_GUEST_MIN, BBGPU_GUEST_MAX, "__GUESTRSV");
+    if (!status) status = reserve_range(BBGPU_GUEST_LOW_MIN, BBGPU_GUEST_LOW_MAX, "__GUESTLOW");
+    return status;
 }
 
 int main(int argc, char **argv) {

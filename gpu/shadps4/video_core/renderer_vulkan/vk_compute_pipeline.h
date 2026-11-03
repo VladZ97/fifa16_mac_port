@@ -37,6 +37,7 @@ public:
     ~ComputePipeline();
 
     /// The Metal pipeline state, once ready (IsReady/WaitReady); null when Failed().
+    u64 KeyValue() const noexcept { return compute_key.value; }
     const Metal::ComputePipeline* Compute() const noexcept {
         return compute;
     }

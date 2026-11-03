@@ -27,6 +27,8 @@ struct WindowSystemInfo {
 class WindowSDL {
 public:
     WindowSDL(s32 width, s32 height, const char* title);
+    /// fifa-hybrid: a window owned by the host application; only its Metal layer is used here.
+    WindowSDL(s32 width, s32 height, void* external_layer, float scale);
     ~WindowSDL();
     s32 GetWidth() const { return width.load(std::memory_order_relaxed); }
     s32 GetHeight() const { return height.load(std::memory_order_relaxed); }

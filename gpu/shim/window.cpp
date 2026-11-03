@@ -151,11 +151,19 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     std::printf("Window: %dx%d pixels, density %.1f\n", w, h, SDL_GetWindowPixelDensity(window));
 }
 
+WindowSDL::WindowSDL(s32 width_, s32 height_, void* external_layer, float scale)
+    : width{width_}, height{height_} {
+    // fifa-hybrid: no SDL window of our own; the host application pumps events and owns the layer.
+    window_info.type = WindowSystemType::Metal;
+    window_info.render_surface = external_layer;
+    window_info.render_surface_scale = scale;
+}
+
 WindowSDL::~WindowSDL() {
 #if defined(__APPLE__)
     if (metal_view) SDL_Metal_DestroyView(metal_view);
 #endif
-    SDL_DestroyWindow(window);
+    if (window) SDL_DestroyWindow(window);
 }
 
 void WindowSDL::BeginTextInput(const std::string& initial, const std::string& prompt, bool password) {

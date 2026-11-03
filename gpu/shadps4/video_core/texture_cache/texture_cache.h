@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <queue>
@@ -20,6 +21,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
@@ -55,6 +57,16 @@ class TextureCache {
     using PageTable = MultiLevelPageTable<Traits>;
 
 public:
+    struct CpuReadWork {
+        struct Copy {
+            VAddr addr;
+            u64 size;
+            Vulkan::StagingBufferRef download;
+        };
+        boost::container::small_vector<Copy, 4> copies;
+        boost::container::small_vector<std::tuple<VAddr, u64, bool>, 4> unprotect;
+        u64 tick = 0;
+    };
     enum class BindingType : u32 {
         Texture,
         Storage,
@@ -116,6 +128,9 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+    /// Diagnostics (BB_DUMP_VOLUMES): sync readback of a GPU-written volume to a file.
+    void DebugDumpVolume(ImageId image_id);
+    void DebugDumpTexture(ImageId image_id, bool shadowed = false);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -140,7 +155,8 @@ public:
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the depth target with specified properties
-    [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
+    [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc,
+                                             bool gl_depth = false);
 
     /// bbport: whether UpdateImage has nothing to do for this image (its fast path).
     [[nodiscard]] bool IsUpToDate(ImageId image_id) const {
@@ -179,6 +195,14 @@ public:
         RefreshImage(image);
     }
 
+    /// fifa-hybrid: the image to bind for a T# viewing a block-compressed image one texel per
+    /// block, synced with it; image_id when the view needs none.
+    ImageId ResolveBlockShadow(ImageId image_id, const ImageDesc& desc);
+    void SyncBlockShadow(Image& image);
+    /// A GPU-written uint image a new BC image at the same address takes its blocks from
+    /// (the uint writes came first: GPU-compressed kits).
+    ImageId block_seed{};
+
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
@@ -194,6 +218,7 @@ public:
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
+    void DebugProbeImage(ImageId id, const char* tag); // bbport debug: per-mip average
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: bbport, added to the S#'s bias (reduced scene rendering).
@@ -345,7 +370,40 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id, bool sync = false, CpuReadWork* work = nullptr);
+    bool ShouldReadbackImage(const Image& image) const; // fifa-hybrid
+
+public:
+    /// fifa-hybrid: on-demand image readbacks. A GPU-written image is not downloaded after
+    /// every write; its pages are read-protected and the download happens on the first CPU
+    /// access (DownloadImagesForCpuRead, from the fault path on the GPU command thread).
+    void QueueReadback(ImageId image_id, Image& image);
+    void ProtectForCpuRead(VAddr addr, size_t size, bool protect, bool droppable);
+    /// fifa-hybrid: a CPU write into this image may drop its pending readback (plain colour/depth
+    /// targets); block-compressed images, their block shadows and integer images keep the download
+    /// (the game's GPU-compressed kit textures went bad otherwise).
+    static bool DroppableOnWrite(const Image& image);
+    /// fifa-hybrid: the downloads a CPU fault needs, recorded on the GPU thread and finished by
+    /// the faulting thread (TextureCache::FinishCpuReadWork): the GPU thread no longer drains the
+    /// device per fault, so frames keep flowing while the readback completes.
+    void DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write, bool have_lock,
+                                  CpuReadWork* work = nullptr);
+    void FinishCpuReadWork(CpuReadWork& work);
+    /// fifa-hybrid: resolves the pending on-demand images a CPU access touches without any GPU
+    /// work when each one's prefetched download already landed in guest memory (or it was never
+    /// GPU-modified): their watchers are lifted. False when one still needs the download.
+    bool ResolvePrefetchedOndemand(VAddr addr, size_t size);
+    void ForgetOndemandImage(ImageId image_id);
+    /// fifa-hybrid: a CPU-side DMA fill/copy is about to overwrite [addr, addr + size): images
+    /// awaiting a readback that lie wholly inside it hold dead data, so they are forgotten
+    /// instead of being downloaded by the write fault.
+    void DropOndemandCovered(VAddr addr, u64 size);
+    /// fifa-hybrid: true when a page of the range is read-watched for a pending on-demand image.
+    bool HasOndemandIn(VAddr addr, u64 size);
+    void LogOndemandWrite(VAddr addr, u64 size);
+    void ForgetOndemandImagesIn(VAddr addr, u64 size, bool droppable_only);
+
+private:
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -398,6 +456,17 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
+    std::unordered_set<ImageId> ondemand_images; ///< fifa-hybrid: GPU-written images awaiting a CPU read fault
+    struct OndemandRange {
+        VAddr first;    ///< protected range start
+        size_t second;  ///< protected range size
+        bool droppable; ///< a CPU write may drop the readback (DroppableOnWrite at queue time)
+    };
+    std::unordered_map<u32, OndemandRange> ondemand_ranges; ///< the range protected per image
+    std::unordered_map<VAddr, u32> ondemand_page_refs;       ///< droppable read-watcher refs per 4 KiB page
+    std::unordered_map<VAddr, u32> ondemand_page_refs_plain; ///< the other images' refs per page
+    std::unordered_map<u32, u64> ondemand_seq; ///< last GPU-write order per pending image
+    u64 ondemand_seq_next{};
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};

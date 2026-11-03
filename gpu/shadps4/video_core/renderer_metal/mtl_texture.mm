@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include "common/logging/log.h"
@@ -125,6 +126,10 @@ Object CreateTexture(Device& device, const TextureDesc& desc, std::string_view l
     d.mipmapLevelCount = std::max(desc.levels, 1u);
     d.arrayLength = std::max(desc.layers, 1u);
     d.sampleCount = std::max(desc.samples, 1u);
+    if (desc.samples > 1) { // MSAADBG
+        LOG_WARNING(Render, "MSAADBG tex {}x{} samples={} fmt={} rt={} label={}", desc.width,
+                    desc.height, desc.samples, desc.pixel_format, desc.render_target, label);
+    }
     d.storageMode = MTLStorageModePrivate;
     MTLTextureUsage usage = MTLTextureUsageShaderRead;
     if (desc.render_target) {
@@ -187,9 +192,18 @@ Object CreateSampler(Device& device, const SamplerDesc& desc) {
     d.borderColor = MTLSamplerBorderColor(desc.border);
     d.lodMinClamp = desc.min_lod;
     d.lodMaxClamp = desc.max_lod;
+    static const bool force_lod0 = std::getenv("BB_FORCE_LOD0") != nullptr; // debug: mip 0 only
+    if (force_lod0) {
+        d.lodMinClamp = 0.0f;
+        d.lodMaxClamp = 0.0f;
+    }
     d.maxAnisotropy = std::clamp<NSUInteger>(desc.max_anisotropy, 1, 16);
     if (desc.compare) {
         d.compareFunction = MTLCompareFunction(desc.compare_function);
+        static const char* force = std::getenv("BB_FORCE_COMPARE"); // debug: 0..7 MTLCompareFunction
+        if (force) {
+            d.compareFunction = MTLCompareFunction(std::atoi(force));
+        }
     }
     d.normalizedCoordinates = desc.normalized;
     if (desc.lod_bias != 0.0f) {

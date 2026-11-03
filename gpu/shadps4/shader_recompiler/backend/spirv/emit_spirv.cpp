@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -151,8 +153,39 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+/// bbport: every loop back-edge also needs fewer than this many iterations in all (per
+/// invocation). A loop whose exit condition reads data the emulation got wrong (stale memory)
+/// otherwise never ends, and one GPU thread that never ends hangs the whole GPU (and
+/// WindowServer with it). BB_NO_LOOP_GUARD=1 turns it off, BB_LOOP_GUARD_LIMIT sets the cap.
+} // Anonymous namespace
+
+bool LoopGuardOn() {
+    static const bool on = std::getenv("BB_NO_LOOP_GUARD") == nullptr;
+    return on;
+}
+bool BoundsCheckOn() {
+    static const bool on = std::getenv("BB_NO_BOUNDS_CHECK") == nullptr;
+    return on;
+}
+
+u32 LoopGuardLimit() {
+    static const u32 limit = [] {
+        const char* env = std::getenv("BB_LOOP_GUARD_LIMIT");
+        return env ? u32(std::strtoul(env, nullptr, 0)) : 1u << 16;
+    }();
+    return limit;
+}
+
+namespace {
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    const bool guard_loops =
+        LoopGuardOn() &&
+        std::ranges::any_of(program.syntax_list, [](const IR::AbstractSyntaxNode& node) {
+            return node.type == IR::AbstractSyntaxNode::Type::Repeat;
+        });
+    Id loop_guard{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -162,6 +195,12 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (guard_loops && loop_guard.value == 0) {
+                // Function variables must be declared in the first block.
+                loop_guard = ctx.AddLocalVariable(
+                    ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]),
+                    spv::StorageClass::Function, ctx.u32_zero_value);
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
@@ -197,6 +236,14 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (loop_guard.value != 0) {
+                const Id count{
+                    ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], loop_guard), ctx.ConstU32(1u))};
+                ctx.OpStore(loop_guard, count);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], count,
+                                                        ctx.ConstU32(LoopGuardLimit())));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
@@ -299,6 +346,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
     if (info.uses_group_quad) {
         ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+        if (info.sw_stage == SwStage::Fragment) {
+            ctx.AddCapability(spv::Capability::DerivativeControl);
+        }
     }
     if (info.uses_group_shuffle) {
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);

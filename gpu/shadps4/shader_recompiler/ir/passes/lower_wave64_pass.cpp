@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "common/logging/classes.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -131,8 +132,11 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
     const u32 scratch_size =
         (Common::AlignUp(num_threads, 64) / profile.subgroup_size) * sizeof(u32);
+    // fifa-hybrid: SharedMemoryBarrierPass may already have reserved its scratch word behind this
+    // area (it assumes the same base and size).
     program.info.shared_memory_scratch_size =
-        scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;
+        std::max(program.info.shared_memory_scratch_size,
+                 scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size);
 
     for (IR::Inst* inst : worklist) {
         LOG_INFO(Render_Recompiler, "Lowering {} instruction for wave64", inst->GetOpcode());

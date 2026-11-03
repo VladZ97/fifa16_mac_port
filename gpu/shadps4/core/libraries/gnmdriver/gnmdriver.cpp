@@ -3012,7 +3012,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     {
         std::scoped_lock lock{m_wait_idle};
         seq = submit_dones_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (!liverpool->IsGpuIdle()) {
+        // BB_NO_SUBMISSION_LOCK=1: the next frame's submits queue behind this one instead of
+        // waiting for the command processor to go idle (the guest fences its own buffer reuse).
+        static const bool no_submission_lock = std::getenv("BB_NO_SUBMISSION_LOCK") != nullptr;
+        if (!no_submission_lock && !liverpool->IsGpuIdle()) {
             submission_lock = true;
         }
     }

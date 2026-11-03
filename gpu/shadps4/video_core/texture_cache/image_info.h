@@ -84,6 +84,7 @@ struct ImageInfo {
     std::array<MipInfo, 16> mips_layout;
     VAddr guest_address{};
     u32 guest_size{};
+    u32 micro_tiled_mips{}; // bbport: bit per mip laid out micro-tiled inside a macro-tiled chain
     u8 bank_swizzle{};
     bool alt_tile{};
 

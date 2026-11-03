@@ -1,3 +1,5 @@
+#include <mutex>
+#include <map>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -21,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 #include <mach/mach_vm.h>
@@ -62,6 +65,54 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
+
+// bbport debug (BB_SPIN_PROF): time the command processor spends in guest waits.
+namespace {
+struct SpinProf {
+    std::atomic<u64> ns[4]{}, n[4]{};
+    std::mutex m;
+    std::map<u64, std::pair<u64, u64>> by_addr; // addr -> (ns, count)
+};
+SpinProf g_spin;
+const bool g_spin_on = std::getenv("BB_SPIN_PROF") != nullptr;
+void SpinAdd(int kind, u64 ns, u64 addr) {
+    g_spin.ns[kind].fetch_add(ns, std::memory_order_relaxed);
+    g_spin.n[kind].fetch_add(1, std::memory_order_relaxed);
+    if (addr) {
+        std::scoped_lock lk{g_spin.m};
+        auto& e = g_spin.by_addr[addr];
+        e.first += ns;
+        ++e.second;
+    }
+}
+void SpinReport() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    const double secs = std::chrono::duration<double>(now - last).count();
+    last = now;
+    static const char* names[4] = {"wrm-drain", "wrm-yield", "wrm-inpend", "vo"};
+    std::string line = "[SPIN]";
+    for (int k = 0; k < 4; ++k) {
+        line += fmt::format(" {} {:.1f}% ({}/s)", names[k], g_spin.ns[k].exchange(0) / (secs * 1e7),
+                            u64(g_spin.n[k].exchange(0) / secs));
+    }
+    std::vector<std::pair<u64, std::pair<u64, u64>>> top;
+    {
+        std::scoped_lock lk{g_spin.m};
+        top.assign(g_spin.by_addr.begin(), g_spin.by_addr.end());
+        g_spin.by_addr.clear();
+    }
+    std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 5); ++i) {
+        line += fmt::format(" | {:#x} {:.1f}% n{}", top[i].first, top[i].second.first / (secs * 1e7),
+                            top[i].second.second);
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+} // namespace
 
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
@@ -314,6 +365,9 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        if (g_spin_on) {
+            SpinReport();
+        }
     }
 }
 
@@ -405,9 +459,17 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
+    // bbport (FIFA): without the draw pipe the GPU thread waited here for the recording thread
+    // to encode everything before the fence (most of its time in matches). The recording thread
+    // signals it instead; BB_RECORDER_FENCES=0 restores the wait.
+    static const bool recorder_fences = [] {
+        const char* env = std::getenv("BB_RECORDER_FENCES");
+        return !env || env[0] != '0';
+    }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
-    } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
+    } else if ((Vulkan::DrawPipe::OnStageB() || recorder_fences) &&
+               !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
         rasterizer.SignalAfterHostCopies([eop] { SignalEop(eop); });
@@ -422,6 +484,20 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
 void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* dma_data = reinterpret_cast<const PM4DmaData*>(data);
     ASSERT(dma_data->command.das == 0);
+    if (static const bool bc_log = std::getenv("BB_BCVIEW_LOG") != nullptr;
+        dma_data->dst_sel != DmaDataDst::Gds && bc_log) {
+        const u64 da = dma_data->DstAddress<VAddr>();
+        if (da < 0x26a200000ull && da + dma_data->NumBytes() > 0x269c00000ull) {
+            static std::atomic<u32> n{0};
+            if (n++ < 40)
+                std::fprintf(stderr, "[STAGEDMA] dst %#llx size %u src_sel %u src %#llx\n",
+                             (unsigned long long)da, u32(dma_data->NumBytes()),
+                             u32(dma_data->src_sel), (unsigned long long)dma_data->SrcAddress<VAddr>());
+        }
+    }
+    if (dma_data->dst_sel != DmaDataDst::Gds) {
+        Vulkan::VbNoteWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), 'D');
+    }
     if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
         rasterizer.FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
                                dma_data->data, true);
@@ -465,6 +541,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
+    Vulkan::VbNoteWrite(write_data->Address<u64>(), (header->type3.count.Value() - 2) * sizeof(u32), 'W');
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
@@ -1301,6 +1378,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
+                {
+                    static const bool zlog = std::getenv("BB_ZPASS_LOG") != nullptr;
+                    static std::atomic<u64> seen[64]{};
+                    const u32 t = static_cast<u32>(event->event_type.Value()) & 63;
+                    if (zlog && seen[t].fetch_add(1) == 0) {
+                        std::fprintf(stderr, "bbport: gfx EventWrite type=%u index=%u\n", t,
+                                     (unsigned)event->event_index.Value());
+                    }
+                }
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // registers: ApplyGraphicsRegisterPacket
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
@@ -1308,10 +1394,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        static const bool zlog = std::getenv("BB_ZPASS_LOG") != nullptr;
+                        static std::atomic<u64> zcount{0};
+                        const u64 zn = zcount.fetch_add(1);
+                        if (zlog && (zn < 64 || (zn & 1023) == 0)) {
+                            std::fprintf(stderr, "bbport: ZpassDone #%llu addr=%#llx pairs=%d ctr=%#llx\n",
+                                         (unsigned long long)zn, (unsigned long long)results,
+                                         (int)num_counter_pairs, (unsigned long long)pixel_counter);
+                        }
+                        // fifa-hybrid experiment: BB_ZPASS_STEP=<n> replaces the emulated per-query
+                        // pixel count (default 0x2FFFFFF = "everything visible"; 0 = nothing passed).
+                        static const u64 step = [] {
+                            const char* env = std::getenv("BB_ZPASS_STEP");
+                            return env ? u64(std::strtoull(env, nullptr, 0)) : u64(OcclusionCounterStep);
+                        }();
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        pixel_counter += step;
                     }
                 }
                 break;
@@ -1384,8 +1484,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    const auto t0 = std::chrono::steady_clock::now();
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
+                    }
+                    if (g_spin_on) {
+                        (void)t0;
                     }
                     mem_semaphore->Decrement();
                 }
@@ -1400,8 +1504,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                const auto t0 = std::chrono::steady_clock::now();
                 while (!rewind->Valid()) {
                     YIELD_GFX();
+                }
+                if (g_spin_on) {
+                    (void)t0;
                 }
                 break;
             }
@@ -1418,7 +1526,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
+                    const auto t0 = std::chrono::steady_clock::now();
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    if (g_spin_on) {
+                        SpinAdd(3, (std::chrono::steady_clock::now() - t0).count(), 0);
+                    }
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -1432,12 +1544,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                const auto t0 = std::chrono::steady_clock::now();
+                bool waited = false, drained = false, yielded = false;
+                u32 pend_val = 0;
+                const bool in_pending =
+                    g_spin_on && wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                    PendingFenceValue(wait_reg_mem->Address<VAddr>(), pend_val);
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    waited = true;
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                        drained = true;
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         continue;
                     }
+                    yielded = true;
                     YIELD_GFX();
+                }
+                if (g_spin_on && waited) {
+                    const u64 ns = (std::chrono::steady_clock::now() - t0).count();
+                    // kind 0: drained only; 1: yielded (external writer); 2: pending value fails test
+                    SpinAdd(yielded ? 1 : 0, ns, 0);
+                    if (in_pending) {
+                        SpinAdd(2, ns, 0);
+                    }
+                    static std::atomic<int> nlog{0};
+                    if (yielded && nlog.fetch_add(1) < 40) {
+                        std::fprintf(stderr, "[SPINW] addr %#llx ref %#x mask %#x func %u space %u engine %u pend %d %#x now %#x drained %d %.0fus\n",
+                                     (unsigned long long)wait_reg_mem->Address<VAddr>(), wait_reg_mem->ref,
+                                     wait_reg_mem->mask, u32(wait_reg_mem->function.Value()),
+                                     u32(wait_reg_mem->mem_space.Value()), u32(wait_reg_mem->engine.Value()),
+                                     int(in_pending), pend_val,
+                                     wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                         ? *wait_reg_mem->Address<u32*>() : 0u,
+                                     int(drained), ns / 1e3);
+                    }
                 }
                 break;
             }
@@ -1835,7 +1975,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            static const bool zlog = std::getenv("BB_ZPASS_LOG") != nullptr;
+            static std::atomic<u64> cseen{0};
+            if (zlog && cseen.fetch_add(1) < 4) {
+                const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                std::fprintf(stderr, "bbport: acb EventWrite type=%u index=%u\n",
+                             (unsigned)event->event_type.Value(), (unsigned)event->event_index.Value());
+            }
             break;
         }
         default:

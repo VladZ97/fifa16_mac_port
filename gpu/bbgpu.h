@@ -15,6 +15,10 @@ typedef struct {
     uint32_t sdk_version;       /* from the eboot's procparam */
     uint32_t psf_attributes;    /* param.sfo ATTRIBUTE */
     int32_t width, height;      /* initial window size */
+    /* fifa-hybrid: when set, the renderer presents into this CAMetalLayer, owned by the host
+     * application's window, and opens no window of its own; layer_scale is its backing scale. */
+    void *metal_layer;
+    float layer_scale;
 } BbGpuConfig;
 /* ---- Two-process split (docs/DESIGN_NATIVE_GPU_PROCESS.md, M3; shared: host/bbgpu_shared.h) ----
  * Game side (bb-probe): instead of bbgpu_init. Writes the configuration into the shared control

@@ -20,6 +20,10 @@ using Sirit::Id;
 /// (emit_spirv_floating_point.cpp).
 int PreciseMode();
 bool InvariantPosition();
+/// Whether loops get an iteration cap (emit_spirv.cpp, BB_NO_LOOP_GUARD turns it off).
+bool LoopGuardOn();
+u32 LoopGuardLimit();
+bool BoundsCheckOn();
 
 struct VectorIds {
     [[nodiscard]] Id& operator[](u32 index) {

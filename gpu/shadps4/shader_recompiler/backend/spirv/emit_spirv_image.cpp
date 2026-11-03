@@ -80,6 +80,25 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
+// fifa-hybrid: a depth image rendered under a [-1, 1] viewport (Gnm's GL-style clip space)
+// holds (z + 1) / 2 on Metal, which has no unrestricted depth range. When the host flags the
+// image (PushData::depth_remap bit), a sampled value is mapped back to the game's [-1, 1].
+static Id RemapDepth(EmitContext& ctx, u32 index, Id value) {
+    if (index >= 32) {
+        return value;
+    }
+    const Id ptr_type = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
+    const Id ptr = ctx.OpAccessChain(ptr_type, ctx.push_data_block,
+                                     ctx.ConstU32(Shader::PushData::DepthRemapIndex));
+    const Id mask = ctx.OpLoad(ctx.U32[1], ptr);
+    const Id bit = ctx.OpBitwiseAnd(ctx.U32[1], mask, ctx.ConstU32(1u << index));
+    const Id on = ctx.OpINotEqual(ctx.U1[1], bit, ctx.ConstU32(0u));
+    const Id remapped = ctx.OpFma(ctx.F32[4], value, ctx.ConstF32(2.f, 2.f, 2.f, 2.f),
+                                  ctx.ConstF32(-1.f, -1.f, -1.f, -1.f));
+    const Id on4 = ctx.OpCompositeConstruct(ctx.U1[4], on, on, on, on);
+    return ctx.OpSelect(ctx.F32[4], on4, remapped, value);
+}
+
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
                               const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
@@ -92,7 +111,8 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     operands.AddOffset(ctx, offset);
     const Id sample = ctx.OpImageSampleImplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample)
+                              : RemapDepth(ctx, handle & 0xFFFF, sample);
 }
 
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
@@ -107,7 +127,8 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     operands.AddOffset(ctx, offset);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample)
+                              : RemapDepth(ctx, handle & 0xFFFF, sample);
 }
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
@@ -156,7 +177,8 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
     operands.AddOffset(ctx, offset, true);
     const Id texels = ctx.OpImageGather(result_type, sampled_image, coords, ctx.ConstU32(comp),
                                         operands.mask, operands.operands);
-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels) : texels;
+    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels)
+                              : RemapDepth(ctx, handle & 0xFFFF, texels);
 }
 
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
@@ -220,7 +242,8 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     operands.AddOffset(ctx, offset);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample)
+                              : RemapDepth(ctx, handle & 0xFFFF, sample);
 }
 
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms) {
@@ -245,6 +268,9 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
             operands.Add(spv::ImageOperandsMask::Sample, ms);
         }
         texel = ctx.OpImageFetch(color_type, image, coords, operands.mask, operands.operands);
+        if (!texture.is_integer) {
+            texel = RemapDepth(ctx, handle & 0xFFFF, texel);
+        }
     } else {
         Id image_ptr = texture.id;
         if (ctx.profile.supports_image_load_store_lod) {

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -121,6 +122,10 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     case IR::Attribute::FragCoord: {
         const Id value = ctx.OpLoad(ctx.F32[1],
             ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+        if (comp == 2 && ctx.runtime_info.hw.fs.gl_depth) {
+            // fifa-hybrid: the game's window depth is in [-1, 1] (HwFragmentRuntimeInfo::gl_depth).
+            return ctx.OpFma(ctx.F32[1], value, ctx.ConstF32(2.f), ctx.ConstF32(-1.f));
+        }
         if (comp >= 2) return value;
         // Guest shaders still address native-sized textures and constants. Convert the
         // reduced framebuffer's pixel coordinates back to that logical coordinate space.
@@ -155,8 +160,9 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                               ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid,
                                                 ctx.ConstU32(comp)));
         } else {
-            return ctx.OpCompositeExtract(
-                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
+            // fifa-hybrid: Metal rejects pull-model interpolation of [[barycentric_coord]]
+            // (SPIRV-Cross emits interpolant<float3>), so read the pixel-centre value.
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         }
     case IR::Attribute::BaryCoordSmoothSample:
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -164,11 +170,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                 ctx.F32[1],
                 ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample, ctx.ConstU32(comp)));
         } else {
-            return ctx.OpCompositeExtract(
-                ctx.F32[1],
-                ctx.OpInterpolateAtSample(ctx.F32[3], ctx.bary_coord,
-                                          ctx.OpLoad(ctx.U32[1], ctx.sample_index)),
-                comp);
+            // fifa-hybrid: as above, no interpolate-at-sample on the Metal barycentric input.
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         }
     case IR::Attribute::BaryCoordNoPersp:
         return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
@@ -307,6 +310,20 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
             // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
             value = ctx.OpFMul(ctx.F32[1], value, value);
         }
+        // fifa-hybrid diagnostic: BB_RESOLVE_GAIN=<f> scales the colour output of FIFA 16's EQAA
+        // resolve (ps 92176db0). Default 1 (off). It was a stopgap (4) while the game's auto-exposure
+        // stayed at its presets: the real cause was the missing subgroup barriers in the luminance
+        // reduction (shared_memory_barrier_pass.cpp), fixed 2026-10-31.
+        if (index == 0 && element < 3 && ctx.info.pgm_hash == 0x92176db0ull) {
+            static const float gain = [] {
+                const char* env = std::getenv("BB_RESOLVE_GAIN");
+                const float g = env ? std::strtof(env, nullptr) : 1.f;
+                return g > 0.f ? g : 1.f;
+            }();
+            if (gain != 1.f) {
+                value = ctx.OpFMul(ctx.F32[1], value, ctx.ConstF32(gain));
+            }
+        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {
@@ -401,6 +418,16 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
     ctx.OpStore(pointer, value);
 }
 
+/// bbport: Metal has no robust buffer access, so dword accesses past a guest buffer's bound range
+/// read 0 and drop writes like the hardware's num_records check (BB_NO_BOUNDS_CHECK=1: off).
+/// Returns the range in dwords, or an invalid id when unchecked.
+static Id BufferLength(EmitContext& ctx, const EmitContext::BufferDefinition& buffer, Id id) {
+    if (!BoundsCheckOn() || buffer.buffer_type != BufferType::Guest) {
+        return Id{};
+    }
+    return ctx.OpArrayLength(ctx.U32[1], id, 0u);
+}
+
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
@@ -409,12 +436,22 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     }
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
+    const Id length = BufferLength(ctx, spv_buffer, id);
 
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
-        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        Id in_bounds{};
+        if (Sirit::ValidId(length)) {
+            in_bounds = ctx.OpULessThan(ctx.U1[1], index_i, length);
+            index_i = ctx.OpSelect(ctx.U32[1], in_bounds, index_i, ctx.u32_zero_value);
+        }
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-        const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        Id result_i = ctx.OpLoad(data_types[1], ptr_i);
+        if (Sirit::ValidId(length)) {
+            const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.ConstF32(0.0f);
+            result_i = ctx.OpSelect(data_types[1], in_bounds, result_i, zero);
+        }
         ids.push_back(result_i);
     }
 
@@ -501,11 +538,25 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
 
+    const Id length = BufferLength(ctx, spv_buffer, id);
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
+        Id merge{};
+        if (Sirit::ValidId(length)) {
+            const Id store_label = ctx.OpLabel();
+            merge = ctx.OpLabel();
+            ctx.OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
+            ctx.OpBranchConditional(ctx.OpULessThan(ctx.U1[1], index_i, length), store_label,
+                                    merge);
+            ctx.AddLabel(store_label);
+        }
+        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         ctx.OpStore(ptr_i, value_i);
+        if (Sirit::ValidId(merge)) {
+            ctx.OpBranch(merge);
+            ctx.AddLabel(merge);
+        }
     }
 }
 

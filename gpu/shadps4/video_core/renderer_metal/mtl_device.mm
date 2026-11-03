@@ -50,6 +50,24 @@ u64 WatchdogLimitMs() {
 
 } // namespace
 
+template <typename F>
+static void ForEachTraced(const std::string& trace, F&& f) {
+    size_t start = 0;
+    while (start < trace.size()) {
+        size_t end = trace.find("; ", start);
+        if (end == std::string::npos) {
+            end = trace.size();
+        }
+        f(trace.substr(start, end - start));
+        start = end + 2;
+    }
+}
+
+bool Device::TraceShaders() {
+    static const bool on = WatchdogLimitMs() != 0;
+    return on;
+}
+
 void Device::StartWatchdog() {
     const u64 limit_ms = WatchdogLimitMs();
     if (limit_ms == 0) {
@@ -84,6 +102,21 @@ void Device::StartWatchdog() {
                              static_cast<unsigned long long>(committed),
                              static_cast<unsigned long long>(known),
                              static_cast<long long>(stalled));
+                {
+                    std::scoped_lock lock{shared->trace_mutex};
+                    // Only the pipelines that never completed before: a shader that hangs the GPU
+                    // is new at the stall.
+                    for (const auto& [tick, trace] : shared->pending_trace) {
+                        std::string fresh;
+                        ForEachTraced(trace, [&](const std::string& name) {
+                            if (!shared->completed_shaders.contains(name)) {
+                                fresh += name + "; ";
+                            }
+                        });
+                        std::fprintf(stderr, "STOP: pending tick %llu new shaders: %s\n",
+                                     static_cast<unsigned long long>(tick), fresh.c_str());
+                    }
+                }
                 std::fflush(stderr);
                 _exit(75);
             }
@@ -230,6 +263,11 @@ u64 Device::Commit(void* command_buffer) {
     const u64 tick = current_tick.fetch_add(1, std::memory_order_acq_rel);
     counters->committed.store(tick, std::memory_order_release);
     [cmd encodeSignalEvent:impl->event value:tick];
+    const bool traced = cmd.label.length > 0;
+    if (traced) {
+        std::scoped_lock lock{counters->trace_mutex};
+        counters->pending_trace[tick] = cmd.label.UTF8String;
+    }
     // Before the tick handler: when Wait(tick) returns, this command buffer's time is counted.
     TrackGpuTime(command_buffer);
     std::shared_ptr<Counters> shared = counters;
@@ -241,6 +279,15 @@ u64 Device::Commit(void* command_buffer) {
             }
             LOG_ERROR(Render, "Metal command buffer of tick {} failed: {}", tick,
                       done.error ? done.error.localizedDescription.UTF8String : "unknown error");
+        }
+        if (traced) {
+            std::scoped_lock lock{shared->trace_mutex};
+            if (const auto it = shared->pending_trace.find(tick);
+                it != shared->pending_trace.end()) {
+                ForEachTraced(it->second,
+                              [&](const std::string& name) { shared->completed_shaders.insert(name); });
+                shared->pending_trace.erase(it);
+            }
         }
         RaiseTo(shared->gpu_tick, tick);
         shared->gpu_tick.notify_all();

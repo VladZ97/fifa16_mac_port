@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include "common/hash.h"
 #include "common/serdes.h"
@@ -15,6 +16,9 @@
 
 namespace Shader::Backend::SPIRV {
 int PreciseMode();
+bool LoopGuardOn();
+u32 LoopGuardLimit();
+bool BoundsCheckOn();
 }
 
 namespace Serialization {
@@ -26,7 +30,10 @@ static constexpr u32 ShaderMetaVersionBase = 11u;
 // bbport: cached SPIR-V depends on BB_SPIRV_PRECISE, which the keys do not record (mode 0,
 // "vertex", keeps the base version; the invariant default since 0.5.4 adds the mode).
 static u32 ShaderMetaVersion() {
-    return ShaderMetaVersionBase | (u32(Shader::Backend::SPIRV::PreciseMode()) << 8);
+    return ShaderMetaVersionBase | (u32(Shader::Backend::SPIRV::PreciseMode()) << 8) |
+           (u32(Shader::Backend::SPIRV::LoopGuardOn()) << 16) |
+           (u32(std::bit_width(Shader::Backend::SPIRV::LoopGuardLimit())) << 20) |
+           (u32(Shader::Backend::SPIRV::BoundsCheckOn()) << 26);
 }
 // bbport: 7 Metal vertex attributes; 8 depth/stencil formats only while the pass binds the
 // depth buffer (Metal-native M5; a game's stored cache is rebuilt once).

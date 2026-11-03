@@ -46,6 +46,13 @@ public:
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// fifa-hybrid: adds/removes a READ watcher on the pages of a region (CPU reads then fault;
+    /// refcounted per page with the buffer cache's own read watchers).
+    template <bool track, bool image = true>
+    void UpdateReadWatchers(VAddr addr, u64 size) const;
+
+    static constexpr u64 PM_PAGE_SIZE_PUBLIC = PM_PAGE_SIZE; // fifa-hybrid
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

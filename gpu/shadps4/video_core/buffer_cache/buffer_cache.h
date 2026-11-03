@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <unordered_map>
 
 #include "bbport_arena_runs.h"
 #include "bbport_copy.h"
@@ -44,11 +45,31 @@ class StagingBufferPool;
 
 namespace VideoCore {
 
+// fifa-hybrid diagnostics: guest address watched by BB_BUFWATCH (env) or BB_RESOLVE_WATCH.
+extern std::atomic<u64> g_bb_bufwatch;
+
+
 class TextureCache;
 class MemoryTracker;
 class PageManager;
 
 class BufferCache {
+public:
+    /// fifa-hybrid diagnostics: CPU writes that first needed a GPU readback (BB_FAULT_STATS).
+    std::atomic<u64> write_flushes{0};
+    std::atomic<u64> cpu_write_wins{0}; ///< written pages whose pending GPU write-back was dropped
+    std::mutex hot_read_mutex;
+    std::unordered_map<VAddr, u32> read_fault_counts; ///< per 4 KiB page
+    std::vector<VAddr> hot_read_pages;
+    /// fifa-hybrid: the game wrote [addr, addr+size) after lifting the protection itself.
+    void OnCpuWrite(VAddr addr, u64 size, VAddr fault);
+    /// fifa-hybrid: a CPU read fault on a GPU-modified page; after BB_HOT_READ faults the page
+    /// becomes a hot read page (readable, written back after every submission).
+    void NoteReadFault(VAddr addr);
+    /// Downloads the GPU-modified words of the hot read pages (Rasterizer::OnSubmit).
+    void FlushHotReadPages();
+
+private:
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
@@ -190,6 +211,14 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+public:
+    /// fifa-hybrid: writes the GPU-modified bytes of the pages holding [addr, addr+size) back
+    /// to guest memory asynchronously (no GPU drain) and unmarks them, so a guest polling a
+    /// tiny shader-written counter reads the previous value now and the new one a tick later.
+    void DownloadSmallAsync(VAddr addr, u64 size);
+
+private:
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

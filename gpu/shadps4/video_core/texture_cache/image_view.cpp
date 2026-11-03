@@ -121,7 +121,20 @@ ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info
     // keep the image's format. Stencil views of depth-stencil images read the stencil plane.
     vk::Format format = info.format;
     u32 pixel_format = 0;
-    if (image.has_depth && Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
+    // fifa-hybrid: depth views of a colour image with a depth twin read the twin (Image::depth_twin).
+    void* source_texture = image.GetImage();
+    const Metal::TextureDesc* source_desc = &desc;
+    Metal::TextureDesc twin_desc;
+    const bool twin_view = !image.has_depth && image.depth_twin &&
+                           Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format);
+    if (twin_view) {
+        twin_desc = desc;
+        twin_desc.pixel_format = Metal::VkToMtl::PixelFormat(vk::Format::eD32Sfloat);
+        source_desc = &twin_desc;
+        source_texture = image.depth_twin.Get();
+        format = vk::Format::eD32Sfloat;
+        pixel_format = twin_desc.pixel_format;
+    } else if (image.has_depth && Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
         format = image.info.pixel_format;
         pixel_format = desc.pixel_format;
     } else if (image.has_stencil && Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
@@ -138,9 +151,20 @@ ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info
 
     // Metal aborts on views it cannot make (an uncompressed view of a BC texture, a colour view
     // of a depth texture, ...): such views read the texture in its own format.
-    const u32 safe_format =
-        Metal::SafeViewPixelFormat(desc.pixel_format, pixel_format, desc.format_views);
+    const u32 safe_format = Metal::SafeViewPixelFormat(source_desc->pixel_format, pixel_format,
+                                                       source_desc->format_views);
     if (safe_format != pixel_format) {
+        static std::atomic<u32> logged_count{0}; // fifa-hybrid: the first cases, with formats
+        if (logged_count.fetch_add(1, std::memory_order_relaxed) < 12) {
+            LOG_WARNING(Render_Vulkan,
+                        "image view format fallback: image pixel format {} wanted {} -> using {} "
+                        "(vk view format {}, image {}x{} has_depth={} has_stencil={} format_views={}) "
+                        "storage={} addr={:#x} img_fmt={} levels={}",
+                        desc.pixel_format, pixel_format, safe_format, vk::to_string(format),
+                        image.info.size.width, image.info.size.height, image.has_depth,
+                        image.has_stencil, desc.format_views, info.is_storage, image.info.guest_address,
+                        vk::to_string(image.info.pixel_format), info.range.extent.levels);
+        }
         static std::atomic<bool> logged{false};
         LogOnce(logged, "image view format cannot view the texture in Metal (block or depth "
                         "reinterpretation): using the image's format");
@@ -164,14 +188,14 @@ ImageView::ImageView(const ImageViewInfo& info_, const Image& image) : info{info
         is_3d || !is_array ? 1 : std::clamp(info.range.extent.layers, 1u, desc.layers - base_layer);
     const auto swizzle = Metal::VkToMtl::ComposeSwizzle(info.mapping, format);
 
-    const bool identical = pixel_format == desc.pixel_format && type == desc.type &&
-                           base_level == 0 && levels == desc.levels && base_layer == 0 &&
-                           layers == desc.layers && swizzle == Metal::VkToMtl::IdentitySwizzle;
+    const bool identical = pixel_format == source_desc->pixel_format && type == source_desc->type &&
+                           base_level == 0 && levels == source_desc->levels && base_layer == 0 &&
+                           layers == source_desc->layers && swizzle == Metal::VkToMtl::IdentitySwizzle;
     if (identical) {
-        view = Metal::Object::Retain(image.GetImage());
+        view = Metal::Object::Retain(source_texture);
         return;
     }
-    view = Metal::CreateTextureView(image.GetImage(), pixel_format, type, base_level, levels,
+    view = Metal::CreateTextureView(source_texture, pixel_format, type, base_level, levels,
                                     base_layer, layers, {swizzle.r, swizzle.g, swizzle.b, swizzle.a});
     ASSERT_MSG(view, "Failed to create texture view of image {:#x} ({}x{}x{}) {}:{} {}:{}",
                image.info.guest_address, image.info.size.width, image.info.size.height,

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/position.h"
 #include "shader_recompiler/ir/reinterpret.h"
@@ -103,6 +104,12 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8 ||
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8_8_8);
 
+    static const bool no_ufloat_clamp = std::getenv("BB_NO_UFLOAT_CLAMP") != nullptr;
+    const bool clamp_ufloat = !no_ufloat_clamp &&
+                              color_buffer.num_format == AmdGpu::NumberFormat::Float &&
+                              (color_buffer.data_format == AmdGpu::DataFormat::Format10_11_11 ||
+                               color_buffer.data_format == AmdGpu::DataFormat::Format11_11_10);
+
     // Swizzle components and export
     for (u32 i = 0; i < 4; ++i) {
         const auto swizzled_comp = components[color_buffer.swizzle.Map(i)];
@@ -113,6 +120,13 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
         if (needs_unorm_fixup) {
             // FIXME: Fix-up for GPUs where float-to-unorm rounding is off from expected.
             converted = ir.FPSub(converted, ir.Imm32(1.f / 127500.f));
+        }
+        if (clamp_ufloat) {
+            // bbport: GCN stores NaN/negative as 0 in the unsigned packed-float formats; Metal
+            // turns them into garbage (orange/rainbow speckle on lit kits).
+            const IR::F32 value{converted};
+            converted = IR::F32{ir.Select(ir.FPIsNan(value), ir.Imm32(0.f),
+                                          ir.FPClamp(value, ir.Imm32(0.f), ir.Imm32(64512.f)))};
         }
         ir.SetAttribute(mrt, converted, i);
     }

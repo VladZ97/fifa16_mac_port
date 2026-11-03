@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -84,6 +85,9 @@ public:
     /// `mtl_device`/`mtl_queue`: id<MTLDevice>/id<MTLCommandQueue> to use (MoltenVK's); null: the
     /// system default device and a queue of our own.
     explicit Device(void* mtl_device = nullptr, void* mtl_queue = nullptr);
+    /// Whether command buffers carry a shader trace for the watchdog report (BB_GPU_WATCHDOG_MS).
+    static bool TraceShaders();
+
     /// Waits for every committed command buffer.
     ~Device();
 
@@ -208,6 +212,9 @@ private:
         std::atomic<bool> stop_watchdog{false};
         std::mutex busy_mutex;
         BusyIntervals busy; ///< busy_mutex
+        std::mutex trace_mutex;
+        std::map<u64, std::string> pending_trace; ///< trace_mutex: tick -> shaders (watchdog)
+        std::unordered_set<std::string> completed_shaders; ///< trace_mutex
     };
     std::shared_ptr<Counters> counters{std::make_shared<Counters>()};
 };

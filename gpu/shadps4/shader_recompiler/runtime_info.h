@@ -229,9 +229,13 @@ struct HwFragmentRuntimeInfo {
     bool clip_distance_emulation{false};
     /// bbport: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
+    /// fifa-hybrid: the pass uses the [-w, w] clip space; Metal's FragCoord.z is (z + 1) / 2 of
+    /// the game's window depth, so reads of it are mapped back (PS4 window depth in [-1, 1]).
+    bool gl_depth{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
-        return std::ranges::equal(color_buffers, other.color_buffers) &&
+        return gl_depth == other.gl_depth &&
+               std::ranges::equal(color_buffers, other.color_buffers) &&
                en_flags == other.en_flags && addr_flags == other.addr_flags &&
                num_inputs == other.num_inputs && z_export_format == other.z_export_format &&
                num_samples == other.num_samples && mrtz_mask == other.mrtz_mask &&

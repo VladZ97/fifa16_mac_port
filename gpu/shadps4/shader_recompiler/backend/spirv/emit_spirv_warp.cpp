@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <cstring>
+#include <fmt/format.h>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -19,6 +22,40 @@ Id EmitLaneId(EmitContext& ctx) {
 }
 
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id index) {
+    // bbport: Apple GPUs do not feed helper lanes into quad shuffles, so a fragment shader that
+    // builds its own derivatives from quad lanes (FIFA 16 player normals) reads garbage on partial
+    // quads. Rebuild the other lane's value from the hardware fine derivatives instead; with all
+    // four lanes known through dx, dy and dxy the bilinear fit is exact.
+    static const bool no_quad_fix = std::getenv("BB_NO_QUAD_FIX") != nullptr;
+    static const char* only_pgm = std::getenv("BB_QUAD_FIX_PGM");
+    const bool pgm_ok = !only_pgm || std::strstr(only_pgm, fmt::format("{:08x}", ctx.info.pgm_hash).c_str());
+    if (!no_quad_fix && pgm_ok && ctx.sw_stage == SwStage::Fragment && Sirit::ValidId(ctx.frag_coord)) {
+        const Id f32 = ctx.F32[1];
+        const Id v = ctx.OpBitcast(f32, value);
+        const Id dx = ctx.OpDPdxFine(f32, v);
+        const Id dy = ctx.OpDPdyFine(f32, v);
+        const Id dxy = ctx.OpDPdyFine(f32, dx);
+        const Id coord = ctx.OpLoad(ctx.F32[4], ctx.frag_coord);
+        const auto parity = [&](u32 comp) {
+            const Id c = ctx.OpConvertFToU(ctx.U32[1], ctx.OpCompositeExtract(f32, coord, comp));
+            return ctx.OpConvertUToF(f32, ctx.OpBitwiseAnd(ctx.U32[1], c, ctx.ConstU32(1U)));
+        };
+        const auto bit = [&](u32 b) {
+            const Id x = ctx.OpBitFieldUExtract(ctx.U32[1], index, ctx.ConstU32(b), ctx.ConstU32(1U));
+            return ctx.OpConvertUToF(f32, x);
+        };
+        static const bool swap = std::getenv("BB_QUAD_SWAP") != nullptr;
+        static const bool flipy = std::getenv("BB_QUAD_FLIPY") != nullptr;
+        const Id ox = ctx.OpFSub(f32, bit(swap ? 1 : 0), parity(0));
+        Id oy = ctx.OpFSub(f32, bit(swap ? 0 : 1), parity(1));
+        if (flipy) {
+            oy = ctx.OpFNegate(f32, oy);
+        }
+        Id r = ctx.OpFAdd(f32, v, ctx.OpFMul(f32, ox, dx));
+        r = ctx.OpFAdd(f32, r, ctx.OpFMul(f32, oy, dy));
+        r = ctx.OpFAdd(f32, r, ctx.OpFMul(f32, ctx.OpFMul(f32, ox, oy), dxy));
+        return ctx.OpBitcast(ctx.U32[1], r);
+    }
     return ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, index);
 }
 
