@@ -1196,11 +1196,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     request_cv.notify_one();
 }
 
-// fifa-hybrid (BB_IMMEDIATE_FLIPS): the recent flip cadence decides the present path. Fast frames
-// (four-frame average receive gap <= BB_IMMEDIATE_FLIPS_SLOW_MS, default 24 ms) are shown on
-// arrival with the game-visible completion deferred to the vblank tick; slow frames (GPU-bound
-// replays and flyovers) go through the vblank tick path with the game's flip rate divider and
-// complete at once, the baseline's even 30 fps. (Deferring a slow frame's completion oscillated.)
+// fifa-hybrid (BB_IMMEDIATE_FLIPS): every flip is shown on arrival. The recent cadence decides
+// when the game sees it complete: fast frames (four-frame average receive gap <=
+// BB_IMMEDIATE_FLIPS_SLOW_MS, default 24 ms) complete on the next vblank tick, one per tick;
+// slow frames complete at once. (Deferring a slow frame's completion oscillated; holding slow
+// frames to the flip-rate grid cost whole slots.)
 namespace {
 std::chrono::steady_clock::time_point g_last_receive{};
 double g_gaps[4] = {16.7, 16.7, 16.7, 16.7};
@@ -1271,15 +1271,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || (asap_flips ? SlowCadence() : now >= next_flip);
+        // fifa-hybrid (BB_IMMEDIATE_FLIPS): every flip is taken by the arrival loop below; the
+        // tick path only keeps the window drawn.
+        const bool flip_slot = asap_flips ? false : (!frame_limit || now >= next_flip);
+        if (asap_flips && requests.empty()) {
+            if (timer.GetTotalWait().count() < 0) {
+                if (!main_port.is_open) {
+                    DrawBlankFrame();
+                } else if (ImGui::Core::MustKeepDrawing()) {
+                    DrawLastFrame();
+                }
+            }
+        }
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
-            }
-            if (request && asap_flips) {
-                NoteFlipGap(now);
-                complete_now = true; // the tick path's flip completes at once (see above)
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -1291,7 +1298,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
-                complete_now = false;
                 FRAME_END;
             }
         }
@@ -1346,9 +1352,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
         while (!token.stop_requested()) {
-            if (asap_flips && SlowCadence()) {
-                break; // GPU-bound: the tick path presents on the vblank grid
-            }
             {
                 std::unique_lock lk{mutex};
                 if (!request_cv.wait_until(lk, tick_deadline,
@@ -1366,8 +1369,17 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto request = receive_request();
             if (request) {
                 next_flip = std::max(next_flip + frame_period, now - frame_period);
-NoteFlipGap(now);
+                if (asap_flips) {
+                    NoteFlipGap(now);
+                    // Fast cadence: the game-visible completion waits for the vblank tick (one
+                    // per tick), which keeps the game at the vblank rate. Slow cadence (the game
+                    // serialises on the frame's EOP: close-up cutscenes at 15-21 ms of GPU): the
+                    // flip completes at once, so no 33 ms slot is added to its chain (holding
+                    // those to the flip-rate grid gave 10-13 fps when the chain missed a slot).
+                    complete_now = SlowCadence();
+                }
                 Flip(request);
+                complete_now = false;
                 FRAME_END;
             }
         }
