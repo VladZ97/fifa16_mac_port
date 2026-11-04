@@ -109,6 +109,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
 }
 
 StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(type)];
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
 
@@ -153,6 +154,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
@@ -195,6 +197,7 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
+    std::scoped_lock lk{large_mutex};
     std::erase_if(cache, [this](const LargeBuffer& entry) {
         const bool idle = !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
                           scheduler.IsFree(entry.tick);
@@ -209,6 +212,7 @@ void StagingBufferPool::PublishStats() const {
     using namespace Core::Devtools::Widget;
     // bbport: BB_FRAME_STATS: bytes per memory type, now and peak (the GPU memory detail line).
     if (BbStats::enabled) {
+        std::scoped_lock lk{large_mutex};
         for (size_t i = 0; i < NUM_TYPES; ++i) {
             u64 bytes = 0;
             for (const Block& block : rings[i].blocks) {

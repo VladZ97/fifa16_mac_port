@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -93,6 +94,10 @@ private:
     std::array<Ring, NUM_TYPES> rings;
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
+    /// fifa-hybrid: FreeDeferred runs on the fault thread (TextureCache::FinishCpuReadWork)
+    /// while the GPU thread requests and trims large buffers; the vector moved under it
+    /// ("FreeDeferred on an allocation that is not held" after a long Career session).
+    mutable std::mutex large_mutex;
     u64 frame = 0;
 };
 
