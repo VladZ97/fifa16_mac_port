@@ -20,6 +20,7 @@ struct Device::Impl {
     id<MTLCommandQueue> queue;
     id<MTLResidencySet> residency API_AVAILABLE(macos(15.0)); ///< arena and address-reached buffers
     id<MTLSharedEvent> event; ///< signalled with each command buffer's tick (for GPU-side waits)
+    id<MTLCommandQueue> readback_queue; ///< fifa-hybrid: Device::ReadbackCommit, made on first use
     /// The ordering fences of untracked buffers (OrderTracker indices), primed once; empty with
     /// hazard tracking (BB_METAL_HAZARD_TRACKING=1).
     std::array<id<MTLFence>, OrderTracker::NumFences> fences;

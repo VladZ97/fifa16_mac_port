@@ -101,6 +101,13 @@ public:
                      std::span<const vk::BufferImageCopy> upload_copies);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
+    /// fifa-hybrid: copies the image into `dst` on the device's read-back queue, after the main
+    /// queue signalled `wait_tick`, and returns the retained command buffer (Device::ReadbackWait),
+    /// or null when the image cannot be read that way (no Metal format, multisampled, depth).
+    [[nodiscard]] void* ReadbackImageDirect(VideoCore::Image& src, const VideoCore::Buffer& dst,
+                                            std::span<const vk::BufferImageCopy> copies,
+                                            u64 wait_tick);
+
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,

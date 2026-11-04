@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -185,6 +186,24 @@ public:
     /// Counts `command_buffer`'s (id<MTLCommandBuffer>, not committed yet) GPU interval in
     /// GpuBusyNs once it completes: for command buffers committed on other queues (present).
     void TrackGpuTime(void* command_buffer);
+
+    /// fifa-hybrid: image read-backs on a second command queue (a CPU read fault's download
+    /// no longer drains the main queue). The copies run once the main queue signalled
+    /// `wait_tick` (0: no wait) and do not wait for anything committed after it.
+    struct ReadbackCopy {
+        void* texture;
+        u32 level, slice;
+        u32 origin[3];
+        u32 size[3];
+        void* buffer;
+        u64 offset;
+        u32 bytes_per_row, bytes_per_image;
+    };
+    /// Commits the copies; returns a retained command buffer (null for no copies) that
+    /// ReadbackWait releases.
+    void* ReadbackCommit(std::span<const ReadbackCopy> copies, u64 wait_tick);
+    /// Blocks until the read-back completed; false when its command buffer failed.
+    bool ReadbackWait(void* command_buffer);
 
 private:
     /// Exits the process when committed command buffers stop completing (BB_GPU_WATCHDOG_MS).

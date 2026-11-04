@@ -369,6 +369,7 @@ void Runtime::AccessImage(VideoCore::Image* image, bool write) {
     BeforeImageAccess();
     if (write) {
         ++image->write_serial;
+        image->last_write_tick = scheduler.CurrentTick();
         ++image->diag_other_writes; // (RT binds and uploads count themselves and subtract)
         if (image->info.size.width == 2048 && image->info.pixel_format == vk::Format::eR32Sfloat && BbSeqWindow()) {
             Dl_info info{};
@@ -587,6 +588,7 @@ void Runtime::CopyBufferImage(VideoCore::Image& image, const VideoCore::Buffer& 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     ++dst->write_serial; // fifa-hybrid: the depth twin re-syncs
+    dst->last_write_tick = scheduler.CurrentTick();
     ++dst->diag_uploads;
 
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -629,6 +631,45 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
         AccessBuffer(dst, copy.bufferOffset, copy_size, true);
     }
+}
+
+void* Runtime::ReadbackImageDirect(VideoCore::Image& image, const VideoCore::Buffer& buffer,
+                                   std::span<const vk::BufferImageCopy> copies, u64 wait_tick) {
+    if (!HasMetalFormat(image) || image.GetImage() == nullptr) {
+        return nullptr;
+    }
+    const Metal::TextureDesc& desc = image.backing->desc;
+    if (desc.samples > 1) {
+        return nullptr;
+    }
+    boost::container::small_vector<Metal::Device::ReadbackCopy, 16> blits;
+    for (const auto& copy : copies) {
+        const auto& sub = copy.imageSubresource;
+        const BlitAspect aspect = AspectOf(desc.pixel_format, sub.aspectMask);
+        const BlockLayout block = LayoutOf(desc.pixel_format, aspect);
+        if (block.bytes == 0 || aspect != BlitAspect::All) {
+            return nullptr;
+        }
+        const u32 row_length = copy.bufferRowLength ? copy.bufferRowLength : copy.imageExtent.width;
+        const u32 image_height =
+            copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
+        const u32 bytes_per_row = Common::DivCeil(row_length, block.width) * block.bytes;
+        const u32 bytes_per_image = bytes_per_row * Common::DivCeil(image_height, block.height);
+        for (u32 layer = 0; layer < sub.layerCount; ++layer) {
+            blits.push_back({
+                .texture = image.GetImage(),
+                .level = sub.mipLevel,
+                .slice = sub.baseArrayLayer + layer,
+                .origin = {u32(copy.imageOffset.x), u32(copy.imageOffset.y), u32(copy.imageOffset.z)},
+                .size = {copy.imageExtent.width, copy.imageExtent.height, copy.imageExtent.depth},
+                .buffer = buffer.Handle(),
+                .offset = copy.bufferOffset + u64(layer) * bytes_per_image * copy.imageExtent.depth,
+                .bytes_per_row = bytes_per_row,
+                .bytes_per_image = bytes_per_image,
+            });
+        }
+    }
+    return device.ReadbackCommit(blits, wait_tick);
 }
 
 void Runtime::CopyRegions(VideoCore::Image* src, VideoCore::Image* dst,

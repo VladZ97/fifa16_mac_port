@@ -202,6 +202,54 @@ void Device::CommitUntracked(void* command_buffer) {
     [(__bridge id<MTLCommandBuffer>)command_buffer commit];
 }
 
+void* Device::ReadbackCommit(std::span<const ReadbackCopy> copies, u64 wait_tick) {
+    if (copies.empty()) {
+        return nullptr;
+    }
+    @autoreleasepool {
+        if (impl->readback_queue == nil) {
+            impl->readback_queue = [impl->device newCommandQueue];
+            ASSERT_MSG(impl->readback_queue != nil, "No Metal read-back queue");
+            impl->readback_queue.label = @"Readback";
+        }
+        id<MTLCommandBuffer> cmd = [impl->readback_queue commandBuffer];
+        ASSERT_MSG(cmd != nil, "No read-back command buffer");
+        if (wait_tick != 0) {
+            [cmd encodeWaitForEvent:impl->event value:wait_tick];
+        }
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        blit.label = @"Readback";
+        for (const ReadbackCopy& c : copies) {
+            [blit copyFromTexture:(__bridge id<MTLTexture>)c.texture
+                      sourceSlice:c.slice
+                      sourceLevel:c.level
+                     sourceOrigin:MTLOriginMake(c.origin[0], c.origin[1], c.origin[2])
+                       sourceSize:MTLSizeMake(c.size[0], c.size[1], c.size[2])
+                         toBuffer:(__bridge id<MTLBuffer>)c.buffer
+                destinationOffset:c.offset
+           destinationBytesPerRow:c.bytes_per_row
+         destinationBytesPerImage:c.bytes_per_image];
+        }
+        [blit endEncoding];
+        TrackGpuTime((__bridge void*)cmd);
+        [cmd commit];
+        return (__bridge_retained void*)cmd;
+    }
+}
+
+bool Device::ReadbackWait(void* command_buffer) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = (__bridge_transfer id<MTLCommandBuffer>)command_buffer;
+        [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            LOG_ERROR(Render, "Metal read-back command buffer failed: {}",
+                      cmd.error ? cmd.error.localizedDescription.UTF8String : "unknown error");
+            return false;
+        }
+        return true;
+    }
+}
+
 void Device::TrackGpuTime(void* command_buffer) {
     std::shared_ptr<Counters> shared = counters;
     [(__bridge id<MTLCommandBuffer>)command_buffer addCompletedHandler:^(id<MTLCommandBuffer> done) {

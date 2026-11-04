@@ -72,6 +72,11 @@ TextureCache::TextureCache(Metal::Device& device_, Vulkan::Scheduler& scheduler_
 
 TextureCache::~TextureCache() = default;
 
+// fifa-hybrid diagnostics (BB_FAULT_STATS): fault downloads by where the image's last write sat
+// (pending = still recording, in flight, done), and the direct read-back path's count and time.
+static std::atomic<u64> g_odt_pending{0}, g_odt_inflight{0}, g_odt_done{0}, g_odt_direct_n{0},
+    g_odt_direct_us{0}, g_odt_wait_n{0}, g_odt_wait_us{0};
+
 void TextureCache::ProcessDownloadImages() {
     if (static const char* pe = std::getenv("BB_PROBE_ADDR"); pe) {
         static int pn = 0;
@@ -270,7 +275,11 @@ void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect, bool
 
 void TextureCache::FinishCpuReadWork(CpuReadWork& work) {
     if (!work.copies.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
         scheduler.Wait(work.tick);
+        g_odt_wait_n.fetch_add(1, std::memory_order_relaxed);
+        g_odt_wait_us.fetch_add(u64(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
+                                std::memory_order_relaxed);
         for (const auto& copy : work.copies) {
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(copy.addr), copy.download.mapped,
                                                       copy.size);
@@ -351,6 +360,12 @@ void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_wr
             }
         }
         if (modified && !slot_images[id].PrefetchLanded()) {
+            if (static const bool fstats = std::getenv("BB_FAULT_STATS") != nullptr; fstats) {
+                const Image& im = slot_images[id];
+                const u64 now = scheduler.CurrentTick(), done = runtime.GetDevice().KnownGpuTick();
+                (im.last_write_tick >= now ? g_odt_pending : im.last_write_tick > done ? g_odt_inflight : g_odt_done)
+                    .fetch_add(1, std::memory_order_relaxed);
+            }
             DownloadImageMemory(id, true, work);
         }
     }
@@ -413,6 +428,11 @@ void TextureCache::PrintOndemandWriteCounts() {
         line += fmt::format(" {}x{}", rows[i].second, rows[i].first);
     }
     std::printf("%s\n", line.c_str());
+    std::printf("[ODT] last write pending %llu in-flight %llu done %llu | direct %llu (%.1f ms) ordered wait %llu (%.1f ms)\n",
+                (unsigned long long)g_odt_pending.exchange(0), (unsigned long long)g_odt_inflight.exchange(0),
+                (unsigned long long)g_odt_done.exchange(0), (unsigned long long)g_odt_direct_n.exchange(0),
+                g_odt_direct_us.exchange(0) / 1e3, (unsigned long long)g_odt_wait_n.exchange(0),
+                g_odt_wait_us.exchange(0) / 1e3);
 }
 
 void TextureCache::LogOndemandWrite(VAddr addr, u64 size) {
@@ -580,8 +600,45 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork*
     if (buffer_copies.empty() || copy_size == 0 || copy_size > image.info.guest_size) {
         return;
     }
-    const auto download =
+    auto download =
         runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, !sync || work);
+    // fifa-hybrid: a CPU fault's download of a linear colour image goes through the device's
+    // read-back queue: it waits on the GPU for the ticks committed so far (BB_RB_DIRECT=2, the
+    // default; 1 waits only for the image's last recorded write) instead of flushing the pending
+    // command buffer and draining the whole queue (4-6 ms per fault, 30 a second in matches
+    // for a 93x75 RGBA32F target the game writes next to). An image written in the pending
+    // command buffer still takes the ordered path. BB_RB_DIRECT=0 turns it off.
+    static const int direct_mode = [] {
+        const char* env = std::getenv("BB_RB_DIRECT");
+        return env ? std::atoi(env) : 0; // off: 90% of match downloads are "pending" (same
+                                          // frame), and the GPU-thread wait cost hitches
+    }();
+    if (work && direct_mode != 0 && !image.info.props.is_tiled && !image.info.props.is_block &&
+        !image.info.props.is_depth && image.info.num_samples == 1 && !image.block_shadow &&
+        image.last_write_tick < scheduler.CurrentTick()) {
+        const u64 wait_tick =
+            direct_mode == 2 ? scheduler.CurrentTick() - 1 : image.last_write_tick;
+        auto direct_copies = buffer_copies;
+        for (auto& c : direct_copies) {
+            c.bufferOffset += download.offset;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (void* cb = runtime.ReadbackImageDirect(image, *download.buffer, direct_copies, wait_tick)) {
+            const bool ok = runtime.GetDevice().ReadbackWait(cb);
+            if (ok) {
+                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                          download.mapped, copy_size);
+            }
+            runtime.GetStagingPool().FreeDeferred(download);
+            g_odt_direct_n.fetch_add(1, std::memory_order_relaxed);
+            g_odt_direct_us.fetch_add(u64(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
+                                      std::memory_order_relaxed);
+            if (ok) {
+                return;
+            }
+            download = runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, true);
+        }
+    }
     tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
     if (work) {
         work->copies.push_back({image_addr, copy_size, download});

@@ -3017,7 +3017,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }();
                 if (probe_hash != 0 && (stage.pgm_hash == probe_hash || g_probe_key == probe_hash)) {
                     static std::atomic<int> probes{0};
-                    if (probes.fetch_add(1) < 48) {
+                    if (probes.fetch_add(1) < 660) {
                         const auto* w = reinterpret_cast<const u32*>(vsharp.base_address);
                         u32 mx = 0;
                         const u32 n = std::min<u64>(size / 64, 4096);
@@ -3033,6 +3033,83 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                      (unsigned long long)size, u32(vsharp.GetStride()),
                                      int(desc.is_written), (unsigned long long)adjust,
                                      (unsigned long long)offset, w[0], w[1], w[2], w[3], mx, n);
+                        // BB_PROBE_FIELD=<buffer>,<dword>,<stride dwords>[;...]: that dword over
+                        // the buffer's records (min / max / mean / distinct, records over 64).
+                        // BB_PROBE_DUMP=<buffer>,<records>,<stride dwords>: hex dump of the first
+                        // records (6 dispatches).
+                        static const auto fields = [] {
+                            std::vector<std::array<u64, 3>> v;
+                            if (const char* e = std::getenv("BB_PROBE_FIELD")) {
+                                std::string spec{e};
+                                size_t pos = 0;
+                                while (pos < spec.size()) {
+                                    std::array<u64, 3> f{~0ull, 0, 0};
+                                    std::sscanf(spec.c_str() + pos, "%llu,%llu,%llu", (unsigned long long*)&f[0],
+                                                (unsigned long long*)&f[1], (unsigned long long*)&f[2]);
+                                    v.push_back(f);
+                                    const size_t semi = spec.find(';', pos);
+                                    pos = semi == std::string::npos ? spec.size() : semi + 1;
+                                }
+                            }
+                            return v;
+                        }();
+                        for (const auto& field : fields) {
+                            if (field[2] == 0 || buffer_index != field[0]) {
+                                continue;
+                            }
+                            const u64 recs = std::min<u64>(size / (field[2] * 4), 1u << 20);
+                            u64 mn = ~0ull, mxv = 0, sum = 0, over = 0;
+                            std::unordered_set<u32> distinct;
+                            for (u64 i = 0; i < recs; ++i) {
+                                const u32 v = w[i * field[2] + field[1]];
+                                mn = std::min<u64>(mn, v);
+                                mxv = std::max<u64>(mxv, v);
+                                sum += v;
+                                over += v > 64;
+                                if (distinct.size() < 4096) {
+                                    distinct.insert(v);
+                                }
+                            }
+                            std::fprintf(stderr, "[PROBE] field b%llu[%llu] over %llu records: min %llu max %llu mean %.1f distinct %zu over64 %llu\n",
+                                         (unsigned long long)field[0], (unsigned long long)field[1],
+                                         (unsigned long long)recs, (unsigned long long)mn,
+                                         (unsigned long long)mxv, recs ? double(sum) / recs : 0.0,
+                                         distinct.size(), (unsigned long long)over);
+                        }
+                        static const auto dumps = [] {
+                            std::vector<std::array<u64, 3>> v;
+                            if (const char* e = std::getenv("BB_PROBE_DUMP")) {
+                                std::string spec{e};
+                                size_t pos = 0;
+                                while (pos < spec.size()) {
+                                    std::array<u64, 3> d{~0ull, 0, 0};
+                                    std::sscanf(spec.c_str() + pos, "%llu,%llu,%llu", (unsigned long long*)&d[0],
+                                                (unsigned long long*)&d[1], (unsigned long long*)&d[2]);
+                                    v.push_back(d);
+                                    const size_t semi = spec.find(';', pos);
+                                    pos = semi == std::string::npos ? spec.size() : semi + 1;
+                                }
+                            }
+                            return v;
+                        }();
+                        for (const auto& dump : dumps) {
+                            if (dump[2] == 0 || buffer_index != dump[0]) {
+                                continue;
+                            }
+                            // Two dumps per distinct buffer address (the table moves between the
+                            // menus and the match).
+                            static std::map<std::pair<u64, u64>, int> seen;
+                            if (seen[{dump[0], vsharp.base_address}]++ < 2) {
+                                const u64 recs = std::min<u64>(dump[1], size / (dump[2] * 4));
+                                for (u64 r = 0; r < recs; ++r) {
+                                    std::string line = fmt::format("[PROBE] b{} @{:#x} rec {}:", dump[0], (unsigned long long)vsharp.base_address, r);
+                                    for (u64 k = 0; k < std::min<u64>(dump[2], 64); ++k) {
+                                        line += fmt::format(" {:08x}", w[r * dump[2] + k]);
+                                    }
+                                    std::fprintf(stderr, "%s\n", line.c_str());
+                                }
+                            }
+                        }
                     }
                 }
                 element = {.buffer = buffer->Ref(offset_aligned), .size = size + adjust};

@@ -153,6 +153,7 @@ public:
     Metal::Object depth_twin;
     u64 depth_twin_synced = ~u64{0};
     u64 write_serial = 1; // read from the fault thread too (a stale read only costs a download)
+    u64 last_write_tick = 0; ///< scheduler tick of the last recorded GPU write or upload
     /// fifa-hybrid diagnostics (BB_TWIN_WATCH): why write_serial moved since the last probe.
     u32 diag_rt_writes = 0, diag_uploads = 0, diag_other_writes = 0;
     std::chrono::steady_clock::time_point diag_last_probe{};
