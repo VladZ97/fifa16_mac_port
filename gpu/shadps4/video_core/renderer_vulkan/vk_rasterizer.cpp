@@ -3092,6 +3092,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                             }
                             return v;
                         }();
+                        static const u64 watch_index = [] {
+                            const char* e = std::getenv("BB_PROBE_WATCH");
+                            return e ? std::strtoull(e, nullptr, 10) : ~0ull;
+                        }();
+                        if (buffer_index == watch_index &&
+                            VideoCore::g_watch_lo.load(std::memory_order_relaxed) != vsharp.base_address) {
+                            VideoCore::g_watch_lo.store(vsharp.base_address, std::memory_order_relaxed);
+                            VideoCore::g_watch_hi.store(vsharp.base_address + size, std::memory_order_relaxed);
+                            std::fprintf(stderr, "[WATCH] armed b%u %#llx+%llu\n", buffer_index,
+                                         (unsigned long long)vsharp.base_address, (unsigned long long)size);
+                        }
                         for (const auto& dump : dumps) {
                             if (dump[2] == 0 || buffer_index != dump[0]) {
                                 continue;
@@ -4306,6 +4317,18 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (VideoCore::WatchOverlaps(dst, num_bytes) || VideoCore::WatchOverlaps(src, num_bytes)) {
+        std::fprintf(stderr, "[WATCH] dma copy %#llx <- %#llx %u bytes (gds %d/%d) dst gpu_modified=%d src gpu_modified=%d\n",
+                     (unsigned long long)dst, (unsigned long long)src, num_bytes, int(dst_gds), int(src_gds),
+                     int(buffer_cache.IsRegionGpuModified(dst, num_bytes)),
+                     int(buffer_cache.IsRegionGpuModified(src, num_bytes)));
+        if (!dst_gds && VideoCore::WatchOverlaps(src, num_bytes)) {
+            // Follow the table to its destination (the probe would only re-arm at the next bind).
+            VideoCore::g_watch_lo.store(dst, std::memory_order_relaxed);
+            VideoCore::g_watch_hi.store(dst + num_bytes, std::memory_order_relaxed);
+            std::fprintf(stderr, "[WATCH] re-armed on the dma destination %#llx+%u\n", (unsigned long long)dst, num_bytes);
+        }
+    }
     DrainDrawPipe();
     if (num_bytes == 0) {
         return; // bbport: nothing to copy; no empty blit

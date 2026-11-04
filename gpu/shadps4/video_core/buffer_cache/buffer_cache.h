@@ -45,6 +45,16 @@ class StagingBufferPool;
 
 namespace VideoCore {
 
+// fifa-hybrid diagnostics: a guest range armed by the shader probe (BB_PROBE_WATCH=<buffer index>);
+// the buffer cache logs the uploads, write-backs, GPU-written binds, DMA copies and CPU faults
+// that touch it ([WATCH] lines).
+inline std::atomic<u64> g_watch_lo{0}, g_watch_hi{0};
+inline bool WatchOverlaps(u64 addr, u64 size) {
+    const u64 lo = g_watch_lo.load(std::memory_order_relaxed), hi = g_watch_hi.load(std::memory_order_relaxed);
+    return hi != 0 && addr < hi && addr + size > lo;
+}
+
+
 // fifa-hybrid diagnostics: guest address watched by BB_BUFWATCH (env) or BB_RESOLVE_WATCH.
 extern std::atomic<u64> g_bb_bufwatch;
 

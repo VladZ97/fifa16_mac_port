@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <iterator>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -70,6 +72,16 @@ struct RangeSet {
         }
     }
 
+    /// fifa-hybrid diagnostics: every interval overlapping [base, base+size), by a linear scan.
+    template <typename Func>
+    void ForEachOverlappingLinear(VAddr base_addr, size_t size, Func&& func) const {
+        for (const auto& iv : m_ranges_set) {
+            if (iv.lower() < base_addr + size && iv.upper() > base_addr) {
+                func(iv.lower(), iv.upper());
+            }
+        }
+    }
+
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
         if (m_ranges_set.empty()) {
@@ -77,22 +89,25 @@ struct RangeSet {
         }
         const VAddr start_address = base_addr;
         const VAddr end_address = start_address + size;
-        const IntervalType search_interval{start_address, end_address};
-        auto it = m_ranges_set.lower_bound(search_interval);
-        if (it == m_ranges_set.end()) {
-            return;
+        // fifa-hybrid: lower_bound/upper_bound with the whole query interval skipped overlapping
+        // intervals (boost 1.88, 64-bit domain): a GPU-written range starting before a page run,
+        // or the second range inside it, was never written back and then dropped (FIFA's type
+        // table, DMA-copied at match start, came back as garbage and a culling shader looped for
+        // a second per frame). Start from the interval around the first byte and walk while the
+        // intervals begin before the end (verified against a brute-force reference).
+        auto it = m_ranges_set.lower_bound(IntervalType{start_address, start_address + 1});
+        if (it != m_ranges_set.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->upper() > start_address) {
+                it = prev;
+            }
         }
-        auto end_it = m_ranges_set.upper_bound(search_interval);
-        for (; it != end_it; it++) {
-            VAddr inter_addr_end = it->upper();
-            VAddr inter_addr = it->lower();
-            if (inter_addr_end > end_address) {
-                inter_addr_end = end_address;
+        for (; it != m_ranges_set.end() && it->lower() < end_address; ++it) {
+            if (it->upper() <= start_address) {
+                continue;
             }
-            if (inter_addr < start_address) {
-                inter_addr = start_address;
-            }
-            func(inter_addr, inter_addr_end);
+            func(std::max<VAddr>(it->lower(), start_address),
+                 std::min<VAddr>(it->upper(), end_address));
         }
     }
 
@@ -181,22 +196,25 @@ public:
         }
         const VAddr start_address = base_addr;
         const VAddr end_address = start_address + size;
-        const IntervalType search_interval{start_address, end_address};
-        auto it = m_ranges_map.lower_bound(search_interval);
-        if (it == m_ranges_map.end()) {
-            return;
+        // fifa-hybrid: lower_bound/upper_bound with the whole query interval skipped overlapping
+        // intervals (boost 1.88, 64-bit domain): a GPU-written range starting before a page run,
+        // or the second range inside it, was never written back and then dropped (FIFA's type
+        // table, DMA-copied at match start, came back as garbage and a culling shader looped for
+        // a second per frame). Start from the interval around the first byte and walk while the
+        // intervals begin before the end (verified against a brute-force reference).
+        auto it = m_ranges_map.lower_bound(IntervalType{start_address, start_address + 1});
+        if (it != m_ranges_map.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->first.upper() > start_address) {
+                it = prev;
+            }
         }
-        auto end_it = m_ranges_map.upper_bound(search_interval);
-        for (; it != end_it; it++) {
-            VAddr inter_addr_end = it->first.upper();
-            VAddr inter_addr = it->first.lower();
-            if (inter_addr_end > end_address) {
-                inter_addr_end = end_address;
+        for (; it != m_ranges_map.end() && it->first.lower() < end_address; ++it) {
+            if (it->first.upper() <= start_address) {
+                continue;
             }
-            if (inter_addr < start_address) {
-                inter_addr = start_address;
-            }
-            func(inter_addr, inter_addr_end, it->second);
+            func(std::max<VAddr>(it->first.lower(), start_address),
+                 std::min<VAddr>(it->first.upper(), end_address), it->second);
         }
     }
 
@@ -285,22 +303,20 @@ public:
         }
         const VAddr start_address = base_addr;
         const VAddr end_address = start_address + size;
-        const IntervalType search_interval{start_address, end_address};
-        auto it = m_ranges_map.lower_bound(search_interval);
-        if (it == m_ranges_map.end()) {
-            return;
+        // fifa-hybrid: same iteration as RangeSet::ForEachInRange (see there).
+        auto it = m_ranges_map.lower_bound(IntervalType{start_address, start_address + 1});
+        if (it != m_ranges_map.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->first.upper() > start_address) {
+                it = prev;
+            }
         }
-        auto end_it = m_ranges_map.upper_bound(search_interval);
-        for (; it != end_it; it++) {
-            VAddr inter_addr_end = it->first.upper();
-            VAddr inter_addr = it->first.lower();
-            if (inter_addr_end > end_address) {
-                inter_addr_end = end_address;
+        for (; it != m_ranges_map.end() && it->first.lower() < end_address; ++it) {
+            if (it->first.upper() <= start_address) {
+                continue;
             }
-            if (inter_addr < start_address) {
-                inter_addr = start_address;
-            }
-            func(inter_addr, inter_addr_end, it->second);
+            func(std::max<VAddr>(it->first.lower(), start_address),
+                 std::min<VAddr>(it->first.upper(), end_address), it->second);
         }
     }
 

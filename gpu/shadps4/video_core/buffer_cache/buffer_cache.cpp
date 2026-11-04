@@ -7,6 +7,7 @@
 #include <map>
 #include <unordered_map>
 #include <algorithm>
+#include <pthread.h>
 #include <cstring>
 #include <bit>
 #include <condition_variable>
@@ -452,7 +453,32 @@ BufferCache::~BufferCache() {
     }
 }
 
+// fifa-hybrid diagnostics ([WATCH]): the watched table's byte range should stay in
+// gpu_modified_ranges as long as its pages are GPU-modified; report the first loss.
+static void WatchCheckLoss(BufferCache& bc, RangeSet& ranges, const char* where) {
+    const u64 lo = g_watch_lo.load(std::memory_order_relaxed), hi = g_watch_hi.load(std::memory_order_relaxed);
+    if (hi == 0) {
+        return;
+    }
+    static u64 reported_for = 0;
+    if (reported_for == lo) {
+        return;
+    }
+    const bool pages = bc.IsRegionGpuModified(lo, hi - lo);
+    const bool bytes = ranges.Intersects(lo, hi - lo);
+    if (pages && !bytes) {
+        reported_for = lo;
+        std::fprintf(stderr, "[WATCH] LOST byte range %#llx+%llu at %s (tid %#llx)\n", (unsigned long long)lo,
+                     (unsigned long long)(hi - lo), where, (unsigned long long)(uintptr_t)pthread_self());
+    }
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    WatchCheckLoss(*this, gpu_modified_ranges, "InvalidateMemory");
+    if (WatchOverlaps(device_addr, size)) {
+        std::fprintf(stderr, "[WATCH] invalidate %#llx+%llu gpu_modified=%d\n", (unsigned long long)device_addr,
+                     (unsigned long long)size, int(memory_tracker->IsRegionGpuModified(device_addr, size)));
+    }
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         write_flushes.fetch_add(1, std::memory_order_relaxed);
         ReadMemory(device_addr, size, true, assume_locks);
@@ -501,6 +527,7 @@ void BufferCache::NoteReadFault(VAddr addr) {
 }
 
 void BufferCache::FlushHotReadPages() {
+    WatchCheckLoss(*this, gpu_modified_ranges, "FlushHotReadPages (submit)");
     // fifa-hybrid diagnostics: BB_HOT_PAGE=<hex> forces a page onto the hot list (its GPU writes are
     // written back every submit, so BB_BUFWATCH can print them).
     static bool forced = false;
@@ -527,6 +554,12 @@ void BufferCache::FlushHotReadPages() {
 }
 
 void BufferCache::OnCpuWrite(VAddr addr, u64 size, VAddr fault) {
+    WatchCheckLoss(*this, gpu_modified_ranges, "OnCpuWrite");
+    if (WatchOverlaps(addr, size)) {
+        std::fprintf(stderr, "[WATCH] cpu write fault %#llx (window %#llx+%llu) gpu_modified=%d\n",
+                     (unsigned long long)fault, (unsigned long long)addr, (unsigned long long)size,
+                     int(memory_tracker->IsRegionGpuModified(fault & ~VAddr{0xFFF}, 0x1000)));
+    }
     memory_tracker->ExtendWriteFault(addr, size);
     const VAddr page = fault & ~VAddr{0xFFF};
     if (memory_tracker->IsRegionGpuModified(page, 0x1000)) {
@@ -608,6 +641,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
+    if (WatchOverlaps(addr, size)) {
+        std::fprintf(stderr, "[WATCH] small async write-back %#llx+%llu\n", (unsigned long long)addr,
+                     (unsigned long long)size);
+    }
     const VAddr page = addr & ~VAddr(0xFFF);
     const VAddr end = Common::AlignUp(addr + size, 0x1000);
     const auto* chunk = FindChunk(page, 1);
@@ -638,6 +675,10 @@ void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
             total_size_bytes += (word_end - word_start + align - 1) & ~(align - 1ULL);
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        if (WatchOverlaps(address, size)) {
+            std::fprintf(stderr, "[WATCH]   subtract (DownloadSmallAsync) %#llx+%llu tid %#llx\n", (unsigned long long)address,
+                         (unsigned long long)size, (unsigned long long)(uintptr_t)pthread_self());
+        }
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
@@ -693,6 +734,11 @@ void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    WatchCheckLoss(*this, gpu_modified_ranges, "DownloadMemory entry");
+    if (WatchOverlaps(device_addr, size)) {
+        std::fprintf(stderr, "[WATCH] download (write-back) %#llx+%llu\n", (unsigned long long)device_addr,
+                     (unsigned long long)size);
+    }
     // Metal copies whole 32-bit words (offsets and sizes multiples of 4): each range is copied
     // widened to words, and only its own bytes go back to guest memory.
     struct Download {
@@ -704,8 +750,27 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     boost::container::small_vector<Download, 1> downloads;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
+    const bool watched_dl = WatchOverlaps(device_addr, size);
+    if (watched_dl) {
+        gpu_modified_ranges.ForEachOverlappingLinear(device_addr, size, [&](VAddr a, VAddr b) {
+            std::fprintf(stderr, "[WATCH]   set interval in window (linear): %#llx..%#llx\n", (unsigned long long)a,
+                         (unsigned long long)b);
+        });
+    }
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
+        if (watched_dl) {
+            std::fprintf(stderr, "[WATCH]   gpu-modified page run %#llx+%llu\n", (unsigned long long)address,
+                         (unsigned long long)size);
+            gpu_modified_ranges.ForEachOverlappingLinear(address, size, [&](VAddr a, VAddr b) {
+                std::fprintf(stderr, "[WATCH]     linear overlap %#llx..%#llx\n", (unsigned long long)a,
+                             (unsigned long long)b);
+            });
+        }
         const auto add_download = [&](VAddr start, VAddr end) {
+            if (watched_dl) {
+                std::fprintf(stderr, "[WATCH]     byte range %#llx..%#llx\n", (unsigned long long)start,
+                             (unsigned long long)end);
+            }
             const VAddr word_start = Common::AlignDown(start, 4);
             const VAddr word_end = Common::AlignUp(end, 4);
             copies.push_back(BufferCopy{
@@ -720,6 +785,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (word_end - word_start + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        if (WatchOverlaps(address, size)) {
+            std::fprintf(stderr, "[WATCH]   subtract (DownloadMemory) %#llx+%llu tid %#llx\n", (unsigned long long)address,
+                         (unsigned long long)size, (unsigned long long)(uintptr_t)pthread_self());
+        }
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
@@ -734,9 +803,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // Shared storage is coherent: the data is readable once the copy completed.
     scheduler.Finish();
 
+    const bool watched = WatchOverlaps(device_addr, size);
+    u64 watched_bytes = 0;
     for (const auto& d : downloads) {
-        memory->TryWriteBacking(std::bit_cast<u8*>(d.address), download.mapped + d.staging_offset,
-                                d.size);
+        const bool ok = memory->TryWriteBacking(std::bit_cast<u8*>(d.address), download.mapped + d.staging_offset,
+                                                d.size);
+        if (watched && WatchOverlaps(d.address, d.size)) {
+            watched_bytes += d.size;
+            const u64 lo = g_watch_lo.load(std::memory_order_relaxed);
+            if (d.address <= lo && lo + 16 <= d.address + d.size) {
+                const u32* w = reinterpret_cast<const u32*>(download.mapped + d.staging_offset + (lo - d.address));
+                std::fprintf(stderr, "[WATCH]   write-back covers the table start: dw %08x %08x %08x %08x ok=%d\n",
+                             w[0], w[1], w[2], w[3], int(ok));
+            }
+        }
+    }
+    if (watched) {
+        std::fprintf(stderr, "[WATCH]   write-back: %llu bytes inside the watched range (%zu ranges in the window)\n",
+                     (unsigned long long)watched_bytes, downloads.size());
+    }
+    if (watched) {
+        std::fprintf(stderr, "[WATCH]   unmark gpu-modified %#llx+%llu\n", (unsigned long long)device_addr,
+                     (unsigned long long)size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
 }
@@ -823,11 +911,22 @@ void PrintBufferStats() {
 }
 } // namespace
 
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer,
                                                         bool note_use, BbArenaRuns::Caller caller) {
     if (is_written) {
         VbNoteWrite(device_addr, size, 'O');
+    }
+    WatchCheckLoss(*this, gpu_modified_ranges, "ObtainBuffer entry");
+    if (WatchOverlaps(device_addr, size)) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 400) {
+            std::fprintf(stderr, "[WATCH] bind %#llx+%u written=%d cpu_modified=%d gpu_modified=%d\n",
+                         (unsigned long long)device_addr, size, int(is_written),
+                         int(memory_tracker->IsRegionCpuModified(device_addr, size)),
+                         int(memory_tracker->IsRegionGpuModified(device_addr, size)));
+        }
     }
     // fifa-hybrid: a GPU read of memory an on-demand image still owns (the guest reuses render
     // targets as vertex/constant data) would see stale RAM: download the image first.
@@ -886,6 +985,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         NoteHotUse(device_addr, size);
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+    if (WatchOverlaps(device_addr, size) && !is_written && size <= STREAM_THRESHOLD &&
+        !IsRegionGpuModified(device_addr, size)) {
+        std::fprintf(stderr, "[WATCH] bind %#llx+%u read through the stream buffer (not gpu-modified)\n",
+                     (unsigned long long)device_addr, size);
+    }
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
@@ -941,6 +1045,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        if (WatchOverlaps(device_addr, size)) {
+            u64 covered = 0;
+            gpu_modified_ranges.ForEachInRange(device_addr, size, [&](VAddr a, VAddr b) { covered += b - a; });
+            std::fprintf(stderr, "[WATCH] registered gpu write %#llx+%u: ranges cover %llu bytes, first page gpu=%d last page gpu=%d tid %#llx\n",
+                         (unsigned long long)device_addr, size, (unsigned long long)covered, (unsigned long long)(uintptr_t)pthread_self(),
+                         int(memory_tracker->IsRegionGpuModified(device_addr, 4)),
+                         int(memory_tracker->IsRegionGpuModified(device_addr + size - 4, 4)));
+        }
     }
     // bbport: index and vertex reads are not tracked as accesses; every use is (upload hoisting).
     if (note_use) {
@@ -1025,6 +1137,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainMiss(VAddr device_addr, u32 siz
                        (device_addr + in_run - 1) >> block_shift);
         SynchronizeMemory(arena, device_addr, in_run, is_written, is_texel_buffer);
         if (is_written) {
+            if (WatchOverlaps(device_addr, in_run)) {
+                std::fprintf(stderr, "[WATCH] registered gpu write (miss path, in-run) %#llx+%u\n",
+                             (unsigned long long)device_addr, in_run);
+            }
             gpu_modified_ranges.Add(device_addr, in_run);
         }
         if (note_use) {
@@ -1171,6 +1287,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 addr, u64 size) {
+            if (WatchOverlaps(addr, size)) {
+                const u64 lo = g_watch_lo.load(std::memory_order_relaxed);
+                const u64 at = std::max<u64>(addr, lo);
+                const u32* w = reinterpret_cast<const u32*>(at);
+                std::fprintf(stderr, "[WATCH] upload %#llx+%llu (bind %#llx+%u w%d) guest dw at %#llx: %08x %08x %08x %08x\n",
+                             (unsigned long long)addr, (unsigned long long)size,
+                             (unsigned long long)device_addr, size, int(is_written), (unsigned long long)at,
+                             w[0], w[1], w[2], w[3]);
+            }
             copies.emplace_back(total_size_bytes, addr, size);
             total_size_bytes += size;
         },
