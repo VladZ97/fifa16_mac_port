@@ -29,31 +29,25 @@ The companion repositories:
 
 ---
 
-## Quickstart (bundled release, no building)
+## Quickstart (one app, nothing to build)
 
-Everything except the game is in one download on the
-[Releases](https://github.com/VladZ97/fifa_mac_port/releases) page.
+[Releases](https://github.com/VladZ97/fifa_mac_port/releases) carry **FIFA 16.app**: the
+launcher with the emulator, the Metal GPU library and host, the runtime libraries, the run
+logic and the mod manager inside it. Only the game is yours to supply.
 
-1. Put your dumped game in one folder, as decrypted folders:
-   `<folder>/CUSA02138` (base game) and `<folder>/CUSA02138-UPDATE` (update 1.07).
-2. Download `FIFA16-macOS-<version>.zip`, unzip it, and in Terminal:
+1. Have your dumped game as decrypted folders: the base game (`CUSA02138`, with `eboot.bin`
+   and `sce_sys/`) and, recommended, update 1.07 (`CUSA02138-UPDATE`). They can be anywhere.
+2. Download `FIFA16-macOS-<version>.zip`, unzip, move **FIFA 16.app** to Applications,
+   right-click, Open (it is signed ad hoc, not notarised). If Rosetta 2 is not installed yet,
+   macOS offers to install it on first launch.
+3. In the launcher choose the four folders: **Game**, **Update** (optional), **Mods**
+   (optional, see section 8) and **Saves** (defaults to the app's own data folder). Press
+   **Play**.
 
-   ```bash
-   bash install.sh --game "<folder>"
-   ```
-
-   It checks for Apple Silicon, macOS 15+, Rosetta 2 (and installs it if missing) and
-   python3 (from the Command Line Tools, `xcode-select --install`), copies the emulator, the
-   Metal GPU library and host, the runner and the mod manager into place, points the run script
-   and the emulator config at your game, clears the download quarantine, signs the binaries
-   ad hoc and installs the `fifamod` command.
-3. Open `~/Applications/FIFA 16.app` (right-click, Open the first time) and press **Play**.
-   Or, in Terminal: `bash ~/fifa_metal/run.sh play`.
-
+The app keeps its config, shader cache and logs in `~/Library/Application Support/FIFA 16/`.
 The first start takes about a minute while Rosetta translates the emulator, and the first few
-sessions stutter while shaders are compiled into the cache; after that it holds 60 fps. Logs are
-in `~/fifa_metal/runs/<timestamp>/emulator.log`. To add the FIFA Infinity Patch and mods, see
-section 8. The rest of this page is the build-from-source route and the reference.
+sessions stutter while shaders are compiled; after that it holds 60 fps. Nothing is written
+next to the game. The rest of this page is the build-from-source route and the reference.
 
 ## 1. Requirements
 
@@ -209,16 +203,36 @@ Knobs `run.sh` passes to the GPU side (set in the environment to override):
 | `MTL_HUD_ENABLED` | unset | `1` shows Apple's Metal performance HUD |
 | `SHAD_MAPPING_BASE` / `BB_ARENA_LAYOUT` | `400000000` / `runs` | where guest memory lives; do not change |
 
-## 7. The launcher app (Releases)
+## 7. The launcher app
 
-[Releases](https://github.com/VladZ97/fifa_mac_port/releases) carry the bundle above and, on its
-own, **FIFA 16.app**, a small
-SwiftUI launcher: an installation checklist (emulator, game, update, GPU host, config, shader
-cache), Play / Stop, the log, and the few settings that matter (window or full screen, low-latency
-presentation, frame stats, Metal HUD, play or diagnostics mode). It runs the same
-`bash ~/fifa_metal/run.sh play` you would type, so it needs the layout above. Unzip it anywhere,
-right-click, Open the first time (it is ad-hoc signed). Sources are in
-`fifa16-shadps4-tools/metal/launcher` (`bash build.sh` rebuilds it, `--test` runs its model tests).
+**FIFA 16.app** is a small SwiftUI app (sources in `fifa16-shadps4-tools/metal/launcher`, the
+bundle is assembled by `metal/app/make_app.sh`). Inside the bundle:
+
+```
+Contents/MacOS/FIFA 16                       the launcher (arm64)
+Contents/Resources/run.sh                     launch logic: folders -> emulator environment
+Contents/Resources/emulator/shadps4 + dylibs  shadPS4 metal-hybrid build (x86-64, Rosetta), Vulkan loader, libbbgpu
+Contents/Helpers/FIFA 16 GPU.app              the native Metal GPU host and its libraries (arm64)
+Contents/Resources/bbport.ini, config.template.json
+Contents/Resources/fifamod/                   the mod manager (python)
+```
+
+The launcher stores four folders and a few options in
+`~/Library/Application Support/FIFA 16/settings.json` and runs the bundled `run.sh`, which
+passes them to the emulator as `SHAD_USER_DIR` (config, cache, logs), `SHAD_UPDATE_DIR`,
+`SHAD_DOWNLOAD_DIR` (the mods folder, served as `/download0`; `<mods>/app0` overlays `/app0`
+for root ini files) and `SHAD_HOME_DIR` (the savegame root; saves land in
+`<root>/<user>/savedata/CUSA02138`). The same thing from Terminal:
+
+```
+"/Applications/FIFA 16.app/Contents/MacOS/FIFA 16" --cli status | env | play | stop
+"/Applications/FIFA 16.app/Contents/MacOS/FIFA 16" --cli set gameDir "/path/to/CUSA02138"
+```
+
+Options: window or full screen, low-latency presentation (display sync off, about 5 ms less
+input lag, can tear on non-ProMotion displays), frame stats in the log, Metal HUD, and the
+launch mode (play = errors-only log, diagnostics = full log). The log page follows the current
+run; runs live in `~/Library/Application Support/FIFA 16/runs/<timestamp>/`.
 
 ## 8. Optional: the FIFA Infinity Patch and mods
 
@@ -227,14 +241,16 @@ PS4-specific differences that the mod manager fixes automatically. With
 [`fifa16-mods`](https://github.com/VladZ97/fifa16-mods):
 
 ```bash
-git clone https://github.com/VladZ97/fifa16-mods.git ~/FIFA16Mods
-ln -s ~/FIFA16Mods/fifamod.py /opt/homebrew/bin/fifamod && chmod +x ~/FIFA16Mods/fifamod.py
+alias fifamod='python3 -I "/Applications/FIFA 16.app/Contents/Resources/fifamod/fifamod.py"'   # or clone fifa16-mods
 fifamod init --base "<FIP Manual Install folder>" --game "<game dir>/CUSA02138" --mods-dir "<SSD>/FIFA16Mods/mods"
-fifamod link "$HOME/Library/Application Support/shadPS4QtLauncher/versions/Custom-metal/user/download/CUSA02138"
 fifamod install ~/Downloads/some-scoreboard.rar      # each mod in its own folder, fixers applied
 fifamod scoreboard 53 laliga                           # per-competition scoreboards (see below)
 fifamod list / enable / disable / remove / conflicts / status
 ```
+
+`fifamod build` writes the merged tree to `~/FIFA16Mods/merged`; choose that folder as the
+**Mods** folder in the launcher. The base patch alone (a FIP "Manual Install" folder) also
+works as the Mods folder, without the PS4 fixes.
 
 What the fixers handle, learned the hard way: facepack hair meshes use a PC vertex layout that
 explodes across the pitch on PS4 (converted on install), compressed DDS UI crests render blank
