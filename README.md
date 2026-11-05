@@ -29,6 +29,32 @@ The companion repositories:
 
 ---
 
+## Quickstart (bundled release, no building)
+
+Everything except the game is in one download on the
+[Releases](https://github.com/VladZ97/fifa_mac_port/releases) page.
+
+1. Put your dumped game in one folder, as decrypted folders:
+   `<folder>/CUSA02138` (base game) and `<folder>/CUSA02138-UPDATE` (update 1.07).
+2. Download `FIFA16-macOS-<version>.zip`, unzip it, and in Terminal:
+
+   ```bash
+   bash install.sh --game "<folder>"
+   ```
+
+   It checks for Apple Silicon, macOS 15+, Rosetta 2 (and installs it if missing) and
+   python3 (from the Command Line Tools, `xcode-select --install`), copies the emulator, the
+   Metal GPU library and host, the runner and the mod manager into place, points the run script
+   and the emulator config at your game, clears the download quarantine, signs the binaries
+   ad hoc and installs the `fifamod` command.
+3. Open `~/Applications/FIFA 16.app` (right-click, Open the first time) and press **Play**.
+   Or, in Terminal: `bash ~/fifa_metal/run.sh play`.
+
+The first start takes about a minute while Rosetta translates the emulator, and the first few
+sessions stutter while shaders are compiled into the cache; after that it holds 60 fps. Logs are
+in `~/fifa_metal/runs/<timestamp>/emulator.log`. To add the FIFA Infinity Patch and mods, see
+section 8. The rest of this page is the build-from-source route and the reference.
+
 ## 1. Requirements
 
 - Apple Silicon Mac. Tested on M1 Pro 32 GB; 16 GB should work, less is untested.
@@ -185,7 +211,8 @@ Knobs `run.sh` passes to the GPU side (set in the environment to override):
 
 ## 7. The launcher app (Releases)
 
-[Releases](https://github.com/VladZ97/fifa_mac_port/releases) carry **FIFA 16.app**, a small
+[Releases](https://github.com/VladZ97/fifa_mac_port/releases) carry the bundle above and, on its
+own, **FIFA 16.app**, a small
 SwiftUI launcher: an installation checklist (emulator, game, update, GPU host, config, shader
 cache), Play / Stop, the log, and the few settings that matter (window or full screen, low-latency
 presentation, frame stats, Metal HUD, play or diagnostics mode). It runs the same
