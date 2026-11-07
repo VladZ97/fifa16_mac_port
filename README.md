@@ -54,6 +54,31 @@ minute while Rosetta translates the emulator, and the first few sessions stutter
 are compiled; after that it holds 60 fps. Nothing is written next to the game. The rest of this
 page is the build-from-source route and the reference.
 
+## Installing mods, with the FIFA Infinity Patch as the example
+
+Mods are optional and live entirely inside the app. The example is the FIFA Infinity Patch
+(FIP), the big community patch: updated squads, kits, faces, stadiums, menus. Any other PC mod
+for FIFA 16 installs the same way.
+
+1. Download FIP from its authors. It comes as a set of RAR parts
+   (`FIFA Infinity Patch V9.0.part01.rar` ... `.part13.rar`); keep all parts in one folder.
+2. In the launcher pick a **Mods** folder: an empty folder on a drive with room. FIP 9.0 needs
+   about 45 GB. An external exFAT SSD is fine; the registry and the merged tree the game sees
+   stay in the app's data folder.
+3. Open **Mods** in the side menu and drop `part01.rar` on the page, or click **Install Mod…**
+   and choose it. Any part of the set works; the set is installed once. Leave the name on
+   Automatic and press **Install**. The engine decodes the archive with the bundled `unrar`,
+   unpacks on whichever volume has room, applies the PS4 fixes (UI crests, hair meshes) and
+   builds the overlay. FIP 9.0 takes about an hour; the sheet shows progress.
+4. Make sure **Use mods** is on and press **Play**. The game starts with the patch.
+
+Add more mods the same way: scoreboards, face packs, stadiums, the FIP updates (`V9.1`,
+`V9.2`, ... install on top of `V9.0`). Where two mods change the same file the one lower in
+the list wins; drag to reorder, switch a mod off with its toggle, remove it from its details.
+Turning **Use mods** off plays the stock game again without removing anything. **Show
+Conflicts** lists the overlapping files; **Rebuild** regenerates the overlay after editing a
+mod folder by hand.
+
 ## 1. Requirements
 
 - Apple Silicon Mac. Tested on M1 Pro 32 GB; 16 GB should work, less is untested.
