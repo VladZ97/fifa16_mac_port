@@ -250,7 +250,12 @@ Contents/Helpers/FIFA 16 GPU.app              the native Metal GPU host and its 
                                               bbgpu-host-macos26 + libbbhost.dylib (stub + renderer, macOS 26)
 Contents/Resources/bbport.ini, config.template.json
 Contents/Resources/fifamod/                   the mod manager: compiled engine, 7zz, unrar, stock lists
+Contents/Resources/Licenses/                  licence texts of everything bundled + README with the sources
+Contents/Resources/FIFA16.icns                the app's own icon (drawn by launcher/art/draw_icon.swift)
 ```
+
+Nothing from the game is in the bundle, artwork included: the icon is the project's own drawing
+and the launcher shows the game's header art at runtime from the game folder the user chose.
 
 Which host runs: macOS 27 starts `bbgpu-host-macos27`; older systems start the plain host,
 which reserves the guest ranges with mmap hints and, if that fails (macOS 26's libmalloc puts a
