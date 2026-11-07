@@ -328,3 +328,13 @@ scoreboard only when both clubs belong to that league; a tournament's whenever i
 - The FIFA Infinity Patch team and the scoreboard, face and stadium mod authors whose work the
   mod tooling installs.
 - FIFA 16 is a trademark of Electronic Arts. No game files are distributed here.
+
+## Thanks
+
+- [Andrew Tsai](https://youtube.com/@andytizer) for always bringing the latest news on Mac
+  gaming. The Metal conversion started thanks to his video.
+- [Machete Gaming](https://youtube.com/@machetegaming) for always posting the most authentic
+  football game and mods content. His video gave me the idea to run FIFA 16 on the Mac at all:
+  the PC version was impossible to run because of its Denuvo restrictions.
+- [Claude](https://claude.com/claude-code) for gluing all the optimisations onto the existing
+  tools and adapting the PC content to the PS4 version with ease.
