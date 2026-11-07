@@ -31,13 +31,13 @@ The companion repositories:
 
 ## Quickstart (one app, nothing to build)
 
-[Releases](https://github.com/VladZ97/fifa16_mac_port/releases) carry **FIFA 16.app**: the
+[Releases](https://github.com/VladZ97/fifa16_mac_port/releases) carry **F16.app**: the
 launcher with the emulator, the Metal GPU library and host, the runtime libraries, the run
 logic and the mod manager inside it. Only the game is yours to supply.
 
 1. Have your dumped game as decrypted folders: the base game (`CUSA02138`, with `eboot.bin`
    and `sce_sys/`) and, recommended, update 1.07 (`CUSA02138-UPDATE`). They can be anywhere.
-2. Download `FIFA16-macOS-<version>.zip`, unzip, move **FIFA 16.app** to Applications,
+2. Download `F16-macOS-<version>.zip`, unzip, move **F16.app** to Applications,
    right-click, Open (it is signed ad hoc, not notarised). If Rosetta 2 is not installed yet,
    macOS offers to install it on first launch.
 3. In the launcher choose the four folders: **Game**, **Update** (optional), **Mods**
@@ -238,11 +238,11 @@ Knobs `run.sh` passes to the GPU side (set in the environment to override):
 
 ## 7. The launcher app
 
-**FIFA 16.app** is a small SwiftUI app (sources in `fifa16-shadps4-tools/metal/launcher`, the
+**F16.app** is a small SwiftUI app (sources in `fifa16-shadps4-tools/metal/launcher`, the
 bundle is assembled by `metal/app/make_app.sh`). Inside the bundle:
 
 ```
-Contents/MacOS/FIFA 16                       the launcher (arm64)
+Contents/MacOS/F16                           the launcher (arm64)
 Contents/Resources/run.sh                     launch logic: folders -> emulator environment
 Contents/Resources/emulator/shadps4 + dylibs  shadPS4 metal-hybrid build (x86-64, Rosetta), Vulkan loader, libbbgpu
 Contents/Helpers/FIFA 16 GPU.app              the native Metal GPU host and its libraries (arm64):
@@ -254,7 +254,7 @@ Contents/Resources/Licenses/                  licence texts of everything bundle
 Contents/Resources/FIFA16.icns                the app's own icon (drawn by launcher/art/draw_icon.swift)
 ```
 
-Nothing from the game is in the bundle, artwork included: the icon is the project's own drawing
+The app is called F16 and nothing from the game is in the bundle, artwork included: the icon is the project's own drawing
 and the launcher shows the game's header art at runtime from the game folder the user chose.
 
 Which host runs: macOS 27 starts `bbgpu-host-macos27`; older systems start the plain host,
@@ -277,8 +277,8 @@ same Mac is never touched; `run.sh` stops only processes started from this bundl
 thing from Terminal:
 
 ```
-"/Applications/FIFA 16.app/Contents/MacOS/FIFA 16" --cli status | env | play | stop
-"/Applications/FIFA 16.app/Contents/MacOS/FIFA 16" --cli set gameDir "/path/to/CUSA02138"
+"/Applications/F16.app/Contents/MacOS/F16" --cli status | env | play | stop
+"/Applications/F16.app/Contents/MacOS/F16" --cli set gameDir "/path/to/CUSA02138"
 ```
 
 Options: window or full screen, low-latency presentation (display sync off, about 5 ms less
@@ -303,7 +303,7 @@ reordered or removed; **Use mods** switches the whole overlay off.
 **From the command line,** with [`fifa16-mods`](https://github.com/VladZ97/fifa16-mods):
 
 ```bash
-alias fifamod='python3 -I "/Applications/FIFA 16.app/Contents/Resources/fifamod/fifamod.py"'   # or clone fifa16-mods
+alias fifamod='python3 -I "/Applications/F16.app/Contents/Resources/fifamod/fifamod.py"'   # or clone fifa16-mods
 fifamod init --base "<FIP Manual Install folder>" --game "<game dir>/CUSA02138" --mods-dir "<SSD>/FIFA16Mods/mods"
 fifamod install ~/Downloads/some-scoreboard.rar      # each mod in its own folder, fixers applied
 fifamod scoreboard 53 laliga                           # per-competition scoreboards (see below)
