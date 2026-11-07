@@ -1920,7 +1920,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                                      (unsigned long long)last_kit, nz[0], nz[1], nz[2], nz[3], sum[0] >> 22,
                                      sum[1] >> 22, sum[2] >> 22, sum[3] >> 22);
                         if (nd++ < 3) {
-                            const auto p = fmt::format("/Users/me/fifa_metal/dumps/kitcpu{}_R8G8B8A8_2048x2048_t8.bin", nd.load());
+                            const char* dump_dir = std::getenv("BB_DUMP_DIR"); // debug only: kit texture dumps go here when set
+                            const auto p = fmt::format("{}/kitcpu{}_R8G8B8A8_2048x2048_t8.bin", dump_dir ? dump_dir : "/tmp", nd.load());
                             if (FILE* f = std::fopen(p.c_str(), "wb")) { std::fwrite(g, 1, 2048 * 2048 * 4, f); std::fclose(f); }
                         }
                         last_kit = 0;
