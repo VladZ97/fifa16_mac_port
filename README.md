@@ -1,4 +1,4 @@
-# fifa_mac_port — FIFA 16 (PS4) on Apple Silicon, rendered natively in Metal
+# fifa16_mac_port — FIFA 16 (PS4) on Apple Silicon, rendered natively in Metal
 
 This repository is the GPU side of a hybrid emulator that runs the PlayStation 4 version of
 **FIFA 16** (CUSA02138, update 1.07) on an Apple Silicon Mac at 60 fps:
@@ -31,7 +31,7 @@ The companion repositories:
 
 ## Quickstart (one app, nothing to build)
 
-[Releases](https://github.com/VladZ97/fifa_mac_port/releases) carry **FIFA 16.app**: the
+[Releases](https://github.com/VladZ97/fifa16_mac_port/releases) carry **FIFA 16.app**: the
 launcher with the emulator, the Metal GPU library and host, the runtime libraries, the run
 logic and the mod manager inside it. Only the game is yours to supply.
 
@@ -81,7 +81,7 @@ All scripts assume a fixed layout under your home folder. Keep it, or edit the p
 of each script:
 
 ```
-~/fifa_metal/bloodborne_mac_port/   this repo (branch fifa-hybrid)
+~/fifa_metal/fifa16_mac_port/      this repo (branch fifa-hybrid)
 ~/fifa_metal/shadps4-metal/         shadps4-fifa (branch metal-hybrid)
 ~/fifa_metal/run.sh, bbport.ini, host_app/, launcher/, *.py   from fifa16-shadps4-tools/metal
 ~/FIFA16Mods/                        fifa16-mods (optional, for the patch and mods)
@@ -92,7 +92,7 @@ of each script:
 
 ```bash
 mkdir -p ~/fifa_metal && cd ~/fifa_metal
-git clone -b fifa-hybrid https://github.com/VladZ97/fifa_mac_port.git bloodborne_mac_port
+git clone -b fifa-hybrid https://github.com/VladZ97/fifa16_mac_port.git fifa16_mac_port
 git clone -b metal-hybrid --recurse-submodules --shallow-submodules \
     https://github.com/VladZ97/shadps4-fifa.git shadps4-metal
 git clone https://github.com/VladZ97/fifa16-shadps4-tools.git /tmp/tools
@@ -106,7 +106,7 @@ Two builds of the same library: an x86-64 one that the game process loads (for t
 fallback) and the native arm64 one used by the GPU host.
 
 ```bash
-cd ~/fifa_metal/bloodborne_mac_port
+cd ~/fifa_metal/fifa16_mac_port
 bash scripts/macos/bootstrap_deps.sh                       # x86-64 deps (SDL3, SPIRV-Cross, ...) -> deps/x86_64
 bash build_macos.sh --gpu-only                             # -> out/gpu/libbbgpu.dylib
 BB_DEPS_ARCH=arm64 bash scripts/macos/bootstrap_deps.sh    # arm64 deps -> deps/arm64
@@ -138,7 +138,7 @@ bash ~/fifa_metal/host_app/refresh.sh                   # copies the two host bi
 ```bash
 cd ~/fifa_metal/shadps4-metal
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-      -DENABLE_BBGPU=ON -DBBGPU_ROOT="$HOME/fifa_metal/bloodborne_mac_port"
+      -DENABLE_BBGPU=ON -DBBGPU_ROOT="$HOME/fifa_metal/fifa16_mac_port"
 cmake --build build --parallel 8          # ~20 min the first time; build/shadps4
 ```
 
