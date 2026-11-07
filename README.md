@@ -35,11 +35,13 @@ The companion repositories:
 launcher with the emulator, the Metal GPU library and host, the runtime libraries, the run
 logic and the mod manager inside it. Only the game is yours to supply.
 
-1. Have your dumped game as decrypted folders: the base game (`CUSA02138`, with `eboot.bin`
-   and `sce_sys/`) and, recommended, update 1.07 (`CUSA02138-UPDATE`). They can be anywhere.
-2. Download `F16-macOS-<version>.zip`, unzip, move **F16.app** to Applications,
-   right-click, Open (it is signed ad hoc, not notarised). If Rosetta 2 is not installed yet,
-   macOS offers to install it on first launch.
+1. Have your own copy of the game as a folder dump: the base game (`CUSA02138`, a folder with
+   `eboot.bin` and `sce_sys/` inside) and, recommended, update 1.07 (`CUSA02138-UPDATE`). They
+   can be anywhere. This project cannot read discs or packages and does not decrypt anything.
+2. Download `F16-macOS-<version>.zip`, unzip, move **F16.app** to Applications. The first
+   launch is refused because the app is not notarised: open System Settings > Privacy & Security,
+   click **Open Anyway** next to the message, then launch again (on macOS 14 and earlier,
+   right-click > Open is enough). If Rosetta 2 is not installed yet, macOS offers to install it.
 3. In the launcher choose the four folders: **Game**, **Update** (optional), **Mods**
    (optional, see section 8) and **Saves** (defaults to the app's own data folder). Press
    **Play**.
@@ -91,7 +93,7 @@ mod folder by hand.
   `cmake ninja glslang pkgconf python3`.
 - About 15 GB free for the toolchains and builds, plus the game (around 25 GB) and, if you want
   it, the FIFA Infinity Patch (40 GB, on an external SSD is fine).
-- The game as decrypted folders, the way a PS4 dump tool produces them, in one directory:
+- Your own copy of the game as folders (the layout dump tools produce), in one directory:
 
 ```
 <game dir>/
@@ -357,14 +359,45 @@ scoreboard only when both clubs belong to that league; a tournament's whenever i
   changes are on branch `fifa-hybrid`, upstream history is on `master`.
 - The FIFA Infinity Patch team and the scoreboard, face and stadium mod authors whose work the
   mod tooling installs.
-- FIFA 16 is a trademark of Electronic Arts. No game files are distributed here.
+- FIFA is a registered trademark of the Fédération Internationale de Football Association. FIFA 16
+  and EA SPORTS are trademarks or product names of Electronic Arts Inc. PlayStation and PS4 are
+  trademarks of Sony Interactive Entertainment Inc. They are used here only to say which software
+  this project works with. No game files are distributed here.
+
+## Legal
+
+- This is an unofficial, non-commercial community project. It is not affiliated with, endorsed or
+  sponsored by Electronic Arts Inc., FIFA, Sony Interactive Entertainment Inc., Konami, the shadPS4
+  project or the authors of any patch or mod.
+- No game files, firmware, keys, patch or mod content are included or linked. You need your own
+  copy of FIFA 16 for PlayStation 4 (CUSA02138), dumped from your own disc or download to a folder.
+  This project does not decrypt anything and gives no instructions for dumping; if you cannot
+  produce the folder yourself, this project is not for you.
+- Mods and patches (for example the FIFA Infinity Patch) remain the work and property of their
+  authors. Obtain them from their authors; this project does not host, mirror or modify what they
+  distribute. The PS4 fixes are applied to your local copy only; do not redistribute fixed or
+  converted files (hair meshes, crests, balls, stadiums), share the tools instead.
+- FIFA is a registered trademark of the Fédération Internationale de Football Association. FIFA 16
+  and EA SPORTS are trademarks or product names of Electronic Arts Inc. PlayStation and PS4 are
+  trademarks of Sony Interactive Entertainment Inc. PES and eFootball are trademarks of Konami.
+  They are used here only to say which software this project works with.
+- Offline play only. Nothing here connects to PlayStation Network or EA servers.
+- No warranty. The software is provided "as is" (GPL sections 11 and 12). The mod manager writes
+  only inside its own data folder and the Mods folder you choose, deletes a mod's folder when you
+  remove it, and rebuilds the merged tree on every change; keep your own backups of patch archives.
+  Use at your own risk.
+- Licence: GNU General Public License version 2 or (at your option) any later version; see LICENSE.
+  Third-party components keep their own licences (see Licenses/ in the app). Changes to the upstream
+  bloodborne_mac_port files are listed in CHANGES-FIFA.md.
 
 ## Thanks
 
 - [Andrew Tsai](https://youtube.com/@andytizer) for always bringing the latest news on Mac
   gaming. The Metal conversion started thanks to his video.
 - [Machete Gaming](https://youtube.com/@machetegaming) for always posting the most authentic
-  football game and mods content. His video gave me the idea to run FIFA 16 on the Mac at all:
-  the PC version was impossible to run because of its Denuvo restrictions.
+  football game and mods content. His video gave me the idea to run FIFA 16 on the Mac at all,
+  since the PC version does not run on a Mac.
 - [Claude](https://claude.com/claude-code) for gluing all the optimisations onto the existing
   tools and adapting the PC content to the PS4 version with ease.
+
+None of them is involved in or endorses this project.
