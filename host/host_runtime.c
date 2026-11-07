@@ -112,6 +112,17 @@ void host_view_apply(uint32_t op, uint32_t prot, uint64_t address, uint64_t size
         pthread_rwlock_unlock(&table_lock);
         return;
     }
+    if (start < BBGPU_GUEST_LOW_MAX && end > bbgpu_low_reserved_max) {
+        /* fifa-hybrid: past the part of the low range this host reserved (macOS 26, see main.c). */
+        static int said;
+        if (!said++)
+            say("view at 0x%" PRIx64 "+0x%" PRIx64 " lies beyond the reserved low range end 0x%" PRIx64
+                ": refused (the host on this macOS reserves only the first %" PRIu64 " GiB of the low range)",
+                address, size, bbgpu_low_reserved_max, (bbgpu_low_reserved_max - BBGPU_GUEST_LOW_MIN) >> 30);
+        fail_view(op, address, size, phys, "beyond the reserved low range", E2BIG);
+        pthread_rwlock_unlock(&table_lock);
+        return;
+    }
     switch (op) {
     case BBGPU_EV_MAP: {
         if (phys % BBGPU_GUEST_PAGE || phys > entry_size || size > entry_size - phys) {

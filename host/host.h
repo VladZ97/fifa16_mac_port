@@ -17,3 +17,6 @@ void host_runtime_init(mach_port_t guest_entry, uint64_t guest_entry_size);
 void host_view_apply(uint32_t op, uint32_t prot, uint64_t address, uint64_t size, uint64_t phys);
 int host_view_covered(uint64_t start, uint64_t end);
 void host_view_stats(uint64_t *count, uint64_t *bytes, uint64_t *applied, uint64_t *failed);
+/* fifa-hybrid: end of the reserved part of the low guest range (main.c reserve_range; below
+ * BBGPU_GUEST_LOW_MAX only in bbgpu-host-macos26). Views beyond it are refused. */
+extern uint64_t bbgpu_low_reserved_max;

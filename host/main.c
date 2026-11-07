@@ -12,6 +12,7 @@
 #define _DARWIN_C_SOURCE
 #include "host.h"
 #include "gpu/bbgpu.h"
+#include "guest_takeover.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -354,22 +355,48 @@ static void report_guest_range(void) {
  * range is taken over only if nothing but that segment is in it, so no foreign mapping is
  * overwritten. The plain bbgpu-host (no segment: on macOS 26 a pinned zero-fill segment breaks
  * dyld) keeps the mmap hint, which is enough there. bb-probe picks the host by macOS version. */
+uint64_t bbgpu_low_reserved_max = BBGPU_GUEST_LOW_MAX;
+
 static int reserve_range(uint64_t lo, uint64_t hi, const char *segname) {
     const uint64_t span = hi - lo;
     const struct mach_header_64 *image = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const uint64_t slide = (uint64_t)_dyld_get_image_vmaddr_slide(0);
     const struct segment_command_64 *seg = NULL;
     const struct load_command *cmd = (const struct load_command *)(image + 1);
-    for (uint32_t i = 0; i < image->ncmds; ++i, cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize))
-        if (cmd->cmd == LC_SEGMENT_64 && !strncmp(((const struct segment_command_64 *)cmd)->segname, segname, 16))
-            seg = (const struct segment_command_64 *)cmd;
+    for (uint32_t i = 0; i < image->ncmds; ++i, cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize)) {
+        if (cmd->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *s = (const struct segment_command_64 *)cmd;
+        /* The segment of that name, or (fifa-hybrid, bbgpu-host-macos26 layouts) any reservation
+         * segment of the executable that covers the whole range. */
+        if (!strncmp(s->segname, segname, 16) ||
+            (!strncmp(s->segname, "__GUEST", 7) && s->vmaddr + slide <= lo && s->vmaddr + slide + s->vmsize >= hi))
+            seg = s;
+    }
     if (!seg) { /* built without the segment: the reservation from main() alone */
         void *reserved = mmap((void *)lo, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
         if (reserved == (void *)lo) return 0;
-        say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 " (got %p)", lo, hi, reserved);
         if (reserved != MAP_FAILED) munmap(reserved, span);
+        /* fifa-hybrid: the low range lies in the unused tail of the dyld shared region, where a
+         * hinted mapping is never placed (macOS 26: "got 0xfc00000000"). If the range holds
+         * nothing but that unused reservation, a fixed mapping takes it (guest_takeover.h). */
+        say("guest range 0x%" PRIx64 "-0x%" PRIx64 ": the hint was not honoured (got %p)", lo, hi, reserved);
+        if (!bbgpu_take_unused_range(lo, hi, say)) return 0;
+        say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 " (got %p)", lo, hi, reserved);
         return ENOMEM;
     }
-    const uint64_t own_lo = seg->vmaddr + (uint64_t)_dyld_get_image_vmaddr_slide(0), own_hi = own_lo + seg->vmsize;
+    const uint64_t own_lo = seg->vmaddr + slide, own_hi = own_lo + seg->vmsize;
+    /* fifa-hybrid, bbgpu-host-macos26: the low segment is shorter than the range on purpose.
+     * macOS 26's libmalloc needs a 24 GiB window below 64 GiB at process start and aborts the
+     * process without one ("pointer range initial reservation failed"); the game's GPU-visible
+     * memory in the low range stays within the first GiBs (system managed area). Only the covered
+     * part is taken; views beyond it are refused by host_view_apply (bbgpu_low_reserved_max). */
+    if (own_hi < hi && lo == BBGPU_GUEST_LOW_MIN) {
+        bbgpu_low_reserved_max = own_hi & ~(uint64_t)(BBGPU_GUEST_PAGE - 1);
+        say("low guest range 0x%" PRIx64 "-0x%" PRIx64 ": the segment covers it up to 0x%" PRIx64 " (%" PRIu64
+            " GiB); the rest stays free for libmalloc (macOS 26)", lo, hi, bbgpu_low_reserved_max,
+            (bbgpu_low_reserved_max - lo) >> 30);
+        hi = bbgpu_low_reserved_max;
+    }
     for (mach_vm_address_t at = lo; at < hi;) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
@@ -385,10 +412,32 @@ static int reserve_range(uint64_t lo, uint64_t hi, const char *segname) {
         }
         at += size;
     }
-    void *reserved = mmap((void *)lo, span, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    void *reserved = mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
     if (reserved == (void *)lo) return 0;
     say("cannot reserve the guest range 0x%" PRIx64 "-0x%" PRIx64 ": %s", lo, hi, strerror(errno));
     return ENOMEM;
+}
+
+/* fifa-hybrid: the host built without the segments could not get a range (macOS 26: libmalloc
+ * reserves ~24 GiB at a random address inside the low range before main, nothing to take over).
+ * Before macOS 27 the emulator starts that plain host, and the pinned segments cannot go into
+ * it: on 26 they break dyld's flat-namespace lookups into the executable (the renderer's
+ * runtime_* callbacks). So the ranges come from a sibling, bbgpu-host-macos26: a stub executable
+ * carrying only the segments, with this code in libbbhost.dylib (no lookup into the executable).
+ * Nothing has been sent to bb-probe yet, so the process simply becomes that sibling: same pid,
+ * environment (BBGPU_HANDSHAKE), stdout pipe and registered handshake port. Returns only when
+ * it cannot (no sibling, already re-executed, exec failed); the caller reports as before. */
+static void reexec_segment_host(char **argv) {
+    if (getenv("BBGPU_REEXEC")) return;
+    char exe[PATH_MAX], self[PATH_MAX], sibling[PATH_MAX];
+    uint32_t n = sizeof exe;
+    if (_NSGetExecutablePath(exe, &n) || !realpath(exe, self)) return;
+    if (snprintf(sibling, sizeof sibling, "%s-macos26", self) >= (int)sizeof sibling || access(sibling, X_OK)) return;
+    say("becoming %s (reserves the ranges at exec)", sibling);
+    fflush(stdout);
+    setenv("BBGPU_REEXEC", "1", 1);
+    execv(sibling, argv);
+    say("exec %s: %s", sibling, strerror(errno));
 }
 
 /* fifa-hybrid: two ranges, the Bloodborne/user range (__GUESTRSV) and shadPS4's system areas
@@ -399,7 +448,12 @@ static int reserve_guest_range(void) {
     return status;
 }
 
-int main(int argc, char **argv) {
+/* fifa-hybrid: when libbbhost.dylib is built from this file, main() becomes bbgpu_host_main(),
+ * called by the stub executable bbgpu-host-macos26 (host/stub_main.c). */
+#ifndef BBGPU_HOST_MAIN
+#define BBGPU_HOST_MAIN main
+#endif
+int BBGPU_HOST_MAIN(int argc, char **argv) {
     /* bbgpu-host --msl-check <spv dir> [msl cache dir]: the Metal back end's shader check. */
     if (argc >= 3 && !strcmp(argv[1], "--msl-check")) return bbgpu_msl_check(argv[2], argc >= 4 ? argv[3] : NULL);
     /* stdout is the launcher's pipe (shared with bb-probe): if the launcher goes away, say()
@@ -420,6 +474,7 @@ int main(int argc, char **argv) {
     if (block && !strcmp(block, "1"))
         mmap((void *)BBGPU_GUEST_MIN, 1 << 20, PROT_READ, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
     int status = reserve_guest_range();
+    if (status) reexec_segment_host(argv);
     if (status) report_guest_range();
     mach_port_t parent = MACH_PORT_NULL;
     if (handshake(&parent)) return 1;

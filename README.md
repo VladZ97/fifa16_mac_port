@@ -43,17 +43,25 @@ logic and the mod manager inside it. Only the game is yours to supply.
 3. In the launcher choose the four folders: **Game**, **Update** (optional), **Mods**
    (optional, see section 8) and **Saves** (defaults to the app's own data folder). Press
    **Play**.
+4. Mods are optional: the **Mods** page in the side menu installs the FIFA Infinity Patch and
+   any other PC mod straight from its archive (rar, zip, 7z, multi-part sets, or a folder),
+   applies the PS4 fixes and switches mods on and off.
 
-The app keeps its config, shader cache and logs in `~/Library/Application Support/FIFA 16/`.
-The first start takes about a minute while Rosetta translates the emulator, and the first few
-sessions stutter while shaders are compiled; after that it holds 60 fps. Nothing is written
-next to the game. The rest of this page is the build-from-source route and the reference.
+The app keeps its config, shader cache and logs in `~/Library/Application Support/FIFA 16/`
+and nothing else: it does not read or write another shadPS4 installation on the Mac, and the
+only save location is the Saves folder chosen in the launcher. The first start takes about a
+minute while Rosetta translates the emulator, and the first few sessions stutter while shaders
+are compiled; after that it holds 60 fps. Nothing is written next to the game. The rest of this
+page is the build-from-source route and the reference.
 
 ## 1. Requirements
 
 - Apple Silicon Mac. Tested on M1 Pro 32 GB; 16 GB should work, less is untested.
-- macOS 15 or newer (binaries target 15.0; developed on macOS 27). Rosetta 2 installed:
-  `softwareupdate --install-rosetta`.
+- macOS 15 or newer (binaries target 15.0). Developed on macOS 27 and verified on macOS 26.3;
+  on macOS 26 the GPU host is a two-file layout (a stub executable carrying the pinned guest
+  segments plus `libbbhost.dylib`), built with an SDK 12 platform stamp so libmalloc does not
+  reserve its 24 GiB pointer range in the guest's low address range (see section 7). Rosetta 2
+  installed: `softwareupdate --install-rosetta`.
 - Xcode Command Line Tools (`xcode-select --install`) and Homebrew with
   `cmake ninja glslang pkgconf python3`.
 - About 15 GB free for the toolchains and builds, plus the game (around 25 GB) and, if you want
@@ -212,17 +220,31 @@ bundle is assembled by `metal/app/make_app.sh`). Inside the bundle:
 Contents/MacOS/FIFA 16                       the launcher (arm64)
 Contents/Resources/run.sh                     launch logic: folders -> emulator environment
 Contents/Resources/emulator/shadps4 + dylibs  shadPS4 metal-hybrid build (x86-64, Rosetta), Vulkan loader, libbbgpu
-Contents/Helpers/FIFA 16 GPU.app              the native Metal GPU host and its libraries (arm64)
+Contents/Helpers/FIFA 16 GPU.app              the native Metal GPU host and its libraries (arm64):
+                                              bbgpu-host (plain), bbgpu-host-macos27 (pinned guest segments),
+                                              bbgpu-host-macos26 + libbbhost.dylib (stub + renderer, macOS 26)
 Contents/Resources/bbport.ini, config.template.json
-Contents/Resources/fifamod/                   the mod manager (python)
+Contents/Resources/fifamod/                   the mod manager: compiled engine, 7zz, unrar, stock lists
 ```
+
+Which host runs: macOS 27 starts `bbgpu-host-macos27`; older systems start the plain host,
+which reserves the guest ranges with mmap hints and, if that fails (macOS 26's libmalloc puts a
+24 GiB pointer range below 64 GiB at process start), re-executes itself as `bbgpu-host-macos26`
+(`host/main.c`, `reexec_segment_host`). Both carry the `-platform_version macos 15.0 12.0`
+link stamp (`build_host.sh`, `build_host26.sh` in `fifa16-shadps4-tools/metal`): libmalloc
+chooses its allocator by the main executable's SDK, and the SDK 12 stamp selects the classic
+one with no pointer range. If no host starts, `run.sh` relaunches the game with the renderer
+in-process (`SHAD_BBGPU_SPLIT=0`, slower but playable).
 
 The launcher stores four folders and a few options in
 `~/Library/Application Support/FIFA 16/settings.json` and runs the bundled `run.sh`, which
 passes them to the emulator as `SHAD_USER_DIR` (config, cache, logs), `SHAD_UPDATE_DIR`,
 `SHAD_DOWNLOAD_DIR` (the mods folder, served as `/download0`; `<mods>/app0` overlays `/app0`
 for root ini files) and `SHAD_HOME_DIR` (the savegame root; saves land in
-`<root>/<user>/savedata/CUSA02138`). The same thing from Terminal:
+`<root>/<user>/savedata/CUSA02138`). The renderer's own caches follow `BB_GPU_USER_DIR` and
+`BB_CAPTURE_DIR`, also inside the app's data folder, so an existing shadPS4 installation on the
+same Mac is never touched; `run.sh` stops only processes started from this bundle. The same
+thing from Terminal:
 
 ```
 "/Applications/FIFA 16.app/Contents/MacOS/FIFA 16" --cli status | env | play | stop
@@ -237,8 +259,18 @@ run; runs live in `~/Library/Application Support/FIFA 16/runs/<timestamp>/`.
 ## 8. Optional: the FIFA Infinity Patch and mods
 
 The PC patches work on the PS4 game because it is the same engine and asset formats, with a few
-PS4-specific differences that the mod manager fixes automatically. With
-[`fifa16-mods`](https://github.com/VladZ97/fifa16-mods):
+PS4-specific differences that the mod manager fixes automatically.
+
+**In the app:** open **Mods** in the side menu, choose a Mods folder (an empty folder on a big
+drive; exFAT is fine, the registry and the merged tree stay in the app's data folder) and drop
+archives on the page or use **Install**. Accepted: `.rar`, `.zip`, `.7z`, multi-part sets
+(`.part01.rar`, `.r00`, `.7z.001`: pick any part, the set is installed once) and plain folders.
+The FIFA Infinity Patch 9.0 installs from its 13 part files directly; the engine unpacks on
+whichever volume has room (44 GB for FIP 9.0), decodes RAR with the bundled `unrar` (7-Zip
+cannot read FIP's RAR5 method) and applies the PS4 fixes. Each mod can be enabled, disabled,
+reordered or removed; **Use mods** switches the whole overlay off.
+
+**From the command line,** with [`fifa16-mods`](https://github.com/VladZ97/fifa16-mods):
 
 ```bash
 alias fifamod='python3 -I "/Applications/FIFA 16.app/Contents/Resources/fifamod/fifamod.py"'   # or clone fifa16-mods
