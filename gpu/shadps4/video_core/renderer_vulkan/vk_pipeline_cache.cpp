@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb_msaa.h" // 0.5.1-e BB_MSAA
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -451,9 +452,63 @@ private:
 // while it is still compiling on the creation pool and shader_compile is skip, or balanced with
 // the wait budget spent. Otherwise a pipeline still compiling is returned and the recording
 // thread waits for it (Rasterizer::Draw: WaitReady, then Failed).
+//
+// 0.5.1-h: a skipped draw is only harmless on a target the game draws again in the next frame.
+// A draw the game issues once (a lighting bake at a scene load, a lookup table, a portrait)
+// leaves its target wrong for as long as the game keeps using it: the first session after an
+// update, which compiles every pipeline, showed the menu-arena players yellow that way. So a
+// draw is skipped only when each of its targets has been drawn in every frame for the last
+// BB_SKIP_STEADY_FRAMES frames (default 30, 0 = the old rule: any draw may be skipped);
+// otherwise the pipeline is returned and the recording thread waits for it, as shader_compile=wait
+// does. Such draws come with scene loads, where the wait is not seen.
+bool PipelineCache::TargetsSteady() {
+    static const u64 steady_frames = [] {
+        const char* value = std::getenv("BB_SKIP_STEADY_FRAMES");
+        return value ? u64(std::max(0, std::atoi(value))) : 30ull;
+    }();
+    const auto& regs = *sel.regs;
+    std::array<u64, 9> targets{};
+    for (u32 cb = 0; cb < 8; ++cb) {
+        if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) {
+            targets[cb] = regs.color_buffers[cb].Address();
+        }
+    }
+    if (BoundDepthAttachment(regs).Bound()) {
+        targets[8] = regs.depth_buffer.DepthAddress() ? regs.depth_buffer.DepthAddress()
+                                                      : regs.depth_buffer.StencilAddress();
+    }
+    const u64 frame = BbStats::frame_serial.load(std::memory_order_relaxed) + 1;
+    if (frame == steady_frame && targets == steady_targets) {
+        return steady_answer; // the same targets as the draw before, in the same frame
+    }
+    bool steady = true;
+    for (const u64 address : targets) {
+        if (address == 0) {
+            continue;
+        }
+        TargetUse& use = target_use[address];
+        if (use.last != frame) {
+            if (use.last == 0 || frame - use.last > 2) {
+                use.since = frame; // not drawn in one of the last two frames: a new run
+            }
+            use.last = frame;
+        }
+        steady = steady && frame - use.since >= steady_frames;
+    }
+    steady_targets = targets;
+    steady_frame = frame;
+    steady_answer = steady;
+    return steady;
+}
+
 const GraphicsPipeline* PipelineCache::Drawable(const GraphicsPipeline* pipeline) {
+    const bool steady = TargetsSteady();
     if (!pipeline->IsReady()) {
         const int mode = BbSettings::Get().shader_compile.load(std::memory_order_relaxed);
+        if (mode != BbSettings::ShaderWait && !steady) {
+            BbStats::compile_kept_draws.fetch_add(1, std::memory_order_relaxed);
+            return pipeline; // waited for by the recording thread
+        }
         if (mode == BbSettings::ShaderBalanced) {
             static WaitBudget budget;
             budget.Wait(*pipeline);
@@ -541,7 +596,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
     key.logic_op = regs.color_control.rop3;
-    key.depth_samples = db_enabled ? regs.depth_buffer.NumSamples() : 1;
+    key.depth_samples = db_enabled ? VideoCore::BbSamples(regs.depth_buffer.NumSamples()) : 1; // BB_MSAA
     key.num_samples = key.depth_samples;
     key.cb_shader_mask = regs.color_shader_mask;
 
@@ -579,8 +634,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         color_buffer.num_conversion = col_buf.GetNumberConversion();
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
-        if (std::getenv("BB_BCVIEW_LOG") &&
-            col_buf.Address() >= 0x269c00000ull && col_buf.Address() < 0x26a200000ull) {
+        static const bool bcview_log = std::getenv("BB_BCVIEW_LOG") != nullptr; // 0.5.1-c: was per draw
+        if (bcview_log && col_buf.Address() >= 0x269c00000ull && col_buf.Address() < 0x26a200000ull) {
             static int n = 0;
             if (n++ < 30) {
                 std::fprintf(stderr, "[ENCRT] cb%d dfmt=%u nfmt=%u pitch=%u export=%u", cb,
@@ -683,7 +738,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             vk::ColorComponentFlags{key.color_buffers[cb].swizzle.ApplyMask(target_mask)};
 
         // Fill color samples
-        const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());
+        const u8 prev_color_samples =
+            std::exchange(color_samples, u8(VideoCore::BbSamples(col_buf.NumSamples()))); // BB_MSAA
         all_color_samples_same &= color_samples == prev_color_samples || prev_color_samples == 0;
         key.color_samples[cb] = color_samples;
         key.num_samples = std::max(key.num_samples, color_samples);
@@ -939,6 +995,20 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+    if (info.copy_dispatch.valid == 1) {
+        // A copy-dispatch record from a 0.5.1-c..f shader meta: its swizzle includes the
+        // destination select of whichever permutation that session translated first (not
+        // recorded). Detect again on the permutation in use, once for the program; the record
+        // then holds the shader's own swizzle (info.h CopyDispatch).
+        auto scratch = Shader::Info(hw_stage, sw_stage, params);
+        (void)Shader::TranslateProgram(params.code, pools, scratch, runtime_info, profile);
+        info.copy_dispatch = scratch.copy_dispatch;
+        if (info.copy_dispatch.valid == 1) {
+            info.copy_dispatch = {};
+        }
+        std::unique_lock lk{programs_mutex};
+        program->info_template->copy_dispatch = info.copy_dispatch;
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx{};

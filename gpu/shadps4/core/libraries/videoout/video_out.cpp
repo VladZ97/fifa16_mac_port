@@ -670,4 +670,10 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVideoOutSubmitChangeBufferAttribute);
 }
 
+void DumpStallState() {
+    if (driver) {
+        driver->DumpStall();
+    }
+}
+
 } // namespace Libraries::VideoOut

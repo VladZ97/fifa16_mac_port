@@ -15,6 +15,10 @@
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
 
+namespace Core {
+void ProtectBatch(bool begin); // bbgpu.cpp (0.5.1-b)
+}
+
 namespace VideoCore {
 
 class MemoryTracker {
@@ -70,6 +74,14 @@ public:
         });
     }
 
+    /// fifa-hybrid: the page is read-protected again while GPU modified.
+    void ClearHotRead(VAddr page_addr, u64 size) noexcept {
+        IteratePages<false>(page_addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->ClearHotRead(offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
@@ -107,6 +119,9 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        // 0.5.1-b: every region's protection request is posted to the game process without
+        // waiting; one wait before the copies (on_upload) covers them all (bbgpu.cpp ProtectBatch).
+        Core::ProtectBatch(true);
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                // bbport: read-only bindings skip the region lock when no page
@@ -125,6 +140,7 @@ public:
                                    manager->lock.unlock();
                                }
                            });
+        Core::ProtectBatch(false);
         on_upload();
         if (!is_written) {
             return;

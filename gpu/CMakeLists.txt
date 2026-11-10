@@ -165,8 +165,10 @@ if (APPLE)
     # The settings overlay's Metal side and ImGui's Metal backend (both ARC).
     target_sources(bbgpu PRIVATE shim/bbport_overlay_metal.mm
                    third_party/imgui/backends/imgui_impl_metal.mm)
+    # fifa: the first launch's progress bar in the game window (shim/bbport_startup_progress.h).
+    target_sources(bbgpu PRIVATE shim/bbport_startup_progress.mm)
     set_source_files_properties(shim/bbport_gpu_capture.mm shim/bbport_metalfx.mm
-                                shim/bbport_overlay_metal.mm
+                                shim/bbport_overlay_metal.mm shim/bbport_startup_progress.mm
                                 third_party/imgui/backends/imgui_impl_metal.mm
                                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     # The runtime's symbols resolve against the executable at load time (bb-probe, src/runtime*.c;
@@ -175,7 +177,7 @@ if (APPLE)
     set(BB_HOST_RUNTIME_SYMBOLS
         runtime_disabled_optimizations runtime_errno runtime_fault_recover
         runtime_file_translate runtime_game_cpu_since_last runtime_memory_clamp
-        runtime_memory_gpu_protect runtime_memory_read_backing runtime_memory_region
+        runtime_memory_gpu_protect runtime_memory_gpu_protect_batch runtime_memory_read_backing runtime_memory_region
         runtime_memory_set_gpu_hooks runtime_memory_vma_info runtime_memory_write_backing
         runtime_process_time_counter runtime_process_time_us runtime_restart
         runtime_thread_attach_host runtime_thread_clear_blocked runtime_thread_cpu_ns
@@ -239,7 +241,7 @@ if (APPLE)
     list(REMOVE_ITEM METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_object.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_buffer_barriers.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_compiled_shader.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_counters.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_device.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_draw_core.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_encoder.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_order.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_depth_stencil.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_present.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_render_pipeline.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_scale.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_specialize.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_texture.mm ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/mtl_timeline.cpp ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_metal/vk_to_mtl.mm)
     target_sources(bbgpu PRIVATE ${METAL_SOURCES})
     target_link_libraries(bbgpu PRIVATE bbmetal_core "-framework Metal" "-framework QuartzCore"
-        "-framework CoreGraphics" "-framework ColorSync" "-framework ImageIO" "-framework Foundation")
+        "-framework CoreGraphics" "-framework ColorSync" "-framework ImageIO" "-framework Foundation" "-framework AppKit")
     foreach(source IN LISTS METAL_SOURCES)
         if (source MATCHES "\\.mm$")
             set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS
@@ -284,7 +286,7 @@ endif()
 if (APPLE)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz sirit
-        "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework Foundation")
+        "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework Foundation" "-framework AppKit")
 else()
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz sirit)

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/bb_msaa.h"
+#include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include "shader_recompiler/info.h"
@@ -291,14 +294,57 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         switch (inst.GetOpcode()) {
         case IR::Opcode::ImageRead:
         case IR::Opcode::ImageSampleRaw: {
-            // fifa-hybrid: BB_FMASK=<hex> overrides the emulated FMASK word (experiment: FIFA's
-            // EQAA 4:2 resolve weights samples by this; the identity pattern gives 1/4 brightness).
-            static const u32 fmask_pattern = [] {
-                const char* env = std::getenv("BB_FMASK");
-                return env ? u32(std::strtoul(env, nullptr, 16)) : 0x76543210u;
+            // 0.5.1-e: the emulated FMASK maps every coverage sample i to colour sample
+            // i mod N, in the field width the FMASK format gives (bits per pixel / coverage
+            // samples), N being the colour samples rendered (the fragments, or BB_MSAA's count).
+            // FIFA 16's EQAA 4:2 resolve (Fmask8_S4_F2: four 2-bit fields) decoded the former
+            // constant 0x76543210 as (0, 0, 1, 0): three of its four taps read fragment 0, so the
+            // resolve was no anti-aliasing at all (the jagged pitch lines). (0, 1, 0, 1) is a true
+            // 2-sample resolve; with BB_MSAA=4, (0, 1, 2, 3) is 4x. BB_FMASK=<hex> still overrides.
+            struct FmaskShape { u32 coverage, fragments, bits_per_pixel; };
+            const FmaskShape shape = [&]() -> FmaskShape {
+                switch (image.GetDataFmt()) { // (NumBitsPerBlock has no FMASK entries)
+                case AmdGpu::DataFormat::FormatFmask8_S2_F1: return {2, 1, 8};
+                case AmdGpu::DataFormat::FormatFmask8_S4_F1: return {4, 1, 8};
+                case AmdGpu::DataFormat::FormatFmask8_S8_F1: return {8, 1, 8};
+                case AmdGpu::DataFormat::FormatFmask8_S2_F2: return {2, 2, 8};
+                case AmdGpu::DataFormat::FormatFmask8_S4_F2: return {4, 2, 8};
+                case AmdGpu::DataFormat::FormatFmask8_S4_F4: return {4, 4, 8};
+                case AmdGpu::DataFormat::FormatFmask16_S16_F1: return {16, 1, 16};
+                case AmdGpu::DataFormat::FormatFmask16_S8_F2: return {8, 2, 16};
+                case AmdGpu::DataFormat::FormatFmask32_S16_F2: return {16, 2, 32};
+                case AmdGpu::DataFormat::FormatFmask32_S8_F4: return {8, 4, 32};
+                case AmdGpu::DataFormat::FormatFmask32_S8_F8: return {8, 8, 32};
+                case AmdGpu::DataFormat::FormatFmask64_S16_F4: return {16, 4, 64};
+                case AmdGpu::DataFormat::FormatFmask64_S16_F8: return {16, 8, 64};
+                default: return {0, 0, 0};
+                }
             }();
-            IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(fmask_pattern));
-            IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(fmask_pattern == 0x76543210u ? 0xfedcba98u : fmask_pattern));
+            const u32 coverage = shape.coverage, fragments = shape.fragments;
+            u32 fmask_lo = 0x76543210u, fmask_hi = 0xfedcba98u; // the old constant (unknown format)
+            if (coverage != 0) {
+                const u32 bits = shape.bits_per_pixel / coverage;
+                const u32 colour_samples = std::max(VideoCore::BbSamples(fragments), 1u);
+                u64 word = 0;
+                for (u32 i = 0; i < coverage; ++i) {
+                    word |= u64(i % colour_samples) << (i * bits);
+                }
+                fmask_lo = u32(word);
+                fmask_hi = u32(word >> 32);
+            }
+            static const bool env_set = std::getenv("BB_FMASK") != nullptr;
+            static const u32 env_pattern = env_set ? u32(std::strtoul(std::getenv("BB_FMASK"), nullptr, 16)) : 0;
+            if (env_set) {
+                fmask_lo = fmask_hi = env_pattern;
+            }
+            static std::atomic<u32> said{0};
+            if (said.fetch_add(1) < 4) {
+                std::fprintf(stderr, "[FMASK] shader %016llx: format %u S%u F%u -> emulated word %#x (colour samples %u)\n",
+                             (unsigned long long)info.pgm_hash, u32(image.GetDataFmt()), coverage, fragments,
+                             fmask_lo, std::max(VideoCore::BbSamples(fragments), 1u));
+            }
+            IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(fmask_lo));
+            IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(fmask_hi));
             inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));
             return;
         }

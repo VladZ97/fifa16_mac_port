@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -76,6 +77,65 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    /// 0.5.1-c: a compute program that copies one sampled 2D image into one storage image texel
+    /// for texel (sampled at (gid + 0.5) * scale, LOD 0; written at gid): the renderer runs it as a
+    /// fragment pass instead of a dispatch (vk_rasterizer.cpp PlanCopyDispatchPass; FIFA's 13 full
+    /// screen copies a frame cost 0.47 ms each as compute). Found by CopyDispatchDetectPass.
+    struct CopyDispatch {
+        /// 0 not a copy; 2 a copy, `swizzle` being the shader's own (before the destination's
+        /// channel select, which belongs to the bound image and differs between permutations:
+        /// Compose). 1 is the 0.5.1-c..f form found in stored shader metas (swizzle already
+        /// composed with the select of whichever permutation was translated first, which drew
+        /// red and blue swapped into images with another select: FIFA's face mip chains); the
+        /// pipeline cache re-detects those (PipelineCache::GetProgram), the renderer ignores them.
+        u8 valid{};
+        u8 dst_image{}, src_image{}, src_sampler{};
+        u8 scale_buffer{};           ///< buffers[] index holding the sample scale (two dwords)
+        /// Written colour, per component of the shader's value: 0-3 sample.xyzw, 4 zero, 5 one,
+        /// 7 not known (the translated permutation's select dropped it).
+        u8 swizzle[4]{0, 1, 2, 3};
+        u16 scale_dword_x{}, scale_dword_y{};
+        u16 wg_x{}, wg_y{};          ///< workgroup size the gid derivation was matched against
+
+        /// What a storage write of the shader's value stores for a destination with channel
+        /// select `dst_select` (resource_patching_pass.cpp: ApplySwizzle(texel, select.Inverse())).
+        /// False when a stored component is one this record does not know.
+        bool Compose(const AmdGpu::CompMapping& dst_select, u8 out[4]) const {
+            const AmdGpu::CompMapping inv = dst_select.Inverse();
+            const AmdGpu::CompSwizzle sel[4] = {inv.r, inv.g, inv.b, inv.a};
+            for (u32 i = 0; i < 4; ++i) {
+                if (sel[i] == AmdGpu::CompSwizzle::Zero) {
+                    out[i] = 4;
+                } else if (sel[i] == AmdGpu::CompSwizzle::One) {
+                    out[i] = 5;
+                } else {
+                    const u8 code = swizzle[u32(sel[i]) - u32(AmdGpu::CompSwizzle::Red)];
+                    if (code > 5) {
+                        return false;
+                    }
+                    out[i] = code;
+                }
+            }
+            return true;
+        }
+        /// The inverse at detection: `stored` is what the translated shader writes for a
+        /// destination with `dst_select`. False when the two do not fit.
+        bool Decompose(const AmdGpu::CompMapping& dst_select, const u8 stored[4]) {
+            const AmdGpu::CompMapping inv = dst_select.Inverse();
+            const AmdGpu::CompSwizzle sel[4] = {inv.r, inv.g, inv.b, inv.a};
+            for (u32 j = 0; j < 4; ++j) {
+                swizzle[j] = 7;
+            }
+            for (u32 i = 0; i < 4; ++i) {
+                if (u32(sel[i]) >= u32(AmdGpu::CompSwizzle::Red)) {
+                    swizzle[u32(sel[i]) - u32(AmdGpu::CompSwizzle::Red)] = stored[i];
+                }
+            }
+            u8 check[4];
+            return Compose(dst_select, check) && check[0] == stored[0] && check[1] == stored[1] &&
+                   check[2] == stored[2] && check[3] == stored[3];
+        }
+    } copy_dispatch{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)
@@ -174,8 +234,15 @@ struct Info : InfoPersistent {
     static constexpr u32 MaxUdSnapshots = 6;
     static inline thread_local UdSnapshot ud_snapshots[MaxUdSnapshots];
     static inline thread_local u32 num_ud_snapshots = 0;
+    /// 0.5.1-c: set once the draw recording thread installs snapshots (vk_rasterizer.cpp). Until
+    /// then Snapshot() answers without the thread-local reads: on macOS each is a _tlv_get_addr
+    /// call, and UserData() runs under every binding (6% of the command thread in cutscenes).
+    static inline std::atomic<bool> snapshots_in_use{false};
 
     const UdSnapshot* Snapshot() const noexcept {
+        if (!snapshots_in_use.load(std::memory_order_relaxed)) [[likely]] {
+            return nullptr;
+        }
         for (u32 i = 0; i < num_ud_snapshots; ++i) {
             if (ud_snapshots[i].info == this) {
                 return &ud_snapshots[i];

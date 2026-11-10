@@ -271,6 +271,12 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
         }
     } else {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
+            // bbport: the cache may sit on an exFAT or network volume (it lives in the user's
+            // savegame folder), where macOS keeps extended attributes in "._<name>" companion
+            // files: those carry the same extension and are not blobs.
+            if (file_name.path().filename().string().starts_with('.')) {
+                continue;
+            }
             if (file_name.path().extension().string().ends_with(ext)) {
                 using namespace Common::FS;
                 const auto& file = IOFile{file_name, FileAccessMode::Read};

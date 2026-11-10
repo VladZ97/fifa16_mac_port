@@ -14,6 +14,9 @@
 #include "sdl_window.h"
 #include "bbport_mouse.h"
 #include "bbport_overlay.h"
+#ifdef __APPLE__
+#include "bbport_startup_progress.h"
+#endif
 
 namespace Frontend {
 
@@ -222,6 +225,9 @@ bool WindowSDL::PollEvents() {
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
     }
+#ifdef __APPLE__
+    BbStartupProgress::Tick(window); // fifa: the first launch's progress bar, until the first frame
+#endif
     SDL_Event event;
     // bbport: Cmd as of the event being handled (SDL_GetModState is the state after the pump,
     // which misses a Cmd+W whose Cmd was let go within the same frame).

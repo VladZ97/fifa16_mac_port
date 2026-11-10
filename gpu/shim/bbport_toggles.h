@@ -107,6 +107,18 @@ inline std::atomic<std::uint64_t> hoisted_shader_copies{0}, inline_shader_copies
 /// bbport: copy-shader copies deferred to the end of their render pass, and the passes a
 /// command split anyway because it touched their ranges.
 inline std::atomic<std::uint64_t> deferred_shader_copies{0}, deferred_copy_conflicts{0};
+/// fifa-hybrid: compute dispatches deferred to the end of their render pass (BB_DEFER_CS), and
+/// the passes a command had to split to run them first.
+inline std::atomic<std::uint64_t> deferred_dispatches{0}, deferred_dispatch_conflicts{0};
+/// fifa-hybrid: guest dispatches recorded ahead of their submission (Rasterizer::TryHoistDispatch).
+inline std::atomic<std::uint64_t> hoisted_dispatches{0};
+inline std::atomic<std::uint64_t> copy_dispatch_passes{0}; ///< 0.5.1-c: copy dispatches drawn as passes
+/// fifa-hybrid: the system's memory pressure level (dispatch memory-pressure source in bbgpu.cpp):
+/// 0 normal, 1 warning, 2 critical. The texture cache evicts earlier under it.
+inline std::atomic<int> system_memory_pressure{0};
+/// 0.5.1-b: steady-clock ns of the last flip submitted and the last graphics submission (stall dump).
+inline std::atomic<std::uint64_t> last_flip_ns{0};
+inline std::atomic<std::uint64_t> last_submit_ns{0};
 /// bbport: arena ordering requests recorded (Runtime::FlushBarriers: commands waiting for
 /// render passes, and the others), and uploads not hoisted because their ranges were in use by
 /// a submission in flight.
@@ -208,6 +220,13 @@ inline std::atomic<std::uint64_t> rec_busy_ns{0}, rec_idle_ns{0}, flip_submit_ns
 inline std::atomic<std::uint64_t> background_builds{0}, background_build_ns{0};
 /// Draws skipped because their pipeline was still compiling (shader_compile=skip).
 inline std::atomic<std::uint64_t> compile_skipped_draws{0};
+/// 0.5.1-h: flips submitted since the start (never reset: the frame number of the skip rule), and
+/// draws that waited for their pipeline because their targets are not redrawn every frame.
+inline std::atomic<std::uint64_t> frame_serial{0};
+inline std::atomic<std::uint64_t> compile_kept_draws{0};
+/// 0.5.1-i: pipeline builds handed to the creation pool and finished by it since the start (never
+/// reset: the overlay's "Building shaders" bar shows the builds in flight).
+inline std::atomic<std::uint64_t> pipeline_jobs_submitted{0}, pipeline_jobs_done{0};
 /// Draws with real tessellation, and rect/quad lists (emulated with tessellation).
 inline std::atomic<std::uint64_t> tess_draws{0}, rect_draws{0};
 } // namespace BbStats

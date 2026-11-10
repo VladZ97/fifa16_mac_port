@@ -143,6 +143,9 @@ public:
                            Shader::Backend::Bindings& binding);
     size_t FreePermIndex(u64 pgm_hash, size_t from) const;
     const GraphicsPipeline* Drawable(const GraphicsPipeline* pipeline);
+    /// 0.5.1-h: notes the colour and depth targets of the draw being selected and returns whether
+    /// all of them have been drawn in every frame for a while (see Drawable).
+    bool TargetsSteady();
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr);
@@ -227,6 +230,16 @@ private:
     /// (another BB_SPIRV_PRECISE mode or an earlier build): an older cache format, migrated by
     /// clearing once like old pipeline keys.
     bool load_old_meta = false;
+    /// 0.5.1-h: per render target (guest address): the last frame it was drawn in and the frame
+    /// its run of consecutive frames started; and the last draw's targets with their answer.
+    struct TargetUse {
+        u64 last = 0;
+        u64 since = 0;
+    };
+    tsl::robin_map<u64, TargetUse> target_use;
+    std::array<u64, 9> steady_targets{};
+    u64 steady_frame = ~0ull;
+    bool steady_answer = false;
 };
 
 } // namespace Vulkan

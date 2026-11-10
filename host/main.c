@@ -323,9 +323,26 @@ static int map_shared(void) {
         say("control block version %u, expected %u", g_shared->version, BBGPU_SHARED_VERSION);
         return EINVAL;
     }
-    { /* fifa-hybrid: relay spin window (bbgpu_shared.h relay_spin_ns), BB_RELAY_SPIN_US, default 100 */
+    { /* fifa-hybrid: relay spin window (bbgpu_shared.h relay_spin_ns), BB_RELAY_SPIN_US. Default: 100 us on
+         Macs with more than 8 logical processors, 0 (block at once) otherwise: a spinning relay thread on an
+         8-core Mac takes a core from the game's Rosetta threads for no gain (2026-11-09 A/B on an M1 Pro:
+         latency 26-28 ms either way, same hitch count). */
         const char *e = getenv("BB_RELAY_SPIN_US");
-        __atomic_store_n(&g_shared->relay_spin_ns, (uint32_t)((e ? atoi(e) : 100) * 1000), __ATOMIC_RELEASE);
+        const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        const int us = e ? atoi(e) : (cores > 8 ? 100 : 0);
+        __atomic_store_n(&g_shared->relay_spin_ns, (uint32_t)(us * 1000), __ATOMIC_RELEASE);
+        say("relay spin window %d us (%ld processors)", us, cores);
+        /* 0.5.1-b: the page-protection round trip (host_runtime.c runtime_memory_gpu_protect ->
+         * the game's bb:GpuProtect thread -> back) ran 80-100 times per frame at ~80 us each
+         * (two thread wake-ups), 1.5-9 ms per frame of the command thread. BB_PROTECT_SPIN_US
+         * (default 0 until the A/B) lets both ends spin that long before sleeping. */
+        const char *p = getenv("BB_PROTECT_SPIN_US");
+        /* A/B 2026-11-09 (M1 Pro, 8 cores): 200 us halves the per-protect latency (open play
+         * 0.15-0.6 ms/frame against 0.75-1.1) but costs the game a core: 55 fps with 51-59 ms
+         * worst frames against 60 fps with 27 ms. Same rule as the relay spin: only above 8. */
+        const int pus = p ? atoi(p) : (cores > 8 ? 100 : 0);
+        __atomic_store_n(&g_shared->protect_spin_ns, (uint32_t)(pus * 1000), __ATOMIC_RELEASE);
+        say("protect spin window %d us", pus);
     }
     return 0;
 }
@@ -492,6 +509,7 @@ int BBGPU_HOST_MAIN(int argc, char **argv) {
         else mach_vm_deallocate(mach_task_self(), at, BBGPU_GUEST_PAGE);
     }
     host_runtime_init(entry, entry_size);
+    if (!status) host_protect_direct_init(parent_pid);
     mach_port_t previous = MACH_PORT_NULL;
     if (mach_port_request_notification(mach_task_self(), ctl_port, MACH_NOTIFY_DEAD_NAME, 0, host_port,
                                        MACH_MSG_TYPE_MAKE_SEND_ONCE, &previous) != KERN_SUCCESS) {

@@ -18,6 +18,11 @@
 #if defined(__x86_64__)
 #include <x86intrin.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach_traps.h>
+#else
+#include <sched.h>
+#endif
 
 namespace bbport {
 
@@ -28,6 +33,20 @@ static inline __attribute__((always_inline)) void CpuPause() {
     __asm__ volatile("yield");
 #else
 #error "bbport::CpuPause: unsupported architecture"
+#endif
+}
+
+/// Gives the core to another runnable thread of the same or a higher priority, if there is one.
+/// Never sched_yield() / std::this_thread::yield() in a wait loop: on macOS that is swtch_pri(),
+/// which drops the caller to the lowest priority until every other runnable thread has run or a
+/// scheduler quantum (10 ms) has passed. With the game's threads filling the cores (FIFA 16 on an
+/// 8-core Mac) the command thread lost 3-11 ms per wait that way, long after the recording
+/// thread had finished what it waited for (BB_SLOWWAIT_MS, 2026-11-10): late flips.
+static inline void Yield() {
+#ifdef __APPLE__
+    swtch();
+#else
+    sched_yield();
 #endif
 }
 

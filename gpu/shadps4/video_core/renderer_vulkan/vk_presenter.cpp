@@ -8,6 +8,9 @@
 // drawable on a second command queue that waits for the frame's device tick. The shape follows
 // Huax-1839/bloodborne-macos's mtl_presenter.mm (GPL-2.0-or-later), without frame interpolation.
 
+#include <array>
+#include <ctime>
+#include "bbport_pacing.h"
 #include "bbport_cpu.h"
 #include "bbport_gpu_capture.h"
 #include "bbport_overlay.h"
@@ -32,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <optional>
@@ -74,6 +78,11 @@ Metal::LayerConfig LayerConfigFromEnv() {
 // also holds up the next nextDrawable: 10-18 late frames per run against 0-2 with three at the
 // 60 cap on an M4 Max, and 30-40 FPS on a MacBook Air M5 (#25, 2026-10-21). BB_SWAPCHAIN_IMAGES
 // overrides here too.
+/// fifa-hybrid: the game's display tick is 100 Hz or more (BB_VBLANK_HZ=120, no frame cap).
+bool FastTick() {
+    return EmulatorSettings.GetFrameLimit() == 0 && EmulatorSettings.GetVblankFrequency() >= 100;
+}
+
 u32 FullscreenDrawables(const Metal::LayerConfig& config) {
     return std::getenv("BB_SWAPCHAIN_IMAGES") ? config.max_drawables : 3;
 }
@@ -129,6 +138,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // Snapshots read the drawable back.
     config.framebuffer_only = snapshot_trigger.empty();
     Metal::ConfigureLayer(device, layer, config);
+    // 0.5.1-f: keep the display on a steady refresh grid (see StartSteadyRefresh).
+    // BB_REFRESH_BEAT=0 leaves the display alone, BB_DISPLAY_60=1 uses its 60 Hz mode.
+    // fifa-hybrid (0.5.1-g): with a 120 Hz game tick (BB_VBLANK_HZ=120) the frames themselves
+    // keep the display at its full rate, and the heartbeat's composited path would cap them:
+    // three drawables go round in about four refreshes there (80 to 90 frames a second,
+    // measured 80 with a full queue against 116 without the heartbeat).
+    const bool fast_tick = FastTick();
+    if (const char* env = std::getenv("BB_REFRESH_BEAT");
+        env ? env[0] != '0' : !fast_tick) {
+        const char* fixed = std::getenv("BB_DISPLAY_60");
+        // BB_REFRESH_BEAT=link: a display link asks for the full rate instead of the layer.
+        Metal::StartSteadyRefresh(layer, fixed && fixed[0] == '1', env && env[0] == 'l');
+    }
     windowed_drawables = layer_drawables = config.max_drawables;
     fullscreen_drawables = FullscreenDrawables(config);
     // The settings menu and FPS counter, drawn into the drawable (Present).
@@ -249,6 +271,56 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // post-process pass still sRGB encoded and is decoded there.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    // 0.5.1-e: edge anti-aliasing of the game's picture at its own resolution, before any
+    // scaling (BB_AA=0 turns it off; BB_AA_SUBPIX / BB_AA_EDGE / BB_AA_EDGE_MIN tune it;
+    // BB_AA_SPLIT=<0..1> leaves the left part of the picture untouched for comparison).
+    struct AaConfig {
+        bool enabled{true};
+        HostPasses::PostProcessingPass::AaSettings settings{};
+    };
+    static const AaConfig aa = [] {
+        AaConfig config{};
+        const auto read = [](const char* name, float& value, float lo, float hi) {
+            if (const char* env = std::getenv(name)) {
+                value = std::clamp(std::strtof(env, nullptr), lo, hi);
+            }
+        };
+        if (const char* env = std::getenv("BB_AA")) {
+            config.enabled = env[0] != '0';
+        }
+        read("BB_AA_SUBPIX", config.settings.subpix, 0.0f, 1.0f);
+        read("BB_AA_EDGE", config.settings.edge_threshold, 0.03f, 0.5f);
+        read("BB_AA_EDGE_MIN", config.settings.edge_threshold_min, 0.0f, 0.2f);
+        read("BB_AA_SPLIT", config.settings.split, 0.0f, 1.0f);
+        if (const char* env = std::getenv("BB_AA_QUALITY")) {
+            config.settings.quality = u32(std::clamp(std::atoi(env), 0, 2));
+        }
+        return config;
+    }();
+    // Measurement aid: BB_AA_ALT=<seconds> cycles the pass off / fast / quality every that many seconds
+    // and logs each switch, so one run gives paired GPU times at the same content.
+    static const double aa_alt = [] {
+        const char* env = std::getenv("BB_AA_ALT");
+        return env ? std::max(0.0, std::strtod(env, nullptr)) : 0.0;
+    }();
+    bool run_aa = aa.enabled;
+    auto aa_settings = aa.settings;
+    if (aa_alt > 0.0) {
+        // Three phases: off, 5 search steps, 12 search steps.
+        static int last_phase = -1;
+        const double now = double(bbport::CyclesToNs(bbport::CpuCycles())) * 1e-9;
+        const int phase = int(u64(now / aa_alt) % 3u);
+        if (phase != last_phase) {
+            last_phase = phase;
+            std::fprintf(stderr, "[AA] %s\n", phase == 0 ? "off" : phase == 1 ? "q0" : "q2");
+        }
+        run_aa = run_aa && phase != 0;
+        aa_settings.quality = phase == 1 ? 0u : 2u;
+    }
+    if (run_aa && !upscaled && !frame->is_hdr) {
+        input = pp_pass.EdgeAa(draw_scheduler, std::move(input), image_width, image_height,
+                               aa_settings);
+    }
     if (fsr_pass) {
         input = fsr_pass->Render(draw_scheduler, std::move(input), {image_width, image_height},
                                  {frame->width, frame->height}, fsr_settings, frame->is_hdr);
@@ -374,19 +446,293 @@ std::string Presenter::TakeSnapshotRequest() {
 }
 
 namespace {
-/// bbport: frame pacing (bbport.ini frame_pacing, default off): the minimum time each frame stays
+/// bbport: frame pacing (bbport.ini even_frames, default on since 0.5.1-f, on displays whose
+/// steady refresh is 120 or 240 Hz): the minimum time each frame stays
 /// on screen, the frame cap's period. On variable-refresh displays (ProMotion) frames at a steady
 /// cap otherwise alternate between neighbouring refresh slots (12.5 / 20.8 ms at 60 FPS on a
 /// MacBook Pro); with it they are shown for one period each. It holds frames until their slot:
 /// about one more frame of input latency (measured +23 ms at 60 FPS). Slightly under the period
 /// (97%), so a frame on time is never held back to the next refresh.
 double PacingSeconds() {
-    if (!BbSettings::Get().frame_pacing.load(std::memory_order_relaxed)) {
+    // BB_FRAME_PACING=<0|1> overrides the setting, BB_PACING_FACTOR the share of the period.
+    static const int forced = [] {
+        const char* env = std::getenv("BB_FRAME_PACING");
+        return env ? int(std::atoi(env) != 0) : -1;
+    }();
+    static const double factor = [] {
+        const char* env = std::getenv("BB_PACING_FACTOR");
+        const double v = env ? std::atof(env) : 0.0;
+        return v > 0.1 && v <= 1.0 ? v : 0.97;
+    }();
+    if (forced == 0) {
         return 0;
     }
-    const u32 fps = EmulatorSettings.GetFrameLimit();
-    return fps ? 0.97 / fps : 0;
+    if (forced < 0 && FastTick()) {
+        return 0; // 120 Hz mode: every refresh may show a new frame, nothing to hold back
+    }
+    if (forced < 0) {
+        // On a 60 Hz display every refresh shows one frame anyway; on a 120 Hz grid (see
+        // Metal::StartSteadyRefresh) the minimum duration is what keeps a frame for two.
+        const int hz = Metal::SteadyRefreshHz();
+        if (!BbSettings::Get().frame_pacing.load(std::memory_order_relaxed) || hz < 100 ||
+            hz % 60 != 0) {
+            return 0;
+        }
+    }
+    // Without a frame cap (FIFA 16: frame limit 0) the game's own rate is the vblank's.
+    const u32 limit = EmulatorSettings.GetFrameLimit();
+    const u32 fps = limit ? limit : EmulatorSettings.GetVblankFrequency();
+    return fps ? factor / fps : 0;
 }
+
+/// fifa-hybrid (0.5.1-f): keeps finished frames from piling up in front of the display.
+/// The game is paced by the host's own 60 Hz tick, the display by its own clock. When the game
+/// runs a hair faster than the display (or delivers two frames close together after a slow one)
+/// finished frames queue up, the queue never drains, and every later frame reaches the screen
+/// 80 to 98 ms after its flip. The lock measures how long finished frames wait for their slot
+/// (end of GPU work to shown) and moves the tick by at most 0.2 ms a frame until the shortest
+/// recent wait sits at the target: one spare frame in front of the display, no more.
+///
+/// Runs with paced presents (120 Hz grid) and on 60 Hz displays, when "Even frame times" is on.
+/// History: a target of 8 ms was below what the display path can do and slowed the game for
+/// good; 26 ms worked on paper, but every frame the game delivered a few ms late then missed
+/// its slot. Screen captures make the window server skip a refresh (the test harness took one
+/// every 3.3 s, which looked like a display fault for a day): measure in capture-free stretches.
+/// BB_PACING_LOCK=0 disables (1 forces it without paced presents), BB_PACING_TARGET_MS sets the
+/// target (default 40), BB_PACING_TRACE=1 logs every frame.
+class PacingLock {
+public:
+    void Note(u64 shown_ns, u64 gpu_end_ns, u64 flip_ns, bool paced) {
+        if (!shown_ns) {
+            return;
+        }
+        const double kPeriodMs = PeriodMs();
+        const bool from_flip = FromFlip();
+        const float flip_wait_ms =
+            flip_ns && shown_ns >= flip_ns ? float(double(shown_ns - flip_ns) * 1e-6) : 0.f;
+        std::scoped_lock lock{mutex};
+        // By default with paced presents (120 Hz grid) and on 60 Hz displays, where a full
+        // drawable queue is the same 50 ms of latency without any pacing.
+        active = Mode() == 1 ||
+                 (Mode() < 0 && (paced || ((Metal::SteadyRefreshHz() == 60 || FastTick()) &&
+                                           BbSettings::Get().frame_pacing.load(
+                                               std::memory_order_relaxed))));
+        if (!active && BbPacing::g_slew_ns.load(std::memory_order_relaxed) != 0) {
+            BbPacing::SetTickSlew(0);
+        }
+        if (Tracing()) {
+            // BB_PACING_TRACE=1: shown interval / wait / GPU-end interval / tick slew, per frame.
+            trace.push_back({last_shown_ns ? float((shown_ns - last_shown_ns) * 1e-6) : 0.f,
+                             gpu_end_ns ? float((double(shown_ns) - double(gpu_end_ns)) * 1e-6) : 0.f,
+                             last_gpu_end_ns && gpu_end_ns
+                                 ? float((double(gpu_end_ns) - double(last_gpu_end_ns)) * 1e-6)
+                                 : 0.f,
+                             float(BbPacing::g_slew_ns.load(std::memory_order_relaxed) * 1e-6),
+                             flip_wait_ms});
+        }
+        if (!active) {
+            last_shown_ns = shown_ns;
+            last_gpu_end_ns = gpu_end_ns;
+            return;
+        }
+        const u64 last = last_shown_ns;
+        last_shown_ns = shown_ns;
+        last_gpu_end_ns = gpu_end_ns;
+        ++frames;
+        const bool late = last && shown_ns > last &&
+                          double(shown_ns - last) * 1e-6 > kPeriodMs * 1.3;
+        const bool valid = from_flip ? flip_wait_ms > 0.f && flip_wait_ms < 250.f
+                                     : gpu_end_ns && shown_ns >= gpu_end_ns &&
+                                           shown_ns - gpu_end_ns < 200'000'000ull;
+        if (late || !valid) {
+            if (late) {
+                ++late_frames;
+            }
+            ring_n = 0; // the slots moved: earlier waits say nothing about the next frames
+            BbPacing::SetTickSlew(0);
+            return;
+        }
+        const double wait_ms =
+            from_flip ? double(flip_wait_ms) : double(shown_ns - gpu_end_ns) * 1e-6;
+        ring[ring_at] = wait_ms;
+        ring_at = (ring_at + 1) % kRing;
+        ring_n = std::min<u32>(ring_n + 1, kRing);
+        wait_sum_ms += wait_ms;
+        wait_min_ms = std::min(wait_min_ms, wait_ms);
+        ++wait_n;
+        if (ring_n < kRing) {
+            BbPacing::SetTickSlew(0);
+            return;
+        }
+        double least = ring[0];
+        for (u32 i = 1; i < kRing; ++i) {
+            least = std::min(least, ring[i]);
+        }
+        const double error_ms = least - BaseTarget();
+        double slew_ms = 0;
+        if (std::abs(error_ms) > 0.4) {
+            // Later quickly (a queue costs latency on every frame), earlier only gently: a
+            // short wait is usually a slow scene, which an earlier tick does not help.
+            slew_ms = std::clamp(error_ms * 0.08, -0.1, 0.2);
+        }
+        BbPacing::SetTickSlew(s64(slew_ms * 1e6));
+    }
+
+    void Print() {
+        std::scoped_lock lock{mutex};
+        if (!trace.empty()) {
+            timespec now{};
+            clock_gettime(CLOCK_REALTIME, &now);
+            std::printf("PTT: %lld.%03ld\nPT:", (long long)now.tv_sec, now.tv_nsec / 1'000'000);
+            for (const auto& t : trace) {
+                std::printf(" %.1f/%.1f/%.1f/%.2f/%.1f", t[0], t[1], t[2], t[3], t[4]);
+            }
+            std::printf("\n");
+            trace.clear();
+        }
+        if (!active || !frames) {
+            return;
+        }
+        std::printf("Pacing lock: target %.1f ms %s, wait of %u on-time frames "
+                    "least %.1f mean %.1f ms, late %u of %u, ticks moved +%.1f / -%.1f ms\n",
+                    BaseTarget(), FromFlip() ? "from the flip" : "from GPU end", wait_n, wait_n ? wait_min_ms : 0.0,
+                    wait_n ? wait_sum_ms / wait_n : 0.0, late_frames, frames,
+                    BbPacing::g_slewed_fwd_ns.exchange(0) * 1e-6,
+                    BbPacing::g_slewed_back_ns.exchange(0) * 1e-6);
+        wait_n = 0;
+        wait_sum_ms = 0;
+        wait_min_ms = 1e9;
+        late_frames = frames = 0;
+    }
+
+    /// True when the lock runs without paced presents too (needs the presented callback).
+    static bool Wanted() {
+        return Mode() == 1 || Tracing() ||
+               (Mode() < 0 && (Metal::SteadyRefreshHz() == 60 || FastTick()) &&
+                BbSettings::Get().frame_pacing.load(std::memory_order_relaxed));
+    }
+
+private:
+    /// BB_PACING_LOCK: 0 never, 1 always, unset (-1) with paced presents only.
+    static int Mode() {
+        static const int mode = [] {
+            const char* env = std::getenv("BB_PACING_LOCK");
+            return !env ? -1 : env[0] == '0' ? 0 : 1;
+        }();
+        return mode;
+    }
+    static bool Tracing() {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_PACING_TRACE");
+            return env && env[0] == '1';
+        }();
+        return on;
+    }
+    /// The display path needs a finished frame about one refresh plus 12 to 16 ms ahead of its
+    /// slot (measured: frames slip under 21 to 24 ms on the 120 Hz grid, under 28 ms at 60 Hz).
+    /// 40 ms leaves a whole game frame of room on the 120 Hz grid, so a frame the game delivers
+    /// one tick late is still shown in its slot. Measured in capture-free match play: 26 ms
+    /// 97.6% of frames on cadence (1.4 late a second), 34 ms 99.9%, 40 ms 100.0%, for 44, 52
+    /// and 53 ms from flip to screen (a full queue: 78 to 88 ms).
+    /// 0.5.1-g, measured from the flip (120 s capture-free match stretches; flip to screen
+    /// includes about 5 ms before the flip packet). Late frames a second per run:
+    /// 50 ms: 0.05, 0.03, 0.03 at 54 ms from flip to screen; 44 ms: 0.08, 0.27, 0.13, 0.08 at
+    /// 49 ms; 40 ms: 0.88 at 46 ms; 36 ms: 0.38 at 42 ms; the old measure: 0.14 at 73 ms.
+    /// 50 is both more even and 19 ms shorter than the old measure; 44 trades the evenness
+    /// gain for 5 ms more (BB_PACING_TARGET_MS=44). 120 Hz tick: 26 ms, 30 to 31 ms.
+    static double BaseTarget() {
+        static const double forced = [] {
+            const char* env = std::getenv("BB_PACING_TARGET_MS");
+            const double v = env ? std::atof(env) : 0.0;
+            return v >= 4.0 && v <= 60.0 ? v : 0.0;
+        }();
+        if (forced > 0) {
+            return forced;
+        }
+        if (!FromFlip()) {
+            return 40.0;
+        }
+        return FastTick() ? 26.0 : 50.0;
+    }
+    /// 0.5.1-g: the wait is measured from the game's flip reaching the host, not from the end
+    /// of the GPU work. Three drawables hold a finished frame for at most about 40 ms at 60
+    /// frames a second, so the old target sat exactly where the layer is full: the lock then
+    /// read "on target" (or a little under, and moved the tick earlier) while the surplus
+    /// frames waited unseen for a drawable in front of it, 8 to 32 ms more (flip to screen
+    /// wandered between 53 and 87 ms in one match). From the flip the whole queue is in the
+    /// measurement. BB_PACING_FROM=gpu restores the old measurement.
+    static bool FromFlip() {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_PACING_FROM");
+            return !(env && env[0] == 'g');
+        }();
+        return on;
+    }
+    static double PeriodMs() {
+        static const double ms = [] {
+            const u32 limit = EmulatorSettings.GetFrameLimit();
+            const u32 fps = limit ? limit : EmulatorSettings.GetVblankFrequency();
+            return fps ? 1000.0 / fps : 1000.0 / 60.0;
+        }();
+        return ms;
+    }
+    static constexpr u32 kRing = 8;
+    std::mutex mutex;
+    std::array<double, kRing> ring{};
+    std::vector<std::array<float, 5>> trace;
+    u32 ring_at{}, ring_n{};
+    u64 last_shown_ns{}, last_gpu_end_ns{};
+    bool active{};
+    u32 frames{}, late_frames{}, wait_n{};
+    double wait_sum_ms{}, wait_min_ms{1e9};
+};
+PacingLock g_pacing_lock;
+
+class PresentWait {
+public:
+    /// Wait of each shown frame between the end of its GPU work and the display (0.5.1-f).
+    /// Measurement only (printed with the frame stats); PacingLock steers by the same wait.
+    void Note(u64 shown_ns, u64 gpu_end_ns) {
+        if (!shown_ns) {
+            return;
+        }
+        std::scoped_lock lock{mutex};
+        const u64 last = last_shown_ns;
+        last_shown_ns = shown_ns;
+        ++frames;
+        if (last && shown_ns > last && double(shown_ns - last) * 1e-9 > 1.3 / 60.0) {
+            ++late_frames;
+        }
+        if (gpu_end_ns && shown_ns >= gpu_end_ns && shown_ns - gpu_end_ns < 200'000'000ull) {
+            const double wait_ms = double(shown_ns - gpu_end_ns) * 1e-6;
+            wait_sum_ms += wait_ms;
+            wait_min_ms = std::min(wait_min_ms, wait_ms);
+            ++wait_n;
+        }
+    }
+
+    void Print() {
+        std::scoped_lock lock{mutex};
+        if (!frames) {
+            return;
+        }
+        std::printf("Present wait: GPU end to shown least %.1f mean %.1f ms over %u frames, "
+                    "%u of %u shown late\n",
+                    wait_n ? wait_min_ms : 0.0, wait_n ? wait_sum_ms / wait_n : 0.0, wait_n,
+                    late_frames, frames);
+        wait_n = 0;
+        wait_sum_ms = 0;
+        wait_min_ms = 1e9;
+        late_frames = frames = 0;
+    }
+
+private:
+    std::mutex mutex;
+    u64 last_shown_ns{};
+    u32 frames{}, late_frames{}, wait_n{};
+    double wait_sum_ms{}, wait_min_ms{1e9};
+};
+PresentWait g_present_wait;
 } // namespace
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u32 present_id) {
@@ -446,6 +792,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             snapshot = std::make_shared<Metal::Object>(Metal::EncodeSnapshot(
                 device, command_buffer, drawable.texture, drawable.width, drawable.height));
         }
+        const double pacing = PacingSeconds();
+        const u64 flip_ns = is_game_frame ? frame->flip_ns : 0;
         present_queue->Commit(
             command_buffer, drawable.drawable.Get(),
             [pool = pool, frame, snapshot, path = std::move(snapshot_path),
@@ -462,15 +810,24 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                         std::fflush(stdout);
                     }).detach();
                 }
-            }, PacingSeconds(),
-            present_id ? std::function<void(u64)>([this, present_id](u64 shown_ns) {
-                std::scoped_lock lock{past_timings_mutex};
-                if (past_timings.size() < 1024) {
-                    past_timings.push_back(vk::PastPresentationTimingGOOGLE{
-                        .presentID = present_id, .desiredPresentTime = 0,
-                        .actualPresentTime = shown_ns, .earliestPresentTime = 0, .presentMargin = 0});
-                }
-            }) : std::function<void(u64)>{});
+            }, pacing,
+            present_id || pacing > 0 || PacingLock::Wanted()
+                ? std::function<void(u64, u64)>(
+                      [this, present_id, pacing, flip_ns](u64 shown_ns, u64 gpu_end_ns) {
+                          g_present_wait.Note(shown_ns, gpu_end_ns);
+                          g_pacing_lock.Note(shown_ns, gpu_end_ns, flip_ns, pacing > 0);
+                          if (!present_id) {
+                              return;
+                          }
+                          std::scoped_lock lock{past_timings_mutex};
+                          if (past_timings.size() < 1024) {
+                              past_timings.push_back(vk::PastPresentationTimingGOOGLE{
+                                  .presentID = present_id, .desiredPresentTime = 0,
+                                  .actualPresentTime = shown_ns, .earliestPresentTime = 0,
+                                  .presentMargin = 0});
+                          }
+                      })
+                : std::function<void(u64, u64)>{});
         last_present.submitted = NowNs();
         last_present.presented = last_present.submitted;
     });
@@ -491,6 +848,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                         iv.size() / secs, iv[iv.size() / 2], iv[iv.size() * 99 / 100], iv.back(),
                         hitches, (busy - busy0) / 1e6 / iv.size());
             busy0 = busy;
+            g_present_wait.Print();
+            g_pacing_lock.Print();
             std::fflush(stdout);
             iv.clear();
             win = now;

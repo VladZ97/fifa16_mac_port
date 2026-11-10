@@ -261,6 +261,25 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// fifa-hybrid: the part of gpu_modified_ranges that is not a steady rewrite of a tiny
+    /// buffer (see NoteGpuWrite): no asynchronous write-back, the CPU's read waits for the GPU.
+    RangeSet oneshot_ranges;
+    struct GpuWriteHistory {
+        u64 last_ns = 0;
+        u32 count = 0;
+    };
+    std::unordered_map<VAddr, GpuWriteHistory> gpu_write_history;
+    void NoteGpuWrite(VAddr addr, u64 size);
+public:
+    /// 0.5.1-g: the GPU side wrote guest memory itself (see TextureCache::NoteHostWrite): the
+    /// arena copy of those pages is stale, so they are marked CPU-modified as a fault would.
+    void NoteHostWrite(VAddr addr, u64 size);
+    /// Debug: bytes of [addr, addr + size) on clean pages (neither CPU- nor GPU-modified) where
+    /// the arena differs from guest memory; ~0 without a chunk. `clean` gets the bytes compared.
+    u64 DebugArenaDiff(VAddr addr, u64 size, u64* clean, u64* first_diff);
+private:
+    void DropHotRead(VAddr page, const char* why);
+    void DropHotReadIn(VAddr addr, u64 size, const char* why);
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -29,6 +30,9 @@
 #include "video_core/renderer_vulkan/vk_depth_attachment.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/blit_helper.h" // 0.5.1-c: copy dispatch pass
+#include "video_core/renderer_metal/mtl_texture.h"
+#include <vulkan/vulkan_format_traits.hpp>
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -114,7 +118,12 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
     }
     scheduler.SetPassEndHook(
-        [](void* self) { FlushDeferredCopies(*static_cast<Rasterizer*>(self)); }, this);
+        [](void* self) {
+            auto* r = static_cast<Rasterizer*>(self);
+            r->FlushDeferredDispatches(); // first: TryDeferDispatch keeps clear of pending copies
+            FlushDeferredCopies(*r);
+        },
+        this);
     // bbport: the frame capture's event trace also lists the SRT walkers' guest reads.
     if (([] { static const bool v = std::getenv("BB_CAPTURE_TRIGGER") != nullptr; return v; }())) {
         Shader::srt_read_hook = [](u64 address, u32 size) {
@@ -130,19 +139,24 @@ Rasterizer::Rasterizer(Metal::Device& device_, Scheduler& scheduler_, Runtime& r
 Rasterizer::~Rasterizer() = default;
 
 inline const AmdGpu::Regs& Rasterizer::Regs() const {
-    return stage_regs ? *stage_regs : liverpool->regs;
+    return stage_regs_used.load(std::memory_order_relaxed) && stage_regs ? *stage_regs
+                                                                          : liverpool->regs;
 }
 
 inline AmdGpu::CbDbExtent Rasterizer::CbExtent(u32 index) const {
-    return stage_regs ? pipe_cb_extent[index] : liverpool->last_cb_extent[index];
+    return stage_regs_used.load(std::memory_order_relaxed) && stage_regs
+               ? pipe_cb_extent[index]
+               : liverpool->last_cb_extent[index];
 }
 
 inline const AmdGpu::ComputeProgram& Rasterizer::CsRegs() const {
-    return stage_cs ? *stage_cs : liverpool->GetCsRegs();
+    return stage_regs_used.load(std::memory_order_relaxed) && stage_cs ? *stage_cs
+                                                                        : liverpool->GetCsRegs();
 }
 
 inline AmdGpu::CbDbExtent Rasterizer::DbExtent() const {
-    return stage_regs ? pipe_db_extent : liverpool->last_db_extent;
+    return stage_regs_used.load(std::memory_order_relaxed) && stage_regs ? pipe_db_extent
+                                                                          : liverpool->last_db_extent;
 }
 
 namespace {
@@ -344,6 +358,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image_id = bound_images.emplace_back(FindTargetMemoized(
             desc, last_targets[cb], [&] { std::construct_at(&desc, col_buf, hint); }, tag,
             col_buf, hint));
+        bound_images_written.push_back(1);
+        bound_images_prev_write.push_back(0);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -361,6 +377,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                                   htile_address, hint);
             },
             tag, regs.depth_buffer, regs.depth_view, regs.depth_control, htile_address, hint));
+        bound_images_written.push_back(1);
+        bound_images_prev_write.push_back(0);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -832,6 +850,13 @@ void Rasterizer::RetireSubmission() {
     }
 }
 
+void Rasterizer::DumpStall() {
+    std::fprintf(stderr, "[STALL] draw pipe: %s, head %llu; deferred copies pending %d, deferred dispatches %zu\n",
+                 draw_pipe ? (draw_pipe->Idle() ? "idle" : "BUSY") : "off",
+                 (unsigned long long)DrawPipeHead(), int(DeferredCopiesPending()), deferred_dispatches.size());
+    scheduler.DumpStall();
+}
+
 bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 toggle) {
     if (!UseDrawPipe() || BbToggle::Disabled(toggle)) {
         DrainDrawPipe(DrawPipe::ReasonRasterizer);
@@ -867,6 +892,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         in += AmdGpu::RegDirty::BlockWords * sizeof(u32);
     }
     ASSERT(packet.num_stages <= Shader::Info::MaxUdSnapshots);
+    Shader::Info::snapshots_in_use.store(true, std::memory_order_relaxed); // 0.5.1-c
     for (u32 i = 0; i < packet.num_stages; ++i) {
         const auto& stage = *reinterpret_cast<const PacketStage*>(in);
         in += sizeof(PacketStage);
@@ -948,6 +974,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         }
     }
     ASSERT(static_cast<u32>(in - data) == size);
+    stage_regs_used.store(true, std::memory_order_relaxed); // 0.5.1-c
     stage_regs = &regs;
     self.pipe_cb_extent = packet.cb_extent;
     self.pipe_db_extent = packet.db_extent;
@@ -1058,6 +1085,19 @@ bool Rasterizer::FilterDrawPasses() const {
     return !(mode == Mode::Disable && (depth_copy || stencil_copy));
 }
 
+// fifa-hybrid diagnostics (BB_DRAWLOG_TRIGGER): the open draw log and its draw counter.
+static FILE* g_drawlog = nullptr;
+struct DrawlogStream {
+    u32 vs;
+    u32 stream;
+    VAddr addr;
+    u64 size;
+};
+static std::map<std::pair<VAddr, u64>, DrawlogStream> g_drawlog_streams;
+// The draw-log window is open: read faults and image downloads are listed on stderr.
+std::atomic<bool> g_bb_diag_window{false};
+static u64 g_drawlog_draw = 0;
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
@@ -1084,6 +1124,99 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         } else if (r.primitive_type == AmdGpu::PrimitiveType::RectList ||
                    r.primitive_type == AmdGpu::PrimitiveType::QuadList) {
             BbStats::rect_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // BB_DRAWLOG_TRIGGER=<file>: when that file appears (its content is the output path) every draw of the
+    // next 70 ms is written there: a D line per draw, then per stage its constant buffers (B) and images (I).
+    // BB_AUDIT=<seconds, default 20>: every so often, tracked clean images are compared with guest memory.
+    if (static const int audit_s = [] {
+            const char* e = std::getenv("BB_AUDIT");
+            return e ? std::max(std::atoi(e), 1) == 1 ? 20 : std::atoi(e) : 0;
+        }();
+        audit_s) {
+        static u32 skip = 0;
+        if ((++skip & 0xff) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            static auto next_audit = now + std::chrono::seconds(audit_s);
+            if (now >= next_audit) {
+                next_audit = now + std::chrono::seconds(audit_s);
+                texture_cache.AuditImages();
+            }
+        }
+    }
+    if (static const char* dlt = std::getenv("BB_DRAWLOG_TRIGGER"); dlt) {
+        const auto now = std::chrono::steady_clock::now();
+        static auto next_poll = now;
+        static auto stop_at = now;
+        static auto diag_stop = now;
+        if (g_bb_diag_window.load(std::memory_order_relaxed) && now >= diag_stop) {
+            g_bb_diag_window.store(false, std::memory_order_relaxed);
+            std::fprintf(stderr, "[DIAGWIN] end\n");
+        }
+        if (g_drawlog && now >= stop_at) {
+            // BB_VDIFF=1: the vertex streams listed in the window, arena against guest memory.
+            for (const auto& [key, v] : g_drawlog_streams) {
+                u64 clean = 0, first = 0;
+                const u64 diff = buffer_cache.DebugArenaDiff(v.addr, v.size, &clean, &first);
+                std::fprintf(g_drawlog, "A %08x s%u %#llx size %llu: arena differs in %lld of %llu clean bytes, first %#llx\n",
+                             v.vs, v.stream, (unsigned long long)v.addr, (unsigned long long)v.size,
+                             (long long)diff, (unsigned long long)clean, (unsigned long long)first);
+            }
+            g_drawlog_streams.clear();
+            std::fclose(g_drawlog);
+            g_drawlog = nullptr;
+        }
+        if (!g_drawlog && now >= next_poll) {
+            next_poll = now + std::chrono::milliseconds(40);
+            if (FILE* t = std::fopen(dlt, "r")) {
+                char out[1024] = {};
+                if (std::fgets(out, sizeof(out), t)) {
+                    out[std::strcspn(out, "\r\n")] = 0;
+                    g_drawlog = std::fopen(out, "w");
+                    stop_at = now + std::chrono::milliseconds(70);
+                    // BB_DIAG_MS=<ms>: length of the read-fault/download/write-back listing window.
+                    static const int diag_ms = [] {
+                        const char* env = std::getenv("BB_DIAG_MS");
+                        return env ? std::atoi(env) : 500;
+                    }();
+                    diag_stop = now + std::chrono::milliseconds(diag_ms);
+                    g_bb_diag_window.store(true, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[DIAGWIN] begin %s\n", out);
+                }
+                std::fclose(t);
+                std::remove(dlt);
+            }
+        }
+        if (g_drawlog) {
+            const auto& r = liverpool->regs;
+            ++g_drawlog_draw;
+            std::fprintf(g_drawlog, "D %llu idx %u prim %u cb0 %#llx %ux%u z %#llx\n",
+                         (unsigned long long)g_drawlog_draw, r.num_indices, u32(r.primitive_type),
+                         (unsigned long long)r.color_buffers[0].Address(), r.color_buffers[0].Pitch(),
+                         r.color_buffers[0].Height(), (unsigned long long)r.depth_buffer.DepthAddress());
+        }
+    }
+
+    // BB_DB_ENTRY=<pitch>: every draw the game submits with a depth buffer of that pitch, counted per kind
+    // before any filter (to tell draws that never arrive from draws dropped on the way).
+    if (static const u32 dbe = [] { const char* e = std::getenv("BB_DB_ENTRY"); return e ? u32(std::atoi(e)) : 0u; }();
+        dbe) {
+        const auto& r = liverpool->regs;
+        if ((r.depth_buffer.DepthAddress() || r.depth_buffer.DepthWriteAddress()) && r.depth_buffer.Pitch() == dbe) {
+            const std::string key = fmt::format(
+                "z {:#x} zw {:#x} {}x{} zfmt {} cmode {} prim {} idx {} den {} dwr {} dfunc {} fzd {} fzv {} cb0 {:#x} ps {:#x}",
+                u64(r.depth_buffer.DepthAddress()), u64(r.depth_buffer.DepthWriteAddress()), r.depth_buffer.Pitch(),
+                r.depth_buffer.Height(), u32(r.depth_buffer.z_info.format), u32(r.color_control.mode),
+                u32(r.primitive_type), r.num_indices, int(r.depth_control.depth_enable),
+                int(r.depth_control.depth_write_enable), int(r.depth_control.depth_func),
+                int(r.depth_render_override.force_z_dirty), int(r.depth_render_override.force_z_valid),
+                u64(r.color_buffers[0].Address()), u64(r.ps_program.Address<uintptr_t>()));
+            static std::map<std::string, u64> counts;
+            const u64 c = ++counts[key];
+            if (counts.size() < 300 && (c == 1 || c % 1000 == 0)) {
+                std::fprintf(stderr, "[DBE] %s count %llu\n", key.c_str(), (unsigned long long)c);
+            }
         }
     }
 
@@ -1508,7 +1641,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // fifa-hybrid diagnostics: BB_DUMP_PS=<hash,...> writes colour target 0 after every draw of
     // these pixel shaders (from BB_DUMP_PS_AT seconds after the first draw, at most BB_DUMP_PS_MAX
     // (60) files) as <BB_DUMP_DIR>/dNNN_ps<hash>_<w>x<h>.raw; BB_DUMP_PS_RECT=x,y,w,h crops.
-    // 4-byte formats only (raw RGBA/BGRA order as the format says).
+    // 4-byte formats and R8 only (raw RGBA/BGRA order as the format says).
     {
         static const std::vector<u64> dump_ps = [] {
             std::vector<u64> out;
@@ -1636,12 +1769,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                     image.info.pixel_format == vk::Format::eA2B10G10R10UnormPack32 ||
                                     image.info.pixel_format == vk::Format::eB10G11R11UfloatPack32 ||
                                     image.info.pixel_format == vk::Format::eR32Sfloat;
-            if (now >= at && written < max_files && four_bytes && image.GetImage()) {
+            const bool one_byte = image.info.pixel_format == vk::Format::eR8Unorm;
+            if (now >= at && written < max_files && (four_bytes || one_byte) && image.GetImage()) {
                 const u32 x = std::min(rect[0], image.info.size.width - 1);
                 const u32 y = std::min(rect[1], image.info.size.height - 1);
                 const u32 w = rect[2] ? std::min(rect[2], image.info.size.width - x) : image.info.size.width - x;
                 const u32 h = rect[3] ? std::min(rect[3], image.info.size.height - y) : image.info.size.height - y;
-                const u32 row = w * 4;
+                const u32 row = w * (one_byte ? 1 : 4);
                 const u64 size = u64(row) * h;
                 scheduler.EndRendering();
                 auto buffer = std::make_shared<VideoCore::Buffer>(device, VideoCore::MemoryType::HostCached, 0, size, "Draw dump");
@@ -1650,9 +1784,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 });
                 char path[512];
                 std::snprintf(path, sizeof(path), "%s/d%03d_ps%08x_%ux%u_%s.raw", dir.c_str(), written,
-                              u32(ps->pgm_hash), w, h, vk::to_string(image.info.pixel_format).c_str());
+                              u32(ps ? ps->pgm_hash : 0), w, h, vk::to_string(image.info.pixel_format).c_str());
                 std::fprintf(stderr, "[DUMPPS] %d t=%.1f ps %llx vs %llx rt %#llx %ux%u idx %u inst %u -> %s\n", written, now,
-                             (unsigned long long)ps->pgm_hash, (unsigned long long)vs_info.pgm_hash,
+                             (unsigned long long)(ps ? ps->pgm_hash : 0), (unsigned long long)vs_info.pgm_hash,
                              (unsigned long long)image.info.guest_address, image.info.size.width,
                              image.info.size.height, num_indices, num_instances, path);
                 scheduler.DeferPriorityOperation([buffer, size, file = std::string{path}] {
@@ -1966,7 +2100,68 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
+    static const bool bcseq = std::getenv("BB_BCSEQ") != nullptr;
+    const auto seq_line = [&](const char* how) {
+        if (bcseq && (u32(cs.pgm_hash) == 0x510f1e38u || u32(cs.pgm_hash) == 0xa7c5bd5fu ||
+                      u32(cs.pgm_hash) == 0x52abaae0u)) {
+            std::fprintf(stderr, "[SEQ] cs %08x %ux%ux%u %s\n", u32(cs.pgm_hash), cs_program.dim_x,
+                         cs_program.dim_y, cs_program.dim_z, how);
+        }
+    };
+    // fifa-hybrid: a small dispatch inside a render pass runs ahead of the submission
+    // (BB_HOIST_CS; TryHoistDispatch) or after the pass (BB_DEFER_CS; TryDeferDispatch)
+    // instead of splitting it.
+    if (TryHoistDispatch(pipeline, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                         cs.pgm_hash)) {
+        seq_line("hoisted");
+        if (FrameCapture::Active()) {
+            FrameCapture::Dispatch(cs.pgm_hash, cs_program.dim_x, cs_program.dim_y,
+                                   cs_program.dim_z);
+        }
+        DebugState.IncDispatch();
+        scheduler.KickRecording();
+        return;
+    }
+    if (TryDeferDispatch(pipeline, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                         cs.pgm_hash)) {
+        seq_line("deferred");
+        if (FrameCapture::Active()) {
+            FrameCapture::Dispatch(cs.pgm_hash, cs_program.dim_x, cs_program.dim_y,
+                                   cs_program.dim_z);
+        }
+        DebugState.IncDispatch();
+        ResetBindings();
+        scheduler.KickRecording();
+        return;
+    }
+
+    // 0.5.1-c: a full-screen copy dispatch (CopyDispatchDetectPass) draws as a fragment pass.
+    if (CopyDispatchPlan plan; PlanCopyDispatchPass(cs, cs_program.dim_x, cs_program.dim_y,
+                                                    cs_program.dim_z, plan)) {
+        scheduler.EndRendering();
+        if (auto* profiler = GpuProfiler::Get()) { // its own profile label
+            profiler->Mark(cs.pgm_hash ^ 0xC0B1ull, [&] {
+                return fmt::format("copy pass cs {:016x} ({}x{} groups)", cs.pgm_hash,
+                                   cs_program.dim_x, cs_program.dim_y);
+            });
+        }
+        if (FrameCapture::Active()) {
+            FrameCapture::Dispatch(cs.pgm_hash, cs_program.dim_x, cs_program.dim_y,
+                                   cs_program.dim_z);
+        }
+        seq_line("copy pass");
+        OrderAccesses();
+        runtime.GetBlitHelper().CopyDispatch(plan.width, plan.height, plan.dst, plan.src,
+                                             plan.sampler, plan.scale, plan.remap, plan.swizzle);
+        BbStats::copy_dispatch_passes.fetch_add(1, std::memory_order_relaxed);
+        DebugState.IncDispatch();
+        ResetBindings();
+        scheduler.KickRecording();
+        return;
+    }
+
     scheduler.EndRendering();
+    seq_line("dispatch");
     mark();
 
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
@@ -2208,6 +2403,18 @@ void Rasterizer::JoinBindHelper(void* context) {
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     pipeline_is_compute = pipeline->IsCompute();
+    // fifa-hybrid: what this command's descriptors reach must not be among the deferred
+    // dispatches' ranges (their results are not recorded yet): those run first (BB_DEFER_CS).
+    // A compute pipeline needs no check here: deferred, it is appended after the pending ones
+    // (their order holds); not deferred, DispatchRecord's EndRendering runs them first. Its
+    // uploads over their ranges are caught by the caches (SynchronizeMemory, RefreshImage).
+    if (!deferred_dispatches.empty() && !flushing_deferred && !pipeline_is_compute) {
+        deferred_conflict_site = "bind(draw)";
+        if (DeferredDispatchesConflict(pipeline)) {
+            BbStats::deferred_dispatch_conflicts.fetch_add(1, std::memory_order_relaxed);
+            FlushDeferredDispatches();
+        }
+    }
     g_probe_key = pipeline_is_compute
                       ? static_cast<const ComputePipeline*>(pipeline)->KeyValue() : 0;
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
@@ -2515,6 +2722,32 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             FrameCapture::Trace(fmt::format("V {:#x} {}", range.base_address, size));
         }
     }
+    if (g_drawlog) {
+        static const bool vdiff = std::getenv("BB_VDIFF") != nullptr;
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        for (u32 i = 0; i < guest_buffers.size(); ++i) {
+            const auto& vb = guest_buffers[i];
+            const u64 size = vb.GetSize();
+            if (vb.base_address == 0 || size == 0) {
+                continue;
+            }
+            const u32* dw = reinterpret_cast<const u32*>(vb.base_address);
+            std::string words;
+            for (u32 k = 0; k < std::min<u64>(size / 4, 16); ++k) {
+                words += fmt::format(" {:08x}", dw[k]);
+            }
+            std::fprintf(g_drawlog, "V %08x s%u %#llx size %llu stride %u nrec %u h %016llx cm %d gm %d:%s\n",
+                         vs ? u32(vs->pgm_hash) : 0u, i, (unsigned long long)vb.base_address,
+                         (unsigned long long)size, u32(vb.GetStride()), u32(vb.num_records),
+                         (unsigned long long)XXH3_64bits(dw, size),
+                         int(buffer_cache.IsRegionCpuModified(vb.base_address, size)),
+                         int(buffer_cache.IsRegionGpuModified(vb.base_address, size)), words.c_str());
+            if (vdiff && g_drawlog_streams.size() < 256) {
+                g_drawlog_streams.try_emplace({vb.base_address, size},
+                                              DrawlogStream{vs ? u32(vs->pgm_hash) : 0u, i, vb.base_address, size});
+            }
+        }
+    }
 
     // The streams, by attribute location (fetch shader order, like guest_buffers). A V# without
     // memory leaves its location empty: the draw helper binds its null stand-in there.
@@ -2631,8 +2864,11 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
 }
 
 void Rasterizer::ResetBindings() {
+    const u64 tick = scheduler.CurrentTick();
     for (auto& image_id : bound_images) {
-        texture_cache.GetImage(image_id).binding = {};
+        auto& image = texture_cache.GetImage(image_id);
+        image.binding = {};
+        image.last_bound_tick = tick; // an in-order command of this submission used it
     }
     for (const auto [buffer, offset, size, is_written, read_stage, encoders] : bound_buffers) {
         runtime.AccessBuffer(buffer, offset, size, is_written, encoders, read_stage);
@@ -2641,6 +2877,12 @@ void Rasterizer::ResetBindings() {
         runtime.AccessBuffer(buffer, offset, size, is_written, encoders, read_stage);
     }
     bound_images.clear();
+    bound_images_written.clear();
+    bound_images_prev_write.clear();
+    bound_image_ids.clear();
+    bound_image_views.clear();
+    bound_samplers.clear();
+    bound_images_simple = true;
     bound_buffers.clear();
     read_ranges.clear();
 }
@@ -2674,6 +2916,29 @@ void Rasterizer::OrderAccesses() {
         }
         if (conflict) {
             BbStats::deferred_copy_conflicts.fetch_add(1, std::memory_order_relaxed);
+            scheduler.EndRendering();
+            scheduler.ResumeRendering();
+        }
+    }
+    // fifa-hybrid: the same for the dispatches deferred to the pass end (BB_DEFER_CS): the
+    // ranges a draw reads by vertex or index fetch, and the attachments it writes.
+    if (scheduler.IsRendering() && !deferred_dispatches.empty() && !flushing_deferred) {
+        deferred_conflict_site = "order";
+        bool conflict = false;
+        for (const auto& b : bound_buffers) {
+            conflict = conflict || DeferredDispatchTouches(b.buffer->CpuAddr() + b.offset, b.size,
+                                                           b.is_written);
+        }
+        for (const auto& r : read_ranges) {
+            conflict = conflict || DeferredDispatchTouches(r.buffer->CpuAddr() + r.offset, r.size,
+                                                           false);
+        }
+        for (size_t i = 0; i < bound_images.size() && !conflict; ++i) {
+            const bool written = i < bound_images_written.size() && bound_images_written[i];
+            conflict = DeferredDispatchTouchesImage(texture_cache.GetImage(bound_images[i]), written);
+        }
+        if (conflict) {
+            BbStats::deferred_dispatch_conflicts.fetch_add(1, std::memory_order_relaxed);
             scheduler.EndRendering();
             scheduler.ResumeRendering();
         }
@@ -2841,6 +3106,22 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding, Shader::PushData& push_data) {
     const u64 alignment = device.GetLimits().storage_alignment;
+    if (g_drawlog) { // BB_DRAWLOG_TRIGGER: this stage's constant buffers
+        const char* kind = stage.sw_stage == Shader::SwStage::Compute ? "cs" : stage.sw_stage == Shader::SwStage::Fragment ? "ps" : "vs";
+        for (u32 b = 0; b < stage.buffers.size(); ++b) {
+            const auto sharp = stage.buffers[b].GetSharp(stage);
+            if (!sharp.base_address) continue;
+            const u32* dw = reinterpret_cast<const u32*>(sharp.base_address);
+            const u32 nd = u32(std::min<u64>(sharp.GetSize() / 4, 1024));
+            u64 h = 1469598103934665603ull;
+            for (u32 i = 0; i < nd; ++i) h = (h ^ dw[i]) * 1099511628211ull;
+            std::fprintf(g_drawlog, "B %s %08x b%u @%#llx size %llu h %016llx:", kind, u32(stage.pgm_hash), b,
+                         (unsigned long long)sharp.base_address, (unsigned long long)sharp.GetSize(),
+                         (unsigned long long)h);
+            for (u32 i = 0; i < std::min(nd, 160u); ++i) std::fprintf(g_drawlog, " %08x", dw[i]);
+            std::fputc('\n', g_drawlog);
+        }
+    }
     // fifa-hybrid diagnostics: BB_BUFWATCH=<hex address> names, once per stage, the buffers a
     // shader writes that cover the address (who produces the value the game polls there).
     if (const u64 watch = VideoCore::g_bb_bufwatch.load(std::memory_order_relaxed); watch != 0) {
@@ -3272,6 +3553,225 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                         image.info.size.height, int(image_desc.needs_native),
                         int(image_desc.is_written), num_bindings, int(mip_fallback_mode));
         };
+        // fifa-hybrid debug: BB_IMG_BINDS=1 logs every (shader, slot, image) binding with the view
+        // range; BB_DUMP_BIND=<hash8>:<slot>[,...] writes level 0 of every layer of the image bound
+        // there to <BB_DUMP_DIR>/bind_*.raw once BB_DUMP_BIND_TRIGGER (a file) exists.
+        const auto debug_bind = [&](VideoCore::ImageId id, const VideoCore::Image& image,
+                                    const auto& d) {
+            static const bool binds = std::getenv("BB_IMG_BINDS") != nullptr;
+            static const char* dump = std::getenv("BB_DUMP_BIND");
+            // BB_FLAG_PROBE=<hash8>:<slot>:<dword>[,...]: for binds of that shader's image slot, counts the
+            // combinations of (bound image, that dword of every constant buffer big enough to hold it).
+            static const auto flag_probes = [] {
+                std::vector<std::array<u32, 3>> v;
+                if (const char* e = std::getenv("BB_FLAG_PROBE")) {
+                    std::string spec{e};
+                    size_t pos = 0;
+                    while (pos < spec.size()) {
+                        std::array<u32, 3> f{};
+                        if (std::sscanf(spec.c_str() + pos, "%x:%u:%u", &f[0], &f[1], &f[2]) == 3) v.push_back(f);
+                        const size_t c = spec.find(',', pos);
+                        pos = c == std::string::npos ? spec.size() : c + 1;
+                    }
+                }
+                return v;
+            }();
+            if (g_drawlog) {
+                std::fprintf(g_drawlog, "I %08x img%u %#llx %ux%u %s mips %u layers %u flags %#x serial %llu uid %llu view %s L%u+%u\n",
+                             u32(stage.pgm_hash), image_index, (unsigned long long)image.info.guest_address,
+                             image.info.size.width, image.info.size.height,
+                             vk::to_string(image.info.pixel_format).c_str(), image.info.resources.levels,
+                             image.info.resources.layers, u32(image.flags), (unsigned long long)image.write_serial,
+                             (unsigned long long)image.image_uid, vk::to_string(d.view_info.format).c_str(),
+                             d.view_info.range.base.level, d.view_info.range.extent.levels);
+            }
+            for (const auto& fp : flag_probes) {
+                if (u32(stage.pgm_hash) != fp[0] || image_index != fp[1]) continue;
+                std::string key = fmt::format("{:08x} img{} {:#x} {}x{} {}", fp[0], fp[1], image.info.guest_address,
+                                              image.info.size.width, image.info.size.height,
+                                              vk::to_string(image.info.pixel_format));
+                bool flagged = false;
+                for (u32 b = 0; b < stage.buffers.size(); ++b) {
+                    const auto sharp = stage.buffers[b].GetSharp(stage);
+                    if (sharp.base_address && sharp.GetSize() >= (fp[2] + 1) * 4ull) {
+                        const u32* dw = reinterpret_cast<const u32*>(sharp.base_address);
+                        key += fmt::format(" b{}[{}]={:#x}", b, fp[2], dw[fp[2]]);
+                        if (dw[fp[2]] == 1) {
+                            flagged = true;
+                            key += fmt::format(" prev {:#x} {:#x}", dw[fp[2] - 2], dw[fp[2] - 1]);
+                        } else if (dw[fp[2]] == 0 && sharp.GetSize() == 320) {
+                            key += fmt::format(" id {:#x}", dw[fp[2] - 1]);
+                        }
+                    }
+                }
+                {
+                    const auto& r = liverpool->regs;
+                    key += fmt::format(" cb0 {:#x} {}x{}", u64(r.color_buffers[0].Address()),
+                                       r.color_buffers[0].Pitch(), r.color_buffers[0].Height());
+                }
+                static const auto t0 = std::chrono::steady_clock::now();
+                const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                // BB_FLAG_SNAP=<dir> (with BB_SNAPSHOT_TRIGGER): a snapshot when flagged draws reach a 1080p target,
+                // at most one every 12 s and 8 in all.
+                if (flagged && liverpool->regs.color_buffers[0].Height() >= 1080) {
+                    static const char* snap_dir = std::getenv("BB_FLAG_SNAP");
+                    static const char* trig = std::getenv("BB_SNAPSHOT_TRIGGER");
+                    static double last = -100.0;
+                    static u32 taken = 0;
+                    static u64 seen = 0;
+                    if (snap_dir && trig && ++seen > 200 && now_s - last > 9.0 && taken < 14) {
+                        last = now_s;
+                        if (FILE* f = std::fopen(trig, "w")) {
+                            std::fprintf(f, "%s/flagsnap_%u.png\n", snap_dir, taken);
+                            std::fclose(f);
+                        }
+                        std::fprintf(stderr, "[FLAGSNAP] %u at %.1f s: %s\n", taken, now_s, key.c_str());
+                        ++taken;
+                    }
+                }
+                static std::map<std::string, u64> counts;
+                const u64 c = ++counts[key];
+                if (c == 1 || c % 3000 == 0) {
+                    key += fmt::format(" t {:.1f}", now_s);
+                }
+                if (counts.size() < 1500 && (c == 1 || c % 3000 == 0)) {
+                    std::fprintf(stderr, "[FLAG] %s count %llu\n", key.c_str(), (unsigned long long)c);
+                }
+                // The first draws of each combination: every constant buffer in full (up to 160 dwords).
+                if (c == 1 || c == 500) {
+                    for (u32 b = 0; b < stage.buffers.size(); ++b) {
+                        const auto sharp = stage.buffers[b].GetSharp(stage);
+                        if (!sharp.base_address) continue;
+                        const u32 nd = u32(std::min<u64>(sharp.GetSize() / 4, 160));
+                        std::string line = fmt::format("[FLAGBUF] {:08x} c{} b{} @{:#x} size {}:", fp[0], c, b,
+                                                       u64(sharp.base_address), sharp.GetSize());
+                        for (u32 i = 0; i < nd; ++i) {
+                            line += fmt::format(" {:08x}", reinterpret_cast<const u32*>(sharp.base_address)[i]);
+                        }
+                        std::fprintf(stderr, "%s\n", line.c_str());
+                    }
+                }
+            }
+            // BB_MIPTRACE=1: one line per distinct way a small GPU-written image (or any image of a
+            // dispatch) is bound: view format, level range, swizzle, and the colour target of the draw.
+            if (static const bool mt = std::getenv("BB_MIPTRACE") != nullptr; mt &&
+                image.info.size.width <= 1024 &&
+                (stage.sw_stage == Shader::SwStage::Compute || image_desc.is_written ||
+                 True(image.flags & VideoCore::ImageFlagBits::GpuModified))) {
+                const bool cs = stage.sw_stage == Shader::SwStage::Compute;
+                const auto& cb = liverpool->regs.color_buffers[0];
+                const auto& m = d.view_info.mapping;
+                static std::set<std::array<u64, 8>> seen;
+                const std::array<u64, 8> key{stage.pgm_hash, image_index,
+                    u64(image.info.size.width) << 32 | u64(image.info.pixel_format),
+                    u64(d.view_info.format) << 32 | d.view_info.range.base.level,
+                    u64(m.r) << 24 | u64(m.g) << 16 | u64(m.b) << 8 | u64(m.a),
+                    cs ? 0 : u64(cb.info.raw & 0x1fff), cs ? 0 : u64(cb.Pitch()),
+                    u64(d.view_info.min_lod) << 16 | u64(image.info.resources.levels) << 8 |
+                        u64(image_desc.is_written)};
+                if (seen.size() < 1500 && seen.insert(key).second) {
+                    std::fprintf(stderr,
+                                 "[MIPT] %s %08x img%u %#llx %s %ux%u lv%u fl %#x w%d view %s L%u+%u minlod %u map %u%u%u%u | cb0 %#llx %ux%u fmt %u nt %u swap %u\n",
+                                 cs ? "cs" : "gfx", u32(stage.pgm_hash), image_index,
+                                 (unsigned long long)image.info.guest_address,
+                                 vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                                 image.info.size.height, image.info.resources.levels, u32(image.flags),
+                                 int(image_desc.is_written), vk::to_string(d.view_info.format).c_str(),
+                                 d.view_info.range.base.level, d.view_info.range.extent.levels,
+                                 d.view_info.min_lod, u32(m.r), u32(m.g), u32(m.b), u32(m.a),
+                                 cs ? 0ull : (unsigned long long)cb.Address(), cs ? 0u : cb.Pitch(),
+                                 cs ? 0u : cb.Height(), cs ? 0u : u32(cb.info.format),
+                                 cs ? 0u : u32(cb.info.number_type), cs ? 0u : u32(cb.info.comp_swap));
+                }
+            }
+            // BB_BCSEQ=1: every image binding of the face texture compute shaders, in order.
+            if (static const bool seq = std::getenv("BB_BCSEQ") != nullptr;
+                seq && stage.sw_stage == Shader::SwStage::Compute &&
+                (u32(stage.pgm_hash) == 0x510f1e38u || u32(stage.pgm_hash) == 0xa7c5bd5fu ||
+                 u32(stage.pgm_hash) == 0x52abaae0u)) {
+                std::fprintf(stderr,
+                             "[SEQ]  bind %08x img%u id %u %#llx %s %ux%u lv%u fl %#x w%d view %s L%u+%u shadow_of %d\n",
+                             u32(stage.pgm_hash), image_index, id.index,
+                             (unsigned long long)image.info.guest_address,
+                             vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                             image.info.size.height, image.info.resources.levels, u32(image.flags),
+                             int(image_desc.is_written), vk::to_string(d.view_info.format).c_str(),
+                             d.view_info.range.base.level, d.view_info.range.extent.levels,
+                             int(bool(image.shadow_of)));
+            }
+            if (!binds && !dump) return;
+            if (binds) {
+                static std::set<std::tuple<u64, u32, VAddr>> seen;
+                if (seen.size() < 4000 &&
+                    seen.emplace(stage.pgm_hash, image_index, image.info.guest_address).second) {
+                    std::fprintf(stderr,
+                                 "[BIND2] %s %08llx img%u addr %#llx %s %ux%u layers %u mips %u sharp_type %u "
+                                 "view type %u fmt %s base layer %u layers %u base level %u levels %u\n",
+                                 stage.sw_stage == Shader::SwStage::Compute ? "cs" : "gfx",
+                                 (unsigned long long)(stage.pgm_hash & 0xffffffffull), image_index,
+                                 (unsigned long long)image.info.guest_address,
+                                 vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                                 image.info.size.height, image.info.resources.layers,
+                                 image.info.resources.levels, u32(tsharp.GetType()),
+                                 u32(d.view_info.type), vk::to_string(d.view_info.format).c_str(),
+                                 d.view_info.range.base.layer, d.view_info.range.extent.layers,
+                                 d.view_info.range.base.level, d.view_info.range.extent.levels);
+                }
+            }
+            if (dump) {
+                static const std::set<std::pair<u32, u32>> want = [] {
+                    std::set<std::pair<u32, u32>> w;
+                    const char* e = std::getenv("BB_DUMP_BIND");
+                    while (e && *e) {
+                        char* end = nullptr;
+                        const u32 h = u32(std::strtoull(e, &end, 16));
+                        u32 slot = 0;
+                        if (end && *end == ':') slot = u32(std::strtoul(end + 1, &end, 10));
+                        w.emplace(h, slot);
+                        e = (end && *end == ',') ? end + 1 : nullptr;
+                    }
+                    return w;
+                }();
+                // BB_DUMP_ALL_TRIGGER=<file>: once the file exists, every GPU-written block image.
+                if (static const char* all = std::getenv("BB_DUMP_ALL_TRIGGER"); all) {
+                    static bool all_done = false;
+                    static u32 all_polls = 0;
+                    if (!all_done && (++all_polls % 64) == 0) {
+                        if (FILE* f = std::fopen(all, "rb")) {
+                            std::fclose(f);
+                            all_done = true;
+                            const char* env = std::getenv("BB_DUMP_DIR");
+                            texture_cache.DebugDumpGpuCompressed(env && env[0] ? env : "out/dump");
+                        }
+                    }
+                }
+                if (!want.contains({u32(stage.pgm_hash), image_index})) return;
+                static const char* trigger = std::getenv("BB_DUMP_BIND_TRIGGER");
+                static bool triggered = trigger == nullptr;
+                static u32 polls = 0;
+                if (!triggered && (++polls % 16) == 0) {
+                    if (FILE* f = std::fopen(trigger, "rb")) {
+                        std::fclose(f);
+                        triggered = true;
+                    }
+                }
+                static std::set<std::tuple<u32, u32, VAddr>> done;
+                static const size_t dump_max = [] {
+                    const char* e = std::getenv("BB_DUMP_BIND_MAX");
+                    return e ? size_t(std::strtoul(e, nullptr, 10)) : size_t(64);
+                }();
+                if (triggered && done.size() < dump_max &&
+                    done.emplace(u32(stage.pgm_hash), image_index, image.info.guest_address).second) {
+                    const char* env = std::getenv("BB_DUMP_DIR");
+                    const std::string path = fmt::format(
+                        "{}/bind_{:08x}_img{}_{:x}_{}x{}x{}_{}_f{:x}.raw", env && env[0] ? env : "out/dump",
+                        u32(stage.pgm_hash), image_index, image.info.guest_address, image.info.size.width,
+                        image.info.size.height, image.info.resources.layers,
+                        vk::to_string(image.info.pixel_format), u32(image.flags));
+                    texture_cache.DebugDumpImage(id, path.c_str());
+                }
+            }
+        };
         for (auto i = 0; i < num_bindings; i++) {
             // bbport: a plain binding (no mip override) of the same T# resolves to the same image
             // while no image was registered or unregistered.
@@ -3305,6 +3805,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     }
                 }
                 debug_native(*image);
+                debug_bind(image_id, *image, desc_entry.found_desc);
                 if (image->binding.is_bound) {
                     image->binding.force_general |= image_desc.is_written;
                 }
@@ -3358,6 +3859,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 }
             }
             debug_native(*image);
+            debug_bind(image_id, *image, desc);
             if (static const bool pl = std::getenv("BB_PROBE_LUM") != nullptr;
                 pl && image->info.pixel_format == vk::Format::eB10G11R11UfloatPack32 &&
                 image->info.resources.levels == 5 && image->info.size.width == 256) {
@@ -3415,6 +3917,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
+        if (num_bindings != 1) {
+            bound_images_simple = false; // 0.5.1-c
+        }
     }
 
     // fifa-hybrid: one-texel-per-block views of block-compressed images bind a shadow image.
@@ -3455,6 +3960,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(); // the null stand-in
+            bound_image_ids.push_back({}); // 0.5.1-c: PlanCopyDispatchPass
+            bound_image_views.push_back(nullptr);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -3471,10 +3978,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             }
 
             bound_images.emplace_back(image_id);
+            bound_images_written.push_back(is_storage ? 1 : 0);
+            bound_images_prev_write.push_back(texture_cache.GetImage(image_id).last_write_tick);
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
+            bound_image_ids.push_back(image_id); // 0.5.1-c: PlanCopyDispatchPass
+            bound_image_views.push_back(image_view.Texture());
             const auto binding = image.binding;
             if (!is_storage || ([] { static const bool v = std::getenv("BB_DUMP_ADDRS") != nullptr; return v; }())) {
                 texture_cache.DebugDumpTexture(image_id);
@@ -3598,6 +4109,19 @@ void Rasterizer::ForceAnisotropy(AmdGpu::Sampler& sharp, bool is_depth) const {
          sharp.xy_min_filter != AmdGpu::Filter::AnisoLinear)) {
         return;
     }
+    // A sampler with a positive LOD bias is a deliberately blurred lookup. FIFA 16's pitch shader
+    // (ps ed446cb3) reads its line texture through one (+2 mips) as a conservative "is a line
+    // near this pixel" mask that guards its 3x3 supersampling of the line. Anisotropic filtering
+    // takes the mip from the minor axis, so at the pitch's grazing angle the mask no longer
+    // reached the pixels beside the line across the screen and those skipped the supersampling:
+    // a stair-stepped far edge on every pitch line (2026-11-10). BB_ANISO_BIASED=1 restores it.
+    static const bool keep_biased = [] {
+        const char* env = std::getenv("BB_ANISO_BIASED");
+        return !(env && std::atoi(env) != 0);
+    }();
+    if (keep_biased && sharp.LodBias() > 0.0f) {
+        return;
+    }
     const auto ratio = forced >= 16 ? AmdGpu::AnisoRatio::Sixteen
         : forced >= 8 ? AmdGpu::AnisoRatio::Eight
         : forced >= 4 ? AmdGpu::AnisoRatio::Four : AmdGpu::AnisoRatio::Two;
@@ -3617,9 +4141,18 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
+        if (FrameCapture::Tracing()) {
+            // bbport(fifa): the game's own sampler state, before the forced anisotropy.
+            FrameCapture::Trace(fmt::format(
+                "M {} {:08x} min {} mag {} mip {} aniso {} lod {:.2f}..{:.2f} bias {:.2f}",
+                u32(stage.sw_stage), stage.pgm_hash, u32(ssharp.xy_min_filter.Value()),
+                u32(ssharp.xy_mag_filter.Value()), u32(ssharp.mip_filter.Value()),
+                ssharp.MaxAniso(), ssharp.MinLod(), ssharp.MaxLod(), ssharp.LodBias()));
+        }
         ForceAnisotropy(ssharp, sampler.is_depth);
         void* const handle = texture_cache.GetSampler(
             ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
+        bound_samplers.push_back(handle); // 0.5.1-c
         BoundAt(binding.unified++) = {.sampler = handle};
     }
 }
@@ -3724,6 +4257,8 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         const auto& entry = set.entries[i];
         if (!entry.id) {
             image_infos.emplace_back(); // the null stand-in
+            bound_image_ids.push_back({}); // 0.5.1-c
+            bound_image_views.push_back(nullptr);
             continue;
         }
         texture_cache.MarkFound(entry.id);
@@ -3733,6 +4268,10 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         }
         image.binding.is_bound = 1u;
         bound_images.emplace_back(entry.id);
+        bound_images_written.push_back(0);
+        bound_images_prev_write.push_back(image.last_write_tick);
+        bound_image_ids.push_back(entry.id); // 0.5.1-c
+        bound_image_views.push_back(entry.texture);
         image.usage.texture = 1u;
         if (entry.proxy) {
             scene_targets->PrepareSample(image, entry.range.base.level);
@@ -3893,6 +4432,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         if (image->binding.needs_rebind) {
             last_targets[cb].generation = ~0ULL; // FindImage may rewrite the description
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            bound_images_written.push_back(1);
+            bound_images_prev_write.push_back(0);
             image = &texture_cache.GetImage(image_id);
         }
         texture_cache.UpdateImage(image_id);
@@ -4142,6 +4683,45 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.texture = target.texture;
         }
         image.usage.depth_target = true;
+        // fifa-hybrid diagnostics (BB_DB_WATCH=<width>): draws into depth targets of that width, 40 in a row
+        // out of every 1500, with the state that decides what lands in the map.
+        if (static const u32 dbw = [] { const char* e = std::getenv("BB_DB_WATCH"); return e ? u32(std::atoi(e)) : 0u; }();
+            dbw == 1 && image.info.size.width != 1920) {
+            // BB_DB_WATCH=1: every depth target that is not 1080p, one line per distinct kind of draw with counts.
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            const std::string key = fmt::format(
+                "db {:#x} {}x{} vs {:08x} ps {:08x} ncol {} cb0 {:#x} clear {} val {} dtest {} dwrite {} dfunc {}",
+                image.info.guest_address, image.info.size.width, image.info.size.height, vs ? u32(vs->pgm_hash) : 0u,
+                ps ? u32(ps->pgm_hash) : 0u, state.num_colors,
+                state.num_colors ? u64(regs.color_buffers[0].Address()) : 0ull, int(is_depth_clear), regs.depth_clear,
+                int(regs.depth_control.depth_enable), int(regs.depth_control.depth_write_enable),
+                int(regs.depth_control.depth_func));
+            static std::map<std::string, u64> counts;
+            const u64 c = ++counts[key];
+            if (counts.size() < 600 && (c == 1 || c % 2000 == 0)) {
+                std::fprintf(stderr, "[DBW1] %s count %llu\n", key.c_str(), (unsigned long long)c);
+            }
+        } else if (dbw > 1 && image.info.size.width == dbw) {
+            static u32 n = 0;
+            if (n++ % 1500 < 40) {
+                const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+                std::fprintf(stderr, "[DBW] #%u db %#llx w %#llx %ux%u vs %08x ps %08x idx %u ncol %u cmode %d clear %d (en %d meta %d val %g) dtest %d dwrite %d dfunc %d clip %d vpz %g/%g vp %gx%g fzd %d fzv %d\n",
+                             n, (unsigned long long)regs.depth_buffer.DepthAddress(),
+                             (unsigned long long)regs.depth_buffer.DepthWriteAddress(), image.info.size.width,
+                             image.info.size.height, vs ? u32(vs->pgm_hash) : 0u, ps ? u32(ps->pgm_hash) : 0u,
+                             u32(regs.num_indices), state.num_colors, int(regs.color_control.mode), int(is_depth_clear),
+                             int(regs.depth_render_control.depth_clear_enable),
+                             int(texture_cache.IsMetaCleared(htile_address, slice)), regs.depth_clear,
+                             int(regs.depth_control.depth_enable), int(regs.depth_control.depth_write_enable),
+                             int(regs.depth_control.depth_func), int(regs.clipper_control.clip_space),
+                             regs.viewport_control.zoffset_enable ? regs.viewports[0].zoffset : 0.f,
+                             regs.viewport_control.zscale_enable ? regs.viewports[0].zscale : 1.f,
+                             regs.viewports[0].xscale * 2.f, regs.viewports[0].yscale * 2.f,
+                             int(regs.depth_render_override.force_z_dirty), int(regs.depth_render_override.force_z_valid));
+            }
+        }
         if (upscaler->Enabled()) {
             TemporalUpscaler::Target depth_redirect;
             depth_redirected = upscaler->RedirectDepth(image_id, depth_redirect);
@@ -4292,6 +4872,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     DrainDrawPipe();
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    if (!is_gds && !deferred_dispatches.empty() &&
+        (deferred_conflict_site = "fill", DeferredDispatchTouches(address, num_bytes, true))) {
+        FlushDeferredDispatches(); // fifa-hybrid
+    }
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (num_bytes == 0) {
@@ -4299,6 +4883,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             texture_cache.DropOndemandCovered(address, num_bytes);
+            NoteHostWrite(address, num_bytes, "fill");
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -4334,11 +4919,28 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (num_bytes == 0) {
         return; // bbport: nothing to copy; no empty blit
     }
+    if (!deferred_dispatches.empty() &&
+        (deferred_conflict_site = "dma",
+         (!src_gds && DeferredDispatchTouches(src, num_bytes, false)) ||
+             (!dst_gds && DeferredDispatchTouches(dst, num_bytes, true)))) {
+        FlushDeferredDispatches(); // fifa-hybrid: a pending dispatch reaches the copy's ranges
+    }
+    if (static const bool dlog = std::getenv("BB_HOSTW_LOG") != nullptr; dlog && num_bytes >= 65536) {
+        static std::set<std::pair<VAddr, u32>> seen;
+        if (seen.size() < 400 && seen.emplace(dst, num_bytes).second) {
+            std::fprintf(stderr, "[DMA] copy %#llx <- %#llx %u bytes gds %d/%d dst gpu %d src gpu %d src image %d\n",
+                         (unsigned long long)dst, (unsigned long long)src, num_bytes, int(dst_gds), int(src_gds),
+                         int(!dst_gds && buffer_cache.IsRegionGpuModified(dst, num_bytes)),
+                         int(!src_gds && buffer_cache.IsRegionGpuModified(src, num_bytes)),
+                         int(!src_gds && bool(texture_cache.FindImageFromRange(src, num_bytes))));
+        }
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             texture_cache.DropOndemandCovered(dst, num_bytes);
+            NoteHostWrite(dst, num_bytes, "copy");
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
@@ -4367,6 +4969,62 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     runtime.CopyBuffer(*src_buffer, *dst_buffer, std::span{&copy, 1});
 }
 
+void Rasterizer::NoteHostWrite(VAddr addr, u64 size, const char* what) {
+    // BB_HOST_WRITE_NOTIFY=0: the behaviour before 0.5.1-g (the caches are not told).
+    static const bool notify = [] {
+        const char* e = std::getenv("BB_HOST_WRITE_NOTIFY");
+        return !e || e[0] != '0';
+    }();
+    // The buffer cache is told only on request (BB_HOST_WRITE_NOTIFY_BUF=1): it re-uploads the pages
+    // every frame and the game's own writes to them then fault every frame.
+    static const bool notify_buf = [] {
+        const char* e = std::getenv("BB_HOST_WRITE_NOTIFY_BUF");
+        return e && e[0] == '1';
+    }();
+    static const bool log = std::getenv("BB_HOSTW_LOG") != nullptr;
+    if (size == 0) {
+        return;
+    }
+    u32 clean_pages = 0;
+    std::string first;
+    if (log) {
+        const VAddr end = addr + size;
+        u32 looked = 0;
+        for (VAddr page = addr & ~0xfffull; page < end && looked < 8192; page += 0x1000, ++looked) {
+            if (!buffer_cache.IsRegionCpuModified(page, 0x1000) &&
+                !buffer_cache.IsRegionGpuModified(page, 0x1000)) {
+                ++clean_pages;
+            }
+        }
+    }
+    const u32 images = texture_cache.NoteHostWrite(addr, size, notify, log ? &first : nullptr);
+    if (notify && notify_buf) {
+        buffer_cache.NoteHostWrite(addr, size);
+    }
+    if (log) {
+        static u64 calls = 0, bytes = 0, hit_calls = 0, hit_images = 0, hit_pages = 0;
+        static u32 lines = 0;
+        ++calls;
+        bytes += size;
+        if (images || clean_pages) {
+            ++hit_calls;
+            hit_images += images;
+            hit_pages += clean_pages;
+            if (lines < 400 || images) {
+                ++lines;
+                std::fprintf(stderr, "[HOSTW] %s %#llx+%llu: %u clean buffer pages, %u clean images%s%s notify=%d\n",
+                             what, (unsigned long long)addr, (unsigned long long)size, clean_pages, images,
+                             first.empty() ? "" : " first ", first.c_str(), int(notify));
+            }
+        }
+        if ((calls & (calls - 1)) == 0 || (calls % 5000) == 0) {
+            std::fprintf(stderr, "[HOSTW] totals: %llu writes, %.1f MB, %llu touched clean data (%llu images, %llu buffer pages)\n",
+                         (unsigned long long)calls, bytes / 1e6, (unsigned long long)hit_calls,
+                         (unsigned long long)hit_images, (unsigned long long)hit_pages);
+        }
+    }
+}
+
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     DrainDrawPipe();
     auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -4378,6 +5036,8 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 // fifa-hybrid diagnostics (BB_FAULT_STATS): the on-demand resolve of write faults, split into the
 // drop path (droppable image forgotten, no GPU round trip) and the download path.
 static std::atomic<u64> g_odw_drop_n{0}, g_odw_drop_us{0}, g_odw_dl_n{0}, g_odw_dl_us{0};
+static std::atomic<u64> g_odw_tail_n{0}, g_odw_tail_us{0}; // 0.5.1-e: tail releases
+static std::atomic<u64> g_odw_none_n{0}; // write faults on a watched page with nothing pending
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     DrainDrawPipe();
@@ -4456,14 +5116,16 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
         const u64 cnt = n.exchange(0);
         std::printf("[WFAULT] n=%llu unmapped=%llu drain=%.1fms ondemand=%.1fms buffer=%.1fms "
                     "(flushes %llu) texture=%.1fms extend=%.1fms | odw drop %llu (%.1fms) "
-                    "download %llu (%.1fms)\n",
+                    "download %llu (%.1fms) tail %llu (%.1fms) unresolved %llu\n",
                     (unsigned long long)cnt, (unsigned long long)unmapped.exchange(0),
                     t_drain.exchange(0) / 1e3, t_ondemand.exchange(0) / 1e3,
                     t_buffer.exchange(0) / 1e3,
                     (unsigned long long)buffer_cache.write_flushes.exchange(0),
                     t_texture.exchange(0) / 1e3, t_extend.exchange(0) / 1e3,
                     (unsigned long long)g_odw_drop_n.exchange(0), g_odw_drop_us.exchange(0) / 1e3,
-                    (unsigned long long)g_odw_dl_n.exchange(0), g_odw_dl_us.exchange(0) / 1e3);
+                    (unsigned long long)g_odw_dl_n.exchange(0), g_odw_dl_us.exchange(0) / 1e3,
+                    (unsigned long long)g_odw_tail_n.exchange(0), g_odw_tail_us.exchange(0) / 1e3,
+                    (unsigned long long)g_odw_none_n.exchange(0));
         texture_cache.PrintOndemandWriteCounts();
         std::fflush(stdout);
     }
@@ -4471,6 +5133,12 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+    if (g_bb_diag_window.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[RFD] read %#llx+%llu locks=%d gpumod=%d ondemand=%d\n",
+                     (unsigned long long)addr, (unsigned long long)size, int(assume_locks),
+                     int(buffer_cache.IsRegionGpuModified(addr, size)),
+                     int(texture_cache.HasOndemandIn(addr, size)));
+    }
     static const bool log_reads = std::getenv("BB_LOG_READFAULTS") != nullptr;
     if (log_reads) {
         static std::atomic<u64> count{0};
@@ -4497,7 +5165,10 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 void Rasterizer::ResolveOndemandImages(VAddr addr, u64 size, bool for_write, bool assume_locks) {
     // Most faults touch no pending image; the round trip to the GPU thread below waited for its
     // whole command list (several ms per write fault in matches).
-    if (!texture_cache.HasOndemandIn(addr, size)) {
+    // 0.5.1-e: a write into the image bytes of a released tail page (no read watcher there any
+    // more) still downloads the image first.
+    const bool tail_hit = for_write && texture_cache.OndemandTailHit(addr, size);
+    if (!tail_hit && !texture_cache.HasOndemandIn(addr, size)) {
         return;
     }
     static const bool stats = std::getenv("BB_FAULT_STATS") != nullptr;
@@ -4518,7 +5189,14 @@ void Rasterizer::ResolveOndemandImages(VAddr addr, u64 size, bool for_write, boo
                          std::memory_order_relaxed);
         }
     };
-    if (for_write && drop_on_write) {
+    // 0.5.1-e: a write past the end of a pending image on its last page releases that page
+    // instead of waiting for the GPU (TextureCache::ReleaseOndemandTails).
+    if (for_write && !tail_hit && texture_cache.ReleaseOndemandTails(addr, size) &&
+        !texture_cache.HasOndemandIn(addr, size)) {
+        note(g_odw_tail_n, g_odw_tail_us);
+        return;
+    }
+    if (for_write && drop_on_write && !tail_hit) {
         texture_cache.ForgetOndemandImagesIn(addr, size, true);
         if (!texture_cache.HasOndemandIn(addr, size)) {
             note(g_odw_drop_n, g_odw_drop_us);
@@ -4564,6 +5242,9 @@ void Rasterizer::ResolveOndemandImages(VAddr addr, u64 size, bool for_write, boo
         DrainDrawPipe();
         texture_cache.DownloadImagesForCpuRead(addr, size, for_write, false, &work);
     });
+    if (stats && for_write && work.copies.empty() && work.unprotect.empty()) {
+        g_odw_none_n.fetch_add(1, std::memory_order_relaxed);
+    }
     texture_cache.FinishCpuReadWork(work);
 }
 
@@ -5124,6 +5805,504 @@ void Rasterizer::NoteFrameStart() {
         std::printf("\n");
         lag_histogram = {};
     }
+}
+
+
+// 0.5.1-c: the copy dispatch as a fragment pass (info.h InfoPersistent::CopyDispatch,
+// copy_dispatch_detect_pass.cpp). BB_COPY_CS_PASS=0 keeps the dispatch, BB_COPY_CS_LOG=1 logs
+// why one stays a dispatch.
+bool Rasterizer::PlanCopyDispatchPass(const Shader::Info& cs, u32 dim_x, u32 dim_y, u32 dim_z,
+                                      CopyDispatchPlan& plan) {
+    static const bool off = [] {
+        const char* e = std::getenv("BB_COPY_CS_PASS");
+        return e && e[0] == '0';
+    }();
+    const auto& cd = cs.copy_dispatch;
+    static const bool log = std::getenv("BB_COPY_CS_LOG") != nullptr;
+    static std::atomic<u32> logged{0};
+    // valid 1 is a stored 0.5.1-c..f record whose swizzle belongs to another permutation.
+    if (off || cd.valid != 2) {
+        if (log && !off && u64(dim_x) * dim_y >= 4096 && logged.fetch_add(1) < 400) {
+            std::fprintf(stderr, "[COPYCS] cs %016llx %ux%ux%u: no copy_dispatch in this info (%p, images %zu)\n",
+                         (unsigned long long)cs.pgm_hash, dim_x, dim_y, dim_z, (const void*)&cs, cs.images.size());
+        }
+        return false;
+    }
+    const auto decline = [&](const char* why) {
+        const auto dst_id = cd.dst_image < bound_image_ids.size() ? bound_image_ids[cd.dst_image] : VideoCore::ImageId{};
+        const auto src_id = cd.src_image < bound_image_ids.size() ? bound_image_ids[cd.src_image] : VideoCore::ImageId{};
+        // Small grids (mip chains) are not logged.
+        if (log && u64(dim_x) * dim_y >= 4096 && logged.fetch_add(1) < 400) {
+            const auto* dst = dst_id ? &texture_cache.GetImage(dst_id) : nullptr;
+            void* const dv = cd.dst_image < bound_image_views.size() ? bound_image_views[cd.dst_image] : nullptr;
+            void* const sv = cd.src_image < bound_image_views.size() ? bound_image_views[cd.src_image] : nullptr;
+            std::fprintf(stderr,
+                         "[COPYCS] cs %016llx %ux%ux%u stays a dispatch: %s (images %u/%u bound %zu, dst image %ux%u type "
+                         "%u L%u M%u fmt %s; dst view %ux%u 2d=%d, src view %ux%u 2d=%d, same view %d)\n",
+                         (unsigned long long)cs.pgm_hash, dim_x, dim_y, dim_z, why, dst_id.index, src_id.index,
+                         bound_image_ids.size(), dst ? dst->info.size.width : 0, dst ? dst->info.size.height : 0,
+                         dst ? u32(dst->info.type) : 0, dst ? dst->info.resources.layers : 0,
+                         dst ? dst->info.resources.levels : 0,
+                         dst ? vk::to_string(dst->info.pixel_format).c_str() : "-",
+                         dv ? Metal::TextureWidth(dv) : 0, dv ? Metal::TextureHeight(dv) : 0, dv ? int(Metal::TextureIs2D(dv)) : -1,
+                         sv ? Metal::TextureWidth(sv) : 0, sv ? Metal::TextureHeight(sv) : 0, sv ? int(Metal::TextureIs2D(sv)) : -1,
+                         int(dv == sv));
+        }
+        return false;
+    };
+    if (dim_z != 1 || dim_x == 0 || dim_y == 0 || !bound_images_simple) {
+        return decline("grid or image bindings");
+    }
+    if (UseDrawPipe() || FrameCapture::Active() || upscaler->RasterScaling()) {
+        return decline("draw pipe, capture or upscaler scene");
+    }
+    if (cd.dst_image >= bound_image_ids.size() || cd.src_image >= bound_image_ids.size() ||
+        cd.dst_image >= cs.images.size() || cd.src_image >= cs.images.size() ||
+        cd.src_sampler >= cs.samplers.size() ||
+        cd.src_sampler >= bound_samplers.size() || cd.scale_buffer >= cs.buffers.size() ||
+        bound_image_views.size() != bound_image_ids.size()) {
+        return decline("binding counts");
+    }
+    const auto dst_id = bound_image_ids[cd.dst_image], src_id = bound_image_ids[cd.src_image];
+    void* const dst_view = bound_image_views[cd.dst_image];
+    void* const src_view = bound_image_views[cd.src_image];
+    void* const sampler = bound_samplers[cd.src_sampler];
+    // One image for both is fine when the views differ (another level or layer; the compute
+    // shader read and wrote those same views); the same view would be a copy onto itself.
+    if (!dst_id || !src_id || !dst_view || !src_view || !sampler || dst_view == src_view) {
+        return decline("null binding or same view");
+    }
+    const auto& dst = texture_cache.GetImage(dst_id);
+    if (dst.info.props.is_depth || dst.info.props.is_block || dst.info.num_samples > 1 ||
+        !Metal::TextureIs2D(dst_view) || !Metal::TextureIs2D(src_view)) {
+        return decline("destination or source kind");
+    }
+    // The view's own size (a level or layer view of a larger image is smaller than level 0).
+    const u32 dst_width = Metal::TextureWidth(dst_view), dst_height = Metal::TextureHeight(dst_view);
+    if (u64(dim_x) * cd.wg_x != dst_width || u64(dim_y) * cd.wg_y != dst_height) {
+        return decline("grid does not cover the destination");
+    }
+    const char* numeric = vk::componentNumericFormat(dst.info.pixel_format, 0);
+    if (std::strcmp(numeric, "UINT") == 0 || std::strcmp(numeric, "SINT") == 0) {
+        return decline("integer destination");
+    }
+    // The record was detected on one permutation of the program. What depends on the bound
+    // resources is taken from them here: the destination's channel select (the dispatch stores
+    // the shader's value through its inverse) and the conversions the recompiler would add,
+    // which the pass does not do.
+    const auto dst_sharp = cs.images[cd.dst_image].GetSharp(cs);
+    const auto src_sharp = cs.images[cd.src_image].GetSharp(cs);
+    if (dst_sharp.GetNumberConversion() != AmdGpu::NumberConversion::None ||
+        src_sharp.GetNumberConversion() != AmdGpu::NumberConversion::None) {
+        return decline("number conversion");
+    }
+    if (cs.samplers[cd.src_sampler].GetSharp(cs).force_degamma &&
+        src_sharp.GetNumberFmt() != AmdGpu::NumberFormat::Srgb) {
+        return decline("forced degamma");
+    }
+    u8 stored[4];
+    if (!cd.Compose(dst_sharp.DstSelect(), stored)) {
+        return decline("channel select");
+    }
+    const auto sharp = cs.buffers[cd.scale_buffer].GetSharp(cs);
+    const VAddr base = sharp.base_address;
+    if (base < 0x400000 ||
+        sharp.GetSize() < (u64(std::max(cd.scale_dword_x, cd.scale_dword_y)) + 1) * 4) {
+        return decline("scale buffer");
+    }
+    float sx = 0.0f, sy = 0.0f;
+    std::memcpy(&sx, reinterpret_cast<const void*>(base + u64(cd.scale_dword_x) * 4), sizeof sx);
+    std::memcpy(&sy, reinterpret_cast<const void*>(base + u64(cd.scale_dword_y) * 4), sizeof sy);
+    if (!(sx > 0.0f) || !(sy > 0.0f) || !std::isfinite(sx) || !std::isfinite(sy)) {
+        return decline("scale values");
+    }
+    plan = {
+        .dst = dst_view,
+        .src = src_view,
+        .sampler = sampler,
+        .width = dst_width,
+        .height = dst_height,
+        .scale = {sx, sy},
+        .remap = cd.src_image < 32 && ((push_data.depth_remap >> cd.src_image) & 1u) != 0,
+        .swizzle = u32(stored[0]) | (u32(stored[1]) << 4) | (u32(stored[2]) << 8) |
+                   (u32(stored[3]) << 12),
+    };
+    return true;
+}
+
+// fifa-hybrid: a guest dispatch recorded ahead of its submission (BB_HOIST_CS).
+namespace {
+u32 HoistCsMaxGroups() {
+    static const u32 v = [] {
+        const char* e = std::getenv("BB_HOIST_CS");
+        return e ? u32(std::strtoul(e, nullptr, 10)) : 64u;
+    }();
+    return v;
+}
+} // namespace
+
+bool Rasterizer::TryHoistDispatch(const ComputePipeline* pipeline, u32 dim_x, u32 dim_y,
+                                  u32 dim_z, u64 cs_hash) {
+    const u32 max_groups = HoistCsMaxGroups();
+    if (max_groups == 0) {
+        return false;
+    }
+    static const bool log_declines = std::getenv("BB_DEFER_CS_LOG") != nullptr;
+    static std::atomic<u32> logged{0};
+    const auto decline = [&](const char* why) {
+        // 0.5.1-d: grids over the cap are not logged (they filled the 400 lines at boot).
+        if (log_declines && u64(dim_x) * dim_y * dim_z <= max_groups && logged.fetch_add(1) < 400) {
+            std::fprintf(stderr, "[HOIST] cs %016llx %ux%ux%u not hoisted: %s\n",
+                         (unsigned long long)cs_hash, dim_x, dim_y, dim_z, why);
+        }
+        return false;
+    };
+    if (!runtime.Ordering()) {
+        return decline("no arena ordering");
+    }
+    if (!scheduler.IsRendering()) {
+        return decline("no open pass"); // in place costs nothing
+    }
+    if (UseDrawPipe() || FrameCapture::Active() || upscaler->RasterScaling()) {
+        return decline("draw pipe, capture or upscaler scene");
+    }
+    if (u64(dim_x) * dim_y * dim_z > max_groups || dim_x == 0 || dim_y == 0 || dim_z == 0) {
+        return decline("size");
+    }
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (cs.uses_dma) {
+        return decline("dma");
+    }
+    // Images: Metal orders the ahead command buffer against the in-order one itself (tracked
+    // textures), so only this submission's own commands matter: nothing in it may have bound
+    // the image (last_bound_tick), written it (last_write_tick before our own access: uploads,
+    // copies, targets), and it may not be an attachment of the open pass or a block-shadow pair
+    // (their copies are in order). Depth and multisampled images stay in place.
+    {
+        const u64 tick = scheduler.CurrentTick();
+        for (size_t i = 0; i < bound_images.size(); ++i) {
+            const auto id = bound_images[i];
+            const auto& image = texture_cache.GetImage(id);
+            if (id == db_desc.first) {
+                return decline("depth attachment");
+            }
+            for (const auto& [cb_id, cb_desc] : cb_descs) {
+                if (cb_id == id) {
+                    return decline("colour attachment");
+                }
+            }
+            if (image.shadow_of || image.block_shadow || image.info.props.is_depth ||
+                image.info.num_samples > 1) {
+                return decline("image kind");
+            }
+            if (image.last_bound_tick >= tick) {
+                return decline("image used this submission");
+            }
+            const u64 prev_write = i < bound_images_prev_write.size() ? bound_images_prev_write[i] : tick;
+            if (prev_write >= tick) {
+                return decline("image written this submission");
+            }
+            const auto& base = image;
+            if (DeferredDispatchTouches(base.info.guest_address, base.info.guest_size,
+                                        i < bound_images_written.size() && bound_images_written[i])) {
+                return decline("deferred dispatch ranges");
+            }
+        }
+    }
+    for (const auto& desc : cs.buffers) {
+        if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
+            return decline("gds");
+        }
+    }
+    // Its ranges against the dispatches deferred to the pass end (they would run after it).
+    for (const auto& b : bound_buffers) {
+        if (DeferredDispatchTouches(b.buffer->CpuAddr() + b.offset, b.size, b.is_written)) {
+            return decline("deferred dispatch ranges");
+        }
+    }
+    for (const auto& b : bound_buffers) {
+        if (!runtime.AheadSafe(b.buffer, b.offset, b.size, b.is_written)) {
+            return decline(b.is_written ? "output in use" : "input in use");
+        }
+    }
+    for (const auto& r : read_ranges) {
+        if (!runtime.AheadSafe(r.buffer, r.offset, r.size, false)) {
+            return decline("read range in use");
+        }
+    }
+    if (!pipeline->IsReady()) {
+        return decline("pipeline compiling"); // the recording thread waits for it, this thread not
+    }
+    const Metal::Draw::ComputeView view = ComputeView(*pipeline);
+    if (!view.state || !view.shader) {
+        return decline("no pipeline");
+    }
+    if (!ahead_nulls) {
+        ahead_nulls.emplace(device);
+    }
+    const Metal::Size3 groups{dim_x, dim_y, dim_z};
+    const Metal::Draw::Nulls nulls = ahead_nulls->Get();
+    // Recorded by the recording thread (this thread is the command processor; in cutscenes
+    // it is the limit) into the ahead encoder, under its lock. Uploads hoisted meanwhile may
+    // land before it in that stream, so its ranges are noted as used by this submission: a
+    // later upload over them is not hoisted (HoistCopy's unused() check) and runs in order.
+    scheduler.Record([this, view, groups, nulls, bound_copy = bound, push_copy = push_data](
+                         Metal::Encoder&) {
+        const std::span<const Metal::Draw::Bound> bound_span{bound_copy};
+        const std::span<const u8> push{reinterpret_cast<const u8*>(&push_copy), sizeof(push_copy)};
+        scheduler.RecordAhead([&](Metal::Encoder& e) {
+            e.SetComputePipeline(view.state, view.buffers);
+            Metal::Draw::BindStage(e, Metal::Stage::Compute, *view.shader, bound_span, push, nulls);
+            e.Dispatch(groups, view.threads_per_group);
+        });
+    });
+    // Its accesses: by the ahead stream (later commands of this submission that touch them
+    // wait for the uploads' fence; HoistCopy marks the same way).
+    runtime.BeginAheadCommand();
+    for (const auto& b : bound_buffers) {
+        runtime.NoteSubmissionUse(b.buffer, b.offset, b.size);
+        runtime.MarkAccess(b.buffer, b.offset, b.size, b.is_written, Metal::EncoderAhead);
+    }
+    for (const auto& r : read_ranges) {
+        runtime.NoteSubmissionUse(r.buffer, r.offset, r.size);
+        runtime.MarkAccess(r.buffer, r.offset, r.size, false, Metal::EncoderAhead);
+    }
+    for (const auto id : bound_images) {
+        texture_cache.GetImage(id).binding = {}; // not last_bound_tick: it ran ahead
+    }
+    bound_images.clear();
+    bound_buffers.clear();
+    read_ranges.clear();
+    bound_images_written.clear();
+    bound_images_prev_write.clear();
+    bound_image_ids.clear();
+    bound_image_views.clear();
+    bound_samplers.clear();
+    bound_images_simple = true;
+    BbStats::hoisted_dispatches.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// fifa-hybrid: dispatches deferred to the end of their render pass (BB_DEFER_CS).
+namespace {
+u32 DeferCsMaxGroups() {
+    static const u32 v = [] {
+        const char* e = std::getenv("BB_DEFER_CS");
+        return e ? u32(std::strtoul(e, nullptr, 10)) : 64u;
+    }();
+    return v;
+}
+bool RangesMeet(VAddr a, u64 a_size, VAddr b_begin, VAddr b_end) {
+    return a < b_end && b_begin < a + a_size;
+}
+/// BB_DEFER_CS_LOG=1: the first conflicts that flush deferred dispatches, with what met what.
+void LogDeferConflict(const char* where, VAddr address, u64 size, bool write, VAddr r_begin,
+                      VAddr r_end, bool r_write) {
+    static const bool on = std::getenv("BB_DEFER_CS_LOG") != nullptr;
+    static std::atomic<u32> logged{0};
+    if (on && logged.fetch_add(1) < 300) {
+        std::fprintf(stderr, "[DEFER] conflict %s: %s %#llx+%#llx meets deferred %s %#llx..%#llx\n",
+                     where, write ? "write" : "read", (unsigned long long)address,
+                     (unsigned long long)size, r_write ? "write" : "read",
+                     (unsigned long long)r_begin, (unsigned long long)r_end);
+    }
+}
+} // namespace
+
+bool Rasterizer::DeferredDispatchTouches(VAddr address, u64 size, bool write) const {
+    if (deferred_cs_ranges.empty() || size == 0) {
+        return false;
+    }
+    for (const auto& r : deferred_cs_ranges) {
+        if ((r.write || write) && RangesMeet(address, size, r.begin, r.end)) {
+            LogDeferConflict(deferred_conflict_site ? deferred_conflict_site : "?", address, size,
+                             write, r.begin, r.end, r.write);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Rasterizer::DeferredDispatchTouchesImage(const VideoCore::Image& image, bool write) {
+    if (deferred_cs_ranges.empty()) {
+        return false;
+    }
+    const VideoCore::Image& base = image.shadow_of ? texture_cache.GetImage(image.shadow_of) : image;
+    return DeferredDispatchTouches(base.info.guest_address, base.info.guest_size, write);
+}
+
+bool Rasterizer::DeferredDispatchesConflict(const Pipeline* pipeline) const {
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                continue; // not a guest range
+            }
+            const auto sharp = desc.GetSharp(*stage);
+            if (DeferredDispatchTouches(sharp.base_address, sharp.GetSize(), desc.is_written)) {
+                return true;
+            }
+        }
+        for (const auto& desc : stage->images) {
+            const auto sharp = desc.GetSharp(*stage);
+            const VAddr address = sharp.Address();
+            if (address == 0) {
+                continue;
+            }
+            // An upper bound of the image's bytes: whole mip chain and all layers.
+            const u64 texels = u64(sharp.width + 1) * (sharp.height + 1) *
+                               std::max<u64>(sharp.depth + 1, 1) * sharp.NumLayers();
+            const u64 bytes =
+                texels * AmdGpu::NumBitsPerBlock(sharp.GetDataFmt()) / 8 * 4 / 3 + 256;
+            if (DeferredDispatchTouches(address, bytes, desc.is_written)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Rasterizer::TryDeferDispatch(const ComputePipeline* pipeline, u32 dim_x, u32 dim_y,
+                                  u32 dim_z, u64 cs_hash) {
+    const u32 max_groups = DeferCsMaxGroups();
+    if (max_groups == 0) {
+        return false;
+    }
+    // BB_DEFER_CS_LOG=1: the first declines, with their reason.
+    static const bool log_declines = std::getenv("BB_DEFER_CS_LOG") != nullptr;
+    static std::atomic<u32> logged{0};
+    const auto decline = [&](const char* why) {
+        if (log_declines && u64(dim_x) * dim_y * dim_z <= max_groups && logged.fetch_add(1) < 400) {
+            std::fprintf(stderr, "[DEFER] cs %016llx %ux%ux%u not deferred: %s\n",
+                         (unsigned long long)cs_hash, dim_x, dim_y, dim_z, why);
+        }
+        return false;
+    };
+    if (flushing_deferred) {
+        return decline("flushing");
+    }
+    if (!scheduler.IsRendering()) {
+        return decline("no open pass");
+    }
+    if (UseDrawPipe()) {
+        return decline("draw pipe");
+    }
+    // The temporal upscaler's scene (reduced-size proxies, its trigger dispatch) keeps the
+    // in-place order; a merely enabled upscaler (the default settings object) does not.
+    if (FrameCapture::Active() || upscaler->RasterScaling()) {
+        return decline("capture or upscaler scene");
+    }
+    if (DeferredCopiesPending()) {
+        return decline("copies pending");
+    }
+    if (u64(dim_x) * dim_y * dim_z > max_groups || dim_x == 0 || dim_y == 0 || dim_z == 0) {
+        return decline("size");
+    }
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (cs.uses_dma) {
+        return decline("dma");
+    }
+    for (const auto& desc : cs.buffers) {
+        // GDS is not a guest range (the read-constant and shared-memory stand-ins are private
+        // to the dispatch).
+        if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
+            return decline("gds");
+        }
+    }
+    // A dispatch that reads or writes an attachment of the open pass stays in place.
+    for (const auto id : bound_images) {
+        if (id == db_desc.first) {
+            return decline("depth attachment");
+        }
+        for (const auto& [cb_id, cb_desc] : cb_descs) {
+            if (cb_id == id) {
+                return decline("colour attachment");
+            }
+        }
+    }
+    DeferredDispatch d{pipeline, bound, push_data, bound_buffers, read_ranges, dim_x, dim_y,
+                       dim_z, cs_hash};
+    for (const auto& b : bound_buffers) {
+        const VAddr begin = b.buffer->CpuAddr() + b.offset;
+        deferred_cs_ranges.push_back({begin, begin + b.size, b.is_written});
+    }
+    for (const auto& r : read_ranges) {
+        const VAddr begin = r.buffer->CpuAddr() + r.offset;
+        deferred_cs_ranges.push_back({begin, begin + r.size, false});
+    }
+    for (size_t i = 0; i < bound_images.size(); ++i) {
+        const auto& image = texture_cache.GetImage(bound_images[i]);
+        const auto& base = image.shadow_of ? texture_cache.GetImage(image.shadow_of) : image;
+        const bool written = i < bound_images_written.size() && bound_images_written[i];
+        deferred_cs_ranges.push_back(
+            {base.info.guest_address, base.info.guest_address + base.info.guest_size, written});
+    }
+    deferred_dispatches.push_back(std::move(d));
+    BbStats::deferred_dispatches.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Rasterizer::FlushDeferredDispatches() {
+    if (deferred_dispatches.empty() || flushing_deferred) {
+        return;
+    }
+    if (scheduler.IsRendering()) {
+        scheduler.EndRendering(); // the pass-end hook comes back here
+        if (deferred_dispatches.empty()) {
+            return;
+        }
+    }
+    flushing_deferred = true;
+    std::vector<DeferredDispatch> list;
+    list.swap(deferred_dispatches);
+    deferred_cs_ranges.clear();
+    // The binding state of the command being bound (the pass-end hook runs between its
+    // BindResources and its recording) is kept.
+    auto saved_bound = std::move(bound);
+    const auto saved_push = push_data;
+    const auto saved_buffers = bound_buffers;
+    const auto saved_reads = read_ranges;
+    const auto saved_images = bound_images;
+    const auto saved_images_written = bound_images_written;
+    const bool saved_compute = pipeline_is_compute;
+    const u8 saved_encoders = draw_encoders;
+    bound_images.clear();
+    bound_images_written.clear();
+    for (auto& d : list) {
+        bound = std::move(d.bound);
+        push_data = d.push;
+        bound_buffers = d.buffers;
+        read_ranges = d.reads;
+        pipeline_is_compute = true;
+        draw_encoders = Metal::EncoderCompute;
+        if (auto* profiler = GpuProfiler::Get()) {
+            profiler->Mark(d.cs_hash ^ 0xD15Aull, [&] {
+                return fmt::format("dispatch cs {:016x} ({}x{}x{} groups, deferred)", d.cs_hash,
+                                   d.dim_x, d.dim_y, d.dim_z);
+            });
+        }
+        OrderAccesses();
+        const Metal::Size3 groups{d.dim_x, d.dim_y, d.dim_z};
+        const Metal::Draw::Resources resources = RecordResources(false);
+        scheduler.RecordDraw(
+            [=, runs = &scheduler.GetDrawRuns(), pipeline = d.pipeline](Metal::Encoder& e) {
+                runs->Dispatch(e, ComputeView(*pipeline), resources.bound, resources.push, groups);
+            },
+            false);
+        ResetBindings(); // marks the accesses where the dispatch really runs
+    }
+    bound = std::move(saved_bound);
+    push_data = saved_push;
+    bound_buffers = saved_buffers;
+    read_ranges = saved_reads;
+    bound_images = saved_images;
+    bound_images_written = saved_images_written;
+    pipeline_is_compute = saved_compute;
+    draw_encoders = saved_encoders;
+    flushing_deferred = false;
+    scheduler.KickRecording();
 }
 
 } // namespace Vulkan

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "bbport_toggles.h"
@@ -182,6 +183,10 @@ public:
         // Every texture binding comes here; the mutex (shared with the fault handlers of the
         // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
         // racing with this check races the same way with the locked path.
+        if (land_pending.load(std::memory_order_acquire)) {
+            std::scoped_lock lock{mutex};
+            DrainLandings();
+        }
         if (!BbToggle::Disabled(BbToggle::UpdateImageFastPath)) {
             const Image& image = slot_images[image_id];
             const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
@@ -225,6 +230,20 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
     void DebugProbeImage(ImageId id, const char* tag); // bbport debug: per-mip average
+    void DebugDumpImage(ImageId id, const char* path); // fifa-hybrid debug: level 0, all layers
+    void DebugDumpGpuCompressed(const char* dir); // fifa-hybrid debug: every GPU-written block image
+    /// 0.5.1-g: the GPU side wrote guest memory [addr, addr + size) itself (DMA copy/fill done in
+    /// host memory, WriteData). Its mapping is not protected, so no fault reports the write:
+    /// tracked images under it are marked CPU-dirty here, as the fault would have. Returns how
+    /// many clean tracked images the write touched; `first` receives a description of one.
+    u32 NoteHostWrite(VAddr addr, u64 size, bool notify, std::string* first);
+    /// 0.5.1-g: a download landed in guest memory (written by the GPU side, so no fault): CPU
+    /// textures under it are marked CPU-dirty at the next image update. Any thread.
+    void NoteLanding(VAddr addr, u64 size);
+    /// Applies the queued landings; `mutex` must be held.
+    void DrainLandings();
+    /// BB_AUDIT: reports tracked, clean images whose guest bytes no longer match their upload.
+    void AuditImages();
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: bbport, added to the S#'s bias (reduced scene rendering).
@@ -376,7 +395,8 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false, CpuReadWork* work = nullptr);
+    void DownloadImageMemory(ImageId image_id, bool sync = false, CpuReadWork* work = nullptr,
+                             bool only_if_pending = false);
     bool ShouldReadbackImage(const Image& image) const; // fifa-hybrid
 
 public:
@@ -413,6 +433,18 @@ public:
     void LogOndemandWrite(VAddr addr, u64 size);
     void PrintOndemandWriteCounts(); // fifa-hybrid diagnostics (BB_FAULT_STATS)
     void ForgetOndemandImagesIn(VAddr addr, u64 size, bool droppable_only);
+    /// 0.5.1-e: edge release. A CPU write that lands beside a pending on-demand image, on the
+    /// image's first or last page (FIFA: data sharing a page with a 93x75 RGBA32F target),
+    /// no longer downloads the image synchronously (8-13 ms per fault in cutscenes, the image's
+    /// last write being in the pending command buffer): that one page's read watcher is lifted,
+    /// the image stays pending for its other pages and is downloaded asynchronously; the landing
+    /// writes the released tail only while guest memory still holds the bytes seen at release
+    /// time. The next GPU write protects the tail again. BB_ODW_TAIL=0 turns it off.
+    /// True when a tail was released for this write.
+    bool ReleaseOndemandTails(VAddr addr, u64 size);
+    /// True when [addr, addr + size) touches the image bytes of a released tail: such a write
+    /// still needs the synchronous download (the page itself no longer faults for reads).
+    bool OndemandTailHit(VAddr addr, u64 size);
 
 private:
 
@@ -476,7 +508,39 @@ private:
     std::unordered_map<u32, OndemandRange> ondemand_ranges; ///< the range protected per image
     std::unordered_map<VAddr, u32> ondemand_page_refs;       ///< droppable read-watcher refs per 4 KiB page
     std::unordered_map<VAddr, u32> ondemand_page_refs_plain; ///< the other images' refs per page
+    std::atomic<bool> ondemand_any{false}; ///< 0.5.1-b: either map non-empty (lock-free pre-check)
+    /// 0.5.1-c: 4 MiB chunks of the guest range (below 0xfc00000000) holding an on-demand page,
+    /// set with the maps, cleared when both empty, read without the mutex: a buffer bind nowhere
+    /// near such an image answers here (HasOndemandIn ran under every bind, 2% in cutscenes).
+    static constexpr u64 OndemandChunkShift = 22;
+    static constexpr u64 OndemandChunks = u64{0xfc00000000} >> OndemandChunkShift;
+    std::array<std::atomic<u64>, OndemandChunks / 64> ondemand_chunks{};
     std::unordered_map<u32, u64> ondemand_seq; ///< last GPU-write order per pending image
+    /// 0.5.1-e: tail release (ReleaseOndemandTails). One record per pending image whose last
+    /// page was released at least once; `ondemand_tail_mutex` is a leaf lock (the deferred
+    /// landings take it on the scheduler's thread).
+    struct OndemandEdge {
+        VAddr addr{};             ///< first image byte on the released page
+        u32 size{};               ///< image bytes on that page
+        bool released{};          ///< the page's read watcher is lifted right now
+        std::vector<u8> snapshot; ///< guest bytes there at release time / last landing
+    };
+    struct OndemandTail {
+        std::array<OndemandEdge, 2> edge; ///< 0 = the image's first page, 1 = its last page
+    };
+    std::unordered_map<u32, OndemandTail> ondemand_tails;
+    std::mutex ondemand_tail_mutex;
+    std::atomic<u32> ondemand_tails_released{0};
+    std::mutex land_mutex;
+    std::vector<std::pair<VAddr, u64>> land_ranges;
+    std::atomic<bool> land_pending{false};
+    std::unordered_set<ImageId> tail_downloads; ///< guarded by download_images_mutex
+    void EraseOndemandTail(u32 index);
+    void ReprotectOndemandTail(u32 index); ///< download_images_mutex held
+    bool OndemandTailReleased(u32 index);
+    /// Writes a downloaded image to guest memory honouring a released tail; false when the
+    /// write was skipped (`only_if_pending` and the image is no longer pending with a tail).
+    bool WriteBackImage(u32 index, VAddr addr, const u8* data, u64 size, bool only_if_pending);
     u64 ondemand_seq_next{};
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report

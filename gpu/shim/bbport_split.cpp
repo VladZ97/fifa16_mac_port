@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "common/thread.h"
 #include "core/platform.h"
@@ -121,6 +122,51 @@ void NoteProtect(u64 address, u64 size, u32 read, bool write) { // g_protect_mut
     }
 }
 
+// 0.5.1-c: when the host protects the game's pages itself (bbgpu_shared.h protect_direct,
+// host_runtime.c), its changes and this side's fault handling are ordered by the shared spinlock:
+// the host holds it for the microseconds of a mach_vm_protect, a handler here for as long. Not
+// taken (no cost) while protection is relayed through the bb:GpuProtect thread.
+struct SharedProtectGuard {
+    bool held = false;
+    SharedProtectGuard() {
+        BbGpuShared* s = g_shared;
+        if (!s || !__atomic_load_n(&s->protect_direct, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 spins = 0;; ++spins) {
+            u32 expected = 0;
+            if (__atomic_compare_exchange_n(&s->protect_lock, &expected, 1u, false, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
+                held = true;
+                return;
+            }
+            bbgpu_cpu_relax();
+            if ((spins & 0xffffu) == 0xffffu) {
+                if (!PeerAlive(s->host_pid)) {
+                    PeerLost("GPU host");
+                }
+                // 0.5.1-d: the host holds the lock for microseconds; a second means it is stuck
+                // (a debugger, a hang). This fault is handled without the lock rather than
+                // hanging the game thread with it; the worst case is one stale kind byte.
+                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(1)) {
+                    static std::atomic<u32> said{0};
+                    if (said.fetch_add(1) < 3) {
+                        std::printf("GPU split: the host held the protection lock for over 1 s; "
+                                    "handling the fault without it\n");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    ~SharedProtectGuard() {
+        if (held) {
+            __atomic_store_n(&g_shared->protect_lock, 0u, __ATOMIC_RELEASE);
+        }
+    }
+};
+
 std::atomic<u64> g_relayed_write_states[16]; // BB_FAULT_STATS: relayed writes by page state
 std::atomic<u64> g_spurious_write_faults{0}; // writes retried because the page is writable now
 
@@ -131,6 +177,7 @@ bool LocalWriteFault(u64 address) {
         return false;
     }
     std::scoped_lock lock{g_protect_mutex};
+    SharedProtectGuard shared_guard; // 0.5.1-c: against the host's direct protection changes
     const u8* k = KindSlot(address);
     u8 kind = k ? KindOf(*k) : 0;
     if (kind >= 2 && LocalWriteFaultLevel() < 2) {
@@ -191,7 +238,18 @@ void Attach(BbGpuShared* shared) {
 void InitRemote(BbGpuShared* shared) {
     g_shared = shared;
     g_mode = Mode::Remote;
-    g_page_kind = new u8[(BBGPU_GUEST_LOW_MAX - BBGPU_GUEST_LOW_MIN) >> kLocalPageBits]();
+    // 0.5.1-c: page-aligned and published, so a host that protects the game's pages itself
+    // (host_runtime.c protect_direct) maps this table and keeps it current.
+    const u64 kind_bytes = (BBGPU_GUEST_LOW_MAX - BBGPU_GUEST_LOW_MIN) >> kLocalPageBits;
+    void* kinds = mmap(nullptr, kind_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (kinds == MAP_FAILED) {
+        std::printf("GPU split: cannot map the page kind table; write faults relay\n");
+        kinds = new u8[kind_bytes]();
+    } else {
+        __atomic_store_n(&shared->page_kind_bytes, kind_bytes, __ATOMIC_RELEASE);
+        __atomic_store_n(&shared->page_kind_addr, reinterpret_cast<u64>(kinds), __ATOMIC_RELEASE);
+    }
+    g_page_kind = static_cast<u8*>(kinds);
     // M4: the host's page protection requests, applied here and acknowledged in order.
     std::thread([] {
         Common::SetCurrentThreadName("bb:GpuProtect");
@@ -199,7 +257,8 @@ void InitRemote(BbGpuShared* shared) {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         BbGpuShared* s = g_shared;
         for (;;) {
-            const BbGpuRecord* r = bbgpu_ring_peek_spin(s, &s->protect, Second, s->relay_spin_ns);
+            const BbGpuRecord* r = bbgpu_ring_peek_spin(s, &s->protect, Second,
+                                                       __atomic_load_n(&s->protect_spin_ns, __ATOMIC_ACQUIRE));
             if (!r) {
                 if (!PeerAlive(s->host_pid)) {
                     PeerLost("GPU host");

@@ -374,6 +374,50 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     KickRecording(true);
 }
 
+namespace {
+void SampleSlowWait(const char* what, void* recorder, const char* state);
+
+/// BB_SLOWWAIT_MS=<ms>: a wait of the command thread for the recording or copy threads longer
+/// than this prints where the recording thread is at that moment ([SLOWWAIT], first 60).
+struct SlowWaitProbe {
+    explicit SlowWaitProbe(const char* what_, void* recorder_,
+                           std::function<std::string()> state_ = {})
+        : what{what_}, recorder{recorder_}, state{std::move(state_)} {
+        static const double limit = [] {
+            const char* env = std::getenv("BB_SLOWWAIT_MS");
+            return env ? std::atof(env) : 0.0;
+        }();
+        limit_ns = u64(limit * 1e6);
+        if (limit_ns) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    void Poll() {
+        if (limit_ns && !sampled &&
+            u64((std::chrono::steady_clock::now() - start).count()) > limit_ns) {
+            sampled = true;
+            SampleSlowWait(what, recorder, state ? state().c_str() : "");
+        }
+    }
+    ~SlowWaitProbe() {
+        if (!limit_ns) {
+            return;
+        }
+        const double ms = (std::chrono::steady_clock::now() - start).count() / 1e6;
+        if (sampled || ms * 1e6 > double(limit_ns)) {
+            std::printf("[SLOWWAIT] %s took %.1f ms%s\n", what, ms,
+                        sampled ? "" : " (one blocking call, no sample)");
+        }
+    }
+    const char* what;
+    void* recorder;
+    std::function<std::string()> state;
+    u64 limit_ns = 0;
+    std::chrono::steady_clock::time_point start;
+    bool sampled = false;
+};
+} // namespace
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
@@ -381,11 +425,17 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+    SlowWaitProbe probe{"deferred signals", (void*)recorder_thread.native_handle(), [this] {
+            return fmt::format("queued {} busy {} sleeping {}",
+                               queued_chunks.load(std::memory_order_relaxed), int(recorder_busy),
+                               int(recorder_sleeping));
+        }};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
-        std::this_thread::yield();
+        bbport::Yield();
+        probe.Poll();
     }
 }
 
@@ -393,12 +443,19 @@ void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        SlowWaitProbe probe{"host copies", (void*)recorder_thread.native_handle(), [this] {
+            return fmt::format("queued {} busy {} sleeping {}",
+                               queued_chunks.load(std::memory_order_relaxed), int(recorder_busy),
+                               int(recorder_sleeping));
+        }};
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+            bbport::Yield();
+            probe.Poll();
         }
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
+    SlowWaitProbe probe{"copy threads", nullptr};
     BbCopy::WaitAsync();
 }
 
@@ -474,6 +531,25 @@ std::string ThreadName(void* handle) {
     char name[64] = "?";
     pthread_getname_np((pthread_t)(uintptr_t)handle, name, sizeof(name));
     return name[0] ? name : "?";
+}
+} // namespace
+
+namespace {
+void SampleSlowWait(const char* what, void* recorder, const char* state) {
+    static std::atomic<u32> reports{0};
+    if (!recorder || reports.fetch_add(1, std::memory_order_relaxed) >= 600) {
+        return;
+    }
+#ifdef __APPLE__
+    void* frames[24];
+    const int count = OtherThreadFrames((pthread_t)(uintptr_t)recorder, frames, 24);
+    std::string line;
+    for (int i = 0; i < count; ++i) {
+        line += i ? " < " : "";
+        line += SymbolName(frames[i]);
+    }
+    std::printf("[SLOWWAIT] %s (%s): recording thread at %s\n", what, state, line.c_str());
+#endif
 }
 } // namespace
 
@@ -569,6 +645,7 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:MtlRecorder");
+    BbThreads::MakeInteractive();
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
@@ -673,8 +750,14 @@ u64 Scheduler::SubmitExecution() {
 
     EndRendering();
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
-        // Encoders of the next submission before its first mark.
-        profiler->Mark(0x5B317ull, [] { return std::string{"(after a submission, unmarked)"}; });
+        // Encoders of the next submission before its first mark: the segment that was open
+        // continues (a pass or dispatch run spanning the game's own submissions; FIFA submits
+        // ~15 times a frame), else unmarked.
+        if (const u64 open = profiler->Current()) {
+            profiler->Resume(open);
+        } else {
+            profiler->Mark(0x5B317ull, [] { return std::string{"(after a submission, unmarked)"}; });
+        }
     }
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).

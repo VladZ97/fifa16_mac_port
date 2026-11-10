@@ -15,6 +15,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "bbport_gametrace.h"
 
 namespace Libraries::Kernel {
 
@@ -196,6 +197,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         count = GetTriggeredEvents(ev, num);
         return count > 0;
     };
+    const unsigned long long trace_start = BbGameTrace::Enabled() ? BbGameTrace::NowNs() : 0;
 
     if (micros == 0) {
         // Wait indefinitely for events
@@ -205,6 +207,10 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         // Wait up until the timeout value
         std::unique_lock lock{m_mutex};
         m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
+    }
+    if (trace_start) {
+        BbGameTrace::NoteWait(trace_start, BbGameTrace::NowNs(), count > 0 ? ev[0].ident : 0,
+                              count > 0 ? int(ev[0].filter) : 0, count);
     }
 
     return count;

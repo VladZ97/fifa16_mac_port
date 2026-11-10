@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <vector>
 #include <chrono>
 
 #include "common/enum.h"
@@ -125,6 +126,9 @@ public:
     /// bbport: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
+    /// fifa-hybrid: scheduler tick of the last in-order draw or dispatch that bound it (a hoisted
+    /// dispatch may not run ahead of a submission whose commands already use the image).
+    u64 last_bound_tick{};
     ImageId depth_id{};
     /// fifa-hybrid: Metal has no uncompressed views of block-compressed textures. A one-texel-per-
     /// block view (BC3 as RGBA32Uint, GPU texture compression) uses this separate image instead.
@@ -153,6 +157,13 @@ public:
     Metal::Object depth_twin;
     u64 depth_twin_synced = ~u64{0};
     u64 write_serial = 1; // read from the fault thread too (a stale read only costs a download)
+    u64 audit_hash = 0;          ///< BB_AUDIT: hash of the guest bytes at the last upload (0: none)
+    bool audit_suspect = false;  ///< BB_AUDIT: guest bytes differed from the upload once
+    u32 audit_gpu_pass = 0;      ///< BB_AUDIT_GPU: the pass that last compared the GPU copy
+    bool audit_gpu_reported = false;
+    bool audit_reported = false; ///< BB_AUDIT: reported as stale
+    bool audit_prot_reported = false; ///< BB_AUDIT: reported as writable while tracked
+    std::vector<u64> audit_pages; ///< BB_AUDIT: per 4 KiB page hashes of the guest bytes at the upload
     u64 last_write_tick = 0; ///< scheduler tick of the last recorded GPU write or upload
     /// fifa-hybrid diagnostics (BB_TWIN_WATCH): why write_serial moved since the last probe.
     u32 diag_rt_writes = 0, diag_uploads = 0, diag_other_writes = 0;
@@ -205,6 +216,10 @@ public:
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 lru_id{};
     u64 hash{};
+    /// 0.5.1-g: hash of the image's bytes on its first (0) / last (1) page, taken when a write
+    /// beside the image released that page; compared when the page is tracked again.
+    u64 edge_hash[2]{};
+    bool edge_valid[2]{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;

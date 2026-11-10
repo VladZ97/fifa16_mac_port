@@ -492,6 +492,12 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 
 PageManager::~PageManager() = default;
 
+u32 PageManager::DebugState(VAddr addr) const {
+    const auto& s = impl->cached_pages[addr >> PM_PAGE_BITS];
+    return u32(s.num_write_watchers) | u32(s.num_read_watchers) << 8 | u32(s.num_image_watchers) << 16 |
+           u32(s.num_image_read_watchers) << 24;
+}
+
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);
 }

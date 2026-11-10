@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -63,6 +64,21 @@ public:
         return texture_cache;
     }
 
+    // fifa-hybrid: compute dispatches issued inside a render pass are deferred to its end
+    // (BB_DEFER_CS=<max groups>, default 64; 0 off), so a pass is not split (stored and
+    // reloaded on a tile-based GPU) for the game's tiny per-object dispatches. A command that
+    // reaches what a pending dispatch reads or writes runs them first (the pass splits as before).
+    /// Whether [address, address + size) meets a pending dispatch's writes, or (`write`) reads.
+    [[nodiscard]] bool DeferredDispatchTouches(VAddr address, u64 size, bool write) const;
+    /// The same for an image (a block shadow stands for its block-compressed image).
+    [[nodiscard]] bool DeferredDispatchTouchesImage(const VideoCore::Image& image, bool write);
+    /// Records the pending dispatches now (ending the open pass first); the caller's binding
+    /// state is kept.
+    void FlushDeferredDispatches();
+    [[nodiscard]] bool HasDeferredDispatches() const noexcept {
+        return !deferred_dispatches.empty();
+    }
+
     void Draw(bool is_indexed, u32 index_offset = 0, const PreparedDraw* prepared = nullptr);
 
     /// bbport: draw preparation workers (vk_draw_prep.h), fed and consumed by Liverpool.
@@ -94,6 +110,9 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// 0.5.1-g: the command thread wrote guest memory [addr, addr + size) through the host's own
+    /// (unprotected) mapping: tells the texture and buffer caches, as the write fault would.
+    void NoteHostWrite(VAddr addr, u64 size, const char* what);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies). The
     /// wait kicks the recorder (the recording chunk), so the draw recording thread is drained
@@ -122,6 +141,8 @@ public:
     [[nodiscard]] bool DrawPipeReached(u64 position) const {
         return !draw_pipe || draw_pipe->Reached(position);
     }
+    /// 0.5.1-b stall dump: the draw pipe and the scheduler's queues.
+    void DumpStall();
     /// Stage A: no draws waiting for the recording thread.
     [[nodiscard]] bool DrawPipeIdle() const {
         return !draw_pipe || draw_pipe->Idle();
@@ -141,6 +162,12 @@ public:
     void WaitDeferredSignals() {
         DrainDrawPipe();
         scheduler.WaitDeferredSignals();
+    }
+    [[nodiscard]] u64 DeferredSignalsIssued() const noexcept {
+        return scheduler.DeferredSignalsIssued();
+    }
+    [[nodiscard]] u64 DeferredSignalsDone() const noexcept {
+        return scheduler.DeferredSignalsDone();
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
@@ -413,6 +440,69 @@ private:
     /// Before recording the draw or dispatch: the barrier its accesses need, if any.
     void OrderAccesses();
 
+    /// fifa-hybrid: written flags of bound_images, by index (render targets and storage views).
+    boost::container::static_vector<u8, Shader::NUM_IMAGES> bound_images_written;
+    /// fifa-hybrid: each bound image's last_write_tick before this command's own access (the
+    /// hoisting rule for its storage images).
+    boost::container::static_vector<u64, Shader::NUM_IMAGES> bound_images_prev_write;
+    /// 0.5.1-c (PlanCopyDispatchPass): per image binding of the bound stage(s), the image (null
+    /// for a stand-in) and its view texture; the bound samplers; whether every image binding is
+    /// a single element (then binding i is images[i] of the stage).
+    boost::container::small_vector<VideoCore::ImageId, 16> bound_image_ids;
+    boost::container::small_vector<void*, 16> bound_image_views;
+    boost::container::small_vector<void*, 16> bound_samplers;
+    bool bound_images_simple = true;
+    struct CopyDispatchPlan {
+        void* dst;
+        void* src;
+        void* sampler;
+        u32 width, height;
+        std::array<float, 2> scale;
+        bool remap;
+        u32 swizzle;
+    };
+    /// 0.5.1-c: whether the bound compute program (a detected copy, Shader::InfoPersistent::
+    /// CopyDispatch) with this grid can run as BlitHelper::CopyDispatch; fills `plan`.
+    bool PlanCopyDispatchPass(const Shader::Info& cs, u32 dim_x, u32 dim_y, u32 dim_z,
+                              CopyDispatchPlan& plan);
+    struct DeferredDispatch {
+        const ComputePipeline* pipeline;
+        std::vector<Metal::Draw::Bound> bound;
+        Shader::PushData push;
+        boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> buffers;
+        boost::container::small_vector<BoundBuffer, 8> reads;
+        u32 dim_x, dim_y, dim_z;
+        u64 cs_hash;
+    };
+    std::vector<DeferredDispatch> deferred_dispatches;
+    struct DeferredRange {
+        VAddr begin, end;
+        bool write;
+    };
+    std::vector<DeferredRange> deferred_cs_ranges; ///< guest ranges of the pending dispatches
+    bool flushing_deferred = false;
+    const char* deferred_conflict_site = nullptr; ///< BB_DEFER_CS_LOG: the check in progress
+
+public:
+    /// Names the caller for the conflict log (caches: "upload", "download", "refresh", ...).
+    void NoteDeferredConflictSite(const char* site) noexcept {
+        deferred_conflict_site = site;
+    }
+
+private:
+    /// fifa-hybrid: records the bound dispatch ahead of the submission (the upload encoder) when
+    /// nothing not yet complete touched its ranges, so the open pass is not split and the next
+    /// draw (which reads what it wrote: the game generates vertices this way) waits on the
+    /// uploads' fence only. Buffers only. BB_HOIST_CS=0 turns it off.
+    bool TryHoistDispatch(const ComputePipeline* pipeline, u32 dim_x, u32 dim_y, u32 dim_z,
+                          u64 cs_hash);
+    std::optional<Metal::Draw::NullResources> ahead_nulls; ///< stand-ins for hoisted dispatches
+    /// Defers the bound dispatch when the pass is open and nothing of it meets the pass.
+    bool TryDeferDispatch(const ComputePipeline* pipeline, u32 dim_x, u32 dim_y, u32 dim_z,
+                          u64 cs_hash);
+    /// Whether a descriptor of `pipeline`'s stages reaches a pending dispatch's ranges.
+    [[nodiscard]] bool DeferredDispatchesConflict(const Pipeline* pipeline) const;
+
     /// The resources of the draw or dispatch being bound, by the shaders' unified binding
     /// (Shader::Backend::Bindings::unified; array elements contiguous), for
     /// Metal::Draw::BindStage. Empty elements get the draw helper's null stand-ins.
@@ -530,6 +620,9 @@ private:
     // stops first).
     static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
     static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
+    /// 0.5.1-c: set once the draw recording thread installs its registers; until then Regs()
+    /// and friends skip the thread-local read (a _tlv_get_addr call per use on macOS).
+    static inline std::atomic<bool> stage_regs_used{false};
     AmdGpu::Regs pipe_regs{};
     bool pipe_synced = false;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};

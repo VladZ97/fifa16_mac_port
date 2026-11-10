@@ -33,6 +33,11 @@ inline constexpr const char* Present = "present_fs";
 /// Vulkan's blitImage with eNearest (floor((x + 0.5) * src / dst)); float, uint and int flavours.
 inline constexpr const char* ScaleNearest[3] = {"scale_nearest_fs", "scale_nearest_uint_fs",
                                                 "scale_nearest_int_fs"};
+/// 0.5.1-e: edge anti-aliasing of the display image before it is scaled to the window (FXAA 3.11
+/// quality, 5 to 12 search steps): texture 0, sampler 0 (linear), EdgeAaParams at buffer 0.
+inline constexpr const char* EdgeAa = "edge_aa_fs";
+/// 0.5.1-c: a full-screen copy dispatch as a fragment pass (BlitHelper::CopyDispatch).
+inline constexpr const char* CopyDispatch = "copy_dispatch_fs";
 
 inline constexpr const char* Source = R"msl(
 #include <metal_stdlib>
@@ -154,6 +159,161 @@ fragment float4 post_process_fs(FsTriOut in [[stage_in]], texture2d<float> tex [
     return float4(pp_gamma(c.rgb, pp.gamma), c.a);
 }
 
+// 0.5.1-e edge anti-aliasing: FXAA 3.11 quality (Timothy Lottes, public domain), luma computed
+// per tap. FIFA's 2-sample scene leaves full-pixel stair-steps on the 1080p display image, which
+// the scale to a Retina window then magnifies; this pass runs at the game's resolution, before
+// the scaler. `linear_input`: the texture view decodes sRGB, so luma takes a square root.
+struct EdgeAaParams {
+    float2 rcp_frame;
+    float subpix;
+    float edge_threshold;
+    float edge_threshold_min;
+    uint linear_input;
+    float split;
+    uint quality; ///< 0: 5 search steps, 1: 8, 2: 12
+};
+static float aa_luma(float3 c, uint linear_input) {
+    const float l = dot(c, float3(0.299, 0.587, 0.114));
+    return linear_input != 0u ? sqrt(max(l, 0.0)) : l;
+}
+fragment float4 edge_aa_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                           sampler s [[sampler(0)]], constant EdgeAaParams& aa [[buffer(0)]]) {
+    float2 posM = in.uv;
+    const float4 rgbM = tex.sample(s, posM, level(0.0));
+    if (in.uv.x < aa.split) {
+        return rgbM;
+    }
+    const uint lin = aa.linear_input;
+    const float lumaM = aa_luma(rgbM.rgb, lin);
+    float lumaS = aa_luma(tex.sample(s, posM, level(0.0), int2(0, 1)).rgb, lin);
+    const float lumaE = aa_luma(tex.sample(s, posM, level(0.0), int2(1, 0)).rgb, lin);
+    float lumaN = aa_luma(tex.sample(s, posM, level(0.0), int2(0, -1)).rgb, lin);
+    const float lumaW = aa_luma(tex.sample(s, posM, level(0.0), int2(-1, 0)).rgb, lin);
+    const float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));
+    const float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));
+    const float range = rangeMax - rangeMin;
+    if (range < max(aa.edge_threshold_min, rangeMax * aa.edge_threshold)) {
+        return rgbM;
+    }
+    const float lumaNW = aa_luma(tex.sample(s, posM, level(0.0), int2(-1, -1)).rgb, lin);
+    const float lumaSE = aa_luma(tex.sample(s, posM, level(0.0), int2(1, 1)).rgb, lin);
+    const float lumaNE = aa_luma(tex.sample(s, posM, level(0.0), int2(1, -1)).rgb, lin);
+    const float lumaSW = aa_luma(tex.sample(s, posM, level(0.0), int2(-1, 1)).rgb, lin);
+    const float lumaNS = lumaN + lumaS;
+    const float lumaWE = lumaW + lumaE;
+    const float subpixRcpRange = 1.0 / range;
+    const float subpixNSWE = lumaNS + lumaWE;
+    const float edgeHorz1 = (-2.0 * lumaM) + lumaNS;
+    const float edgeVert1 = (-2.0 * lumaM) + lumaWE;
+    const float lumaNESE = lumaNE + lumaSE;
+    const float lumaNWNE = lumaNW + lumaNE;
+    const float edgeHorz2 = (-2.0 * lumaE) + lumaNESE;
+    const float edgeVert2 = (-2.0 * lumaN) + lumaNWNE;
+    const float lumaNWSW = lumaNW + lumaSW;
+    const float lumaSWSE = lumaSW + lumaSE;
+    const float edgeHorz4 = (abs(edgeHorz1) * 2.0) + abs(edgeHorz2);
+    const float edgeVert4 = (abs(edgeVert1) * 2.0) + abs(edgeVert2);
+    const float edgeHorz3 = (-2.0 * lumaW) + lumaNWSW;
+    const float edgeVert3 = (-2.0 * lumaS) + lumaSWSE;
+    const float edgeHorz = abs(edgeHorz3) + edgeHorz4;
+    const float edgeVert = abs(edgeVert3) + edgeVert4;
+    const float subpixNWSWNESE = lumaNWSW + lumaNESE;
+    const bool horzSpan = edgeHorz >= edgeVert;
+    float lengthSign = horzSpan ? aa.rcp_frame.y : aa.rcp_frame.x;
+    const float subpixA = subpixNSWE * 2.0 + subpixNWSWNESE;
+    if (!horzSpan) {
+        lumaN = lumaW;
+        lumaS = lumaE;
+    }
+    const float subpixB = (subpixA * (1.0 / 12.0)) - lumaM;
+    const float gradientN = lumaN - lumaM;
+    const float gradientS = lumaS - lumaM;
+    float lumaNN = lumaN + lumaM;
+    const float lumaSS = lumaS + lumaM;
+    const bool pairN = abs(gradientN) >= abs(gradientS);
+    const float gradient = max(abs(gradientN), abs(gradientS));
+    if (pairN) {
+        lengthSign = -lengthSign;
+    }
+    const float subpixC = saturate(abs(subpixB) * subpixRcpRange);
+    float2 posB = posM;
+    const float2 offNP = horzSpan ? float2(aa.rcp_frame.x, 0.0) : float2(0.0, aa.rcp_frame.y);
+    if (horzSpan) {
+        posB.y += lengthSign * 0.5;
+    } else {
+        posB.x += lengthSign * 0.5;
+    }
+    // The search steps along the edge, in texels: FXAA quality presets 12, 15 and 39.
+    const float step_table[3][12] = {
+        {1.0, 1.5, 2.0, 4.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        {1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 12.0, 0.0, 0.0, 0.0, 0.0},
+        {1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0}};
+    const int step_counts[3] = {5, 8, 12};
+    const uint quality = min(aa.quality, 2u);
+    const int step_count = step_counts[quality];
+    float steps[12];
+    for (int i = 0; i < 12; ++i) {
+        steps[i] = step_table[quality][i];
+    }
+    float2 posN = posB - offNP * steps[0];
+    float2 posP = posB + offNP * steps[0];
+    const float subpixD = (-2.0 * subpixC) + 3.0;
+    float lumaEndN = aa_luma(tex.sample(s, posN, level(0.0)).rgb, lin);
+    const float subpixE = subpixC * subpixC;
+    float lumaEndP = aa_luma(tex.sample(s, posP, level(0.0)).rgb, lin);
+    if (!pairN) {
+        lumaNN = lumaSS;
+    }
+    const float gradientScaled = gradient * 0.25;
+    const float lumaMM = lumaM - lumaNN * 0.5;
+    const float subpixF = subpixD * subpixE;
+    const bool lumaMLTZero = lumaMM < 0.0;
+    lumaEndN -= lumaNN * 0.5;
+    lumaEndP -= lumaNN * 0.5;
+    bool doneN = abs(lumaEndN) >= gradientScaled;
+    bool doneP = abs(lumaEndP) >= gradientScaled;
+    if (!doneN) {
+        posN -= offNP * steps[1];
+    }
+    if (!doneP) {
+        posP += offNP * steps[1];
+    }
+    for (int i = 2; i < step_count && (!doneN || !doneP); ++i) {
+        if (!doneN) {
+            lumaEndN = aa_luma(tex.sample(s, posN, level(0.0)).rgb, lin) - lumaNN * 0.5;
+            doneN = abs(lumaEndN) >= gradientScaled;
+            if (!doneN) {
+                posN -= offNP * steps[i];
+            }
+        }
+        if (!doneP) {
+            lumaEndP = aa_luma(tex.sample(s, posP, level(0.0)).rgb, lin) - lumaNN * 0.5;
+            doneP = abs(lumaEndP) >= gradientScaled;
+            if (!doneP) {
+                posP += offNP * steps[i];
+            }
+        }
+    }
+    const float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;
+    const float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;
+    const bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero;
+    const float spanLength = dstP + dstN;
+    const bool goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;
+    const bool directionN = dstN < dstP;
+    const float dst = min(dstN, dstP);
+    const bool goodSpan = directionN ? goodSpanN : goodSpanP;
+    const float subpixG = subpixF * subpixF;
+    const float pixelOffset = (dst * (-1.0 / spanLength)) + 0.5;
+    const float subpixH = subpixG * aa.subpix;
+    const float pixelOffsetSubpix = max(goodSpan ? pixelOffset : 0.0, subpixH);
+    if (horzSpan) {
+        posM.y += pixelOffsetSubpix * lengthSign;
+    } else {
+        posM.x += pixelOffsetSubpix * lengthSign;
+    }
+    return float4(tex.sample(s, posM, level(0.0)).rgb, rgbM.a);
+}
+
 // The present blit: the frame over the viewport (the aspect-fit rect), linear.
 fragment float4 present_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
                            sampler s [[sampler(0)]]) {
@@ -169,6 +329,27 @@ fragment float4 present_fs(FsTriOut in [[stage_in]], texture2d<float> tex [[text
 SCALE_NEAREST(float, )
 SCALE_NEAREST(uint, _uint)
 SCALE_NEAREST(int, _int)
+
+// copy_dispatch.frag (0.5.1-c): the compute copy shader as a fragment pass. The dispatch sampled
+// (gid + 0.5) * scale at LOD 0 and wrote a component swizzle of it at gid; position.xy is gid + 0.5.
+// remap: the host's depth remap of the sampled image (PushData::depth_remap); swizzle: 4-bit codes
+// per output component, 0-3 the sample's components, 4 zero, 5 one.
+struct CopyDispatchParams {
+    float2 scale;
+    uint remap;
+    uint swizzle;
+};
+fragment float4 copy_dispatch_fs(float4 position [[position]], texture2d<float> src [[texture(0)]],
+                                 sampler smp [[sampler(0)]],
+                                 constant CopyDispatchParams& p [[buffer(0)]]) {
+    float4 v = src.sample(smp, position.xy * p.scale, level(0.0f));
+    if (p.remap != 0u) {
+        v = v * 2.0f - 1.0f;
+    }
+    const float c[6] = {v.x, v.y, v.z, v.w, 0.0f, 1.0f};
+    return float4(c[p.swizzle & 7u], c[(p.swizzle >> 4u) & 7u], c[(p.swizzle >> 8u) & 7u],
+                  c[(p.swizzle >> 12u) & 7u]);
+}
 )msl";
 
 } // namespace Metal::BlitShaders

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include "common/types.h"
 #include "video_core/renderer_metal/mtl_object.h"
@@ -36,6 +37,12 @@ public:
     void Render(Scheduler& scheduler, Metal::Object input, Metal::Object output, u32 width,
                 u32 height, const Settings& settings);
 
+    /// 0.5.1-e: records the edge anti-aliasing pass over `input` (width x height) and returns the
+    /// filtered texture (same size and pixel format), or `input` when no texture can be made.
+    using AaSettings = Metal::EdgeAaSettings;
+    Metal::Object EdgeAa(Scheduler& scheduler, Metal::Object input, u32 width, u32 height,
+                         const AaSettings& settings);
+
     /// The pipelines, for the present blit (Metal::PresentPasses::Present).
     [[nodiscard]] Metal::PresentPasses& Passes() noexcept {
         return *passes;
@@ -43,6 +50,14 @@ public:
 
 private:
     std::unique_ptr<Metal::PresentPasses> passes;
+    Metal::Device& device;
+    /// Edge AA outputs, used in turn (a recording holds its own reference).
+    struct AaTarget {
+        Metal::Object texture;
+        u32 width{}, height{}, format{};
+    };
+    std::array<AaTarget, 2> aa_targets;
+    u32 aa_next{};
 };
 
 } // namespace Vulkan::HostPasses

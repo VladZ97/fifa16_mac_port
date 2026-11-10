@@ -179,7 +179,7 @@ private:
 
     void WaitForProgress(u64 seen) {
         if (!blocking_wait) {
-            std::this_thread::yield();
+            bbport::Yield();
             return;
         }
         producer_sleeping.store(true, std::memory_order_seq_cst);

@@ -20,15 +20,20 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include "common/thread.h"
+#include "video_core/amdgpu/liverpool.h"
 #include <vector>
 #include <SDL3/SDL.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 #endif
 #include "../bbgpu.h"
 #include "bbport_split.h"
 #include "common/elf_info.h"
+#include "common/path_util.h"
+#include <filesystem>
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "common/signal_context.h"
@@ -48,6 +53,9 @@ int runtime_memory_read_backing(uintptr_t address, void* out, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
+// 0.5.1-b: provided by the GPU host's runtime only (host_runtime.c); the game-side library runs
+// without it (its protects are in-process mprotects, nothing to batch).
+void runtime_memory_gpu_protect_batch(int begin) __attribute__((weak_import));
 typedef void (*RuntimeGpuRange)(uintptr_t address, uint64_t size);
 // runtime_kernel.c: one clock for guest and GPU timestamps
 uint64_t runtime_process_time_us(void);
@@ -89,6 +97,7 @@ void SymbolsResolver::AddSymbol(const char* nid, const char* library, const char
 } // namespace Core::Loader
 
 // ElfInfo's fields are private to Core::Emulator; the port fills them here.
+namespace Vulkan { extern std::atomic<bool> g_bb_diag_window; } // vk_rasterizer.cpp
 namespace Core {
 class Emulator {
 public:
@@ -164,7 +173,71 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, BbWriteLog::Backing);
+    // diag (0.5.1-g): BB_WB_LOG=1 lists every GPU-to-guest write-back inside a BB_DRAWLOG_TRIGGER
+    // window with how many guest bytes it changes; BB_WB_SKIP=<addr>[,<addr>] drops write-backs
+    // that start there; BB_WB_DUMP=<addr> saves the new and the previous guest bytes.
+    static const bool wb_log = std::getenv("BB_WB_LOG") != nullptr;
+    static const std::string wb_skip = [] {
+        const char* env = std::getenv("BB_WB_SKIP");
+        return env ? "," + std::string(env) + "," : std::string{};
+    }();
+    static const u64 wb_dump = [] {
+        const char* env = std::getenv("BB_WB_DUMP");
+        return env ? std::strtoull(env, nullptr, 0) : 0ull;
+    }();
+    const u64 a = reinterpret_cast<uintptr_t>(address);
+    if (!wb_skip.empty()) {
+        char key[32];
+        std::snprintf(key, sizeof(key), ",%#llx,", (unsigned long long)a);
+        if (wb_skip.find(key) != std::string::npos) {
+            return true;
+        }
+    }
+    if ((wb_log || wb_dump) && ::Vulkan::g_bb_diag_window.load(std::memory_order_relaxed)) {
+        std::vector<u8> old(size);
+        const bool have = runtime_memory_read_backing(a, old.data(), size) != 0;
+        u64 changed = 0, first = 0, last = 0;
+        if (have) {
+            const u8* nd = static_cast<const u8*>(data);
+            for (u64 i = 0; i < size; ++i) {
+                if (old[i] != nd[i]) {
+                    if (!changed) first = i;
+                    last = i;
+                    ++changed;
+                }
+            }
+        }
+        if (wb_log) {
+            std::fprintf(stderr, "[WB] %#llx+%llu have=%d changed=%llu first=%llu last=%llu\n",
+                         (unsigned long long)a, (unsigned long long)size, int(have),
+                         (unsigned long long)changed, (unsigned long long)first,
+                         (unsigned long long)last);
+        }
+        static std::atomic<int> dumps{0};
+        if (wb_dump && a == wb_dump && have) {
+            const int n = dumps.fetch_add(1);
+            const char* dir = std::getenv("BB_DUMP_DIR");
+            if (n < 12 && dir) {
+                for (int k = 0; k < 2; ++k) {
+                    char name[512];
+                    std::snprintf(name, sizeof(name), "%s/wb_%llx_%d.%s", dir,
+                                  (unsigned long long)a, n, k ? "old" : "new");
+                    if (FILE* f = std::fopen(name, "wb")) {
+                        std::fwrite(k ? old.data() : static_cast<const u8*>(data), 1, size, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
+    }
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+}
+// 0.5.1-b: see memory_tracker.h ForEachUploadRange and host_runtime.c runtime_memory_gpu_protect_batch.
+void ProtectBatch(bool begin) {
+    if (runtime_memory_gpu_protect_batch) {
+        BbStats::Timer timer{BbStats::t_protect}; // the batch's single wait counts as protect time
+        runtime_memory_gpu_protect_batch(begin ? 1 : 0);
+    }
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms, u32 flags) {
     BbStats::Timer timer{BbStats::t_protect};
@@ -225,6 +298,27 @@ u32 BbDisplayRefreshHz() {
     return hz;
 }
 
+// fifa-hybrid (0.5.1-g): the highest refresh rate among the active displays' current modes
+// (CoreGraphics: usable before the window exists). 0 when it cannot be read.
+u32 BbMaxDisplayRefreshHz() {
+    static const u32 hz = [] {
+        CGDirectDisplayID displays[16];
+        uint32_t count = 0;
+        if (CGGetActiveDisplayList(16, displays, &count) != kCGErrorSuccess) {
+            return 0u;
+        }
+        double best = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displays[i])) {
+                best = std::max(best, CGDisplayModeGetRefreshRate(mode));
+                CGDisplayModeRelease(mode);
+            }
+        }
+        return u32(best + 0.5);
+    }();
+    return hz;
+}
+
 #ifdef BB_PGO_GENERATE
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
@@ -246,6 +340,129 @@ static void StartProfileWriter() {
 
 static void OpenWindow(const BbGpuConfig* config);
 
+// fifa-hybrid: the system's memory pressure. Under it the GPU's own memory is paged and frames
+// take tens to hundreds of milliseconds (the "slow GPU" state; a 22 GiB hog on a 32 GB Mac made
+// the first tick take over 2 s). The level is logged when it changes and the texture cache
+// evicts earlier (BbStats::system_memory_pressure). BB_MEMORY_PRESSURE=0 leaves it unwatched.
+static void WatchMemoryPressure() {
+    if (const char* e = std::getenv("BB_MEMORY_PRESSURE"); e && e[0] == '0') {
+        return;
+    }
+    static dispatch_source_t source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!source) {
+        return;
+    }
+    dispatch_source_set_event_handler(source, ^{
+        const unsigned long data = dispatch_source_get_data(source);
+        const int level = (data & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2
+                          : (data & DISPATCH_MEMORYPRESSURE_WARN)   ? 1
+                                                                     : 0;
+        const int before = BbStats::system_memory_pressure.exchange(level);
+        if (before != level) {
+            static const char* const names[3] = {"normal", "warning", "critical"};
+            std::printf("System memory pressure: %s%s\n", names[level],
+                        level ? " (the GPU slows while the system pages; close other apps to keep "
+                                "frames short)"
+                              : "");
+            std::fflush(stdout);
+        }
+    });
+    dispatch_resume(source);
+}
+
+// fifa-hybrid: BB_SHADER_SEED_DIR=<dir> names a read-only shader cache shipped with the app
+// (<dir>/<serial>/: the SPIR-V cache, the MSL files and the Metal binary archive of a previous
+// run). It is copied once into the user cache directory, when that holds no pipeline archive
+// yet, so a fresh install compiles only what the seed does not hold. Files already present are
+// kept. BB_SHADER_SEED=0 skips the copy. An archive made on another Mac or OS build is rejected
+// by Metal at load and replaced (PsoCache); the MSL files still save the SPIR-V to MSL step.
+extern std::unique_ptr<AmdGpu::Liverpool> liverpool; // gnmdriver.cpp (global scope)
+namespace Libraries::VideoOut {
+void DumpStallState(); // video_out.cpp
+}
+// 0.5.1-b: stall dump. When the game has not flipped for BB_STALL_DUMP_S seconds (default 8,
+// 0 = off) after flipping before, prints what the command processor and the renderer wait for
+// ([STALL] lines, once per 30 s while it lasts). Diagnostic only: it changes nothing.
+static void WatchStalls() {
+    const char* env = std::getenv("BB_STALL_DUMP_S");
+    const int seconds = env ? std::atoi(env) : 8;
+    if (seconds <= 0) {
+        return;
+    }
+    std::thread([seconds] {
+        Common::SetCurrentThreadName("bb:StallWatch");
+        u64 dumped_at = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const u64 flip = BbStats::last_flip_ns.load(std::memory_order_relaxed);
+            if (flip == 0 || now - flip < u64(seconds) * 1000000000ull) {
+                dumped_at = 0;
+                continue;
+            }
+            if (dumped_at && now - dumped_at < 30ull * 1000000000ull) {
+                continue;
+            }
+            dumped_at = now;
+            const u64 submit = BbStats::last_submit_ns.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[STALL] no flip for %.1f s (last graphics submission %.1f s ago)\n",
+                         (now - flip) / 1e9, submit ? (now - submit) / 1e9 : -1.0);
+            if (auto* lp = liverpool.get()) {
+                lp->DumpStall();
+            }
+            Libraries::VideoOut::DumpStallState();
+        }
+    }).detach();
+}
+
+static void SeedShaderCache() {
+    const char* seed = std::getenv("BB_SHADER_SEED_DIR");
+    if (!seed || !seed[0]) {
+        return;
+    }
+    if (const char* e = std::getenv("BB_SHADER_SEED"); e && e[0] == '0') {
+        return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
+    const fs::path src = fs::path{seed} / serial;
+    if (!fs::is_directory(src, ec)) {
+        std::printf("Shader cache: no seed at %s\n", src.c_str());
+        return;
+    }
+    const fs::path dst = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
+    if (fs::exists(dst / "metal" / "pipelines.binaryarchive", ec)) {
+        return; // a cache of its own: nothing to seed
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    fs::create_directories(dst, ec);
+    u64 files = 0, bytes = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(src, ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path rel = fs::relative(entry.path(), src, ec);
+        const fs::path to = dst / rel;
+        fs::create_directories(to.parent_path(), ec);
+        if (fs::exists(to, ec)) {
+            continue;
+        }
+        if (fs::copy_file(entry.path(), to, fs::copy_options::skip_existing, ec)) {
+            ++files;
+            bytes += entry.file_size(ec);
+        }
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("Shader cache: seeded %llu files (%.1f MB) into %s from %s in %.0f ms\n",
+                (unsigned long long)files, bytes / 1e6, dst.c_str(), src.c_str(), ms);
+}
+
+
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
@@ -254,6 +471,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     g_sdk_version = config->sdk_version;
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
     Core::Emulator::FillElfInfo(*config);
+    SeedShaderCache();
+    WatchMemoryPressure();
+    WatchStalls();
     OpenWindow(config);
     Core::Loader::SymbolsResolver resolver;
     // GnmDriver creates the presenter that the VideoOut present thread uses.

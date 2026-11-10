@@ -257,6 +257,18 @@ void Runtime::NoteSubmissionUse(const VideoCore::Buffer* buffer, u64 offset, u64
     }
 }
 
+bool Runtime::AheadSafe(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool write) const {
+    if (!ordering || size == 0) {
+        return false;
+    }
+    if (write && !hoist_targets.contains(buffer)) {
+        return false; // only guest memory (the arena) is written ahead
+    }
+    Metal::OrderRequest need = IsBufferAccessed(buffer, offset, size, write);
+    need.ahead = false; // the uploads and dispatches hoisted before it run first, in order
+    return need.Empty();
+}
+
 bool Runtime::HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                         std::span<const VideoCore::BufferCopy> copies, bool shader_copy) {
     if (!scheduler.IsRendering() || BbToggle::Disabled(BbToggle::UploadHoisting) ||

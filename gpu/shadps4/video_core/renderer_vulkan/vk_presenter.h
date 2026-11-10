@@ -42,6 +42,9 @@ struct Frame {
     u64 ready_tick{};      ///< draw-scheduler tick that wrote it; 0: blank (Present clears)
     bool is_hdr{false};
     u32 id{};
+    /// fifa-hybrid: when the game's flip of this frame reached the host (CLOCK_UPTIME_RAW ns,
+    /// the clock of the display's presented times); the pacing lock measures from here.
+    u64 flip_ns{};
 };
 
 enum SchedulerType {

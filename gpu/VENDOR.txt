@@ -8,3 +8,23 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
   mode (#5126), e518a6515 S_SUBB_U32 SCC wrap (#5031), 282e5c792 S_ADDC_U32 SCC carry-out (#5030),
   fb6367d29 32-bit literals in the high dword of 64-bit floats (#5114), 94e217781 V_BFM_B32 (#5185),
   d1cb90dbb ADDC (#5200), dd43d1cac V_CVT_PK_U8_F32 (#5194), ef08b1e1f V_ALIGNBIT/ALIGNBYTE (#5186).
+Upstream survey 2026-11-09 (shadPS4 origin/main, 78 commits past the emulator fork base 3eecea94): nothing merged.
+  Renderer changes are either equivalent here already (2831b681), micro-optimisations off FIFA's hot paths
+  (914e78c3, 145932bf, 6add101d) or Vulkan-side refactors of code the Metal path replaced (c6b24ec1, 8e23388a,
+  1eab1796, 99e33b7e); recompiler fixes target other games and would force a shader-cache rebuild.
+Local additions 2026-11-09 (0.5.1-e): edge anti-aliasing pass before scaling (FXAA 3.11, host_passes/pp_pass,
+  renderer_metal/mtl_blit_shaders.h; BB_AA=0 disables); on-demand read-back edge-page release
+  (texture_cache.cpp ReleaseOndemandTails / WriteBackImage, vk_rasterizer.cpp ResolveOndemandImages; BB_ODW_TAIL=0 disables).
+Local additions 2026-11-10 (0.5.1-f): forced anisotropy skipped on samplers with a positive LOD bias (vk_rasterizer.cpp;
+  BB_ANISO_BIASED=1 restores); steady display refresh (renderer_metal/mtl_present.mm StartSteadyRefresh: heartbeat layer
+  on 120/240 Hz displays, BB_DISPLAY_60=1 fixed 60 Hz mode, BB_REFRESH_BEAT=0 off); paced presents and the present-tick
+  lock (vk_presenter.cpp PacingSeconds / PacingLock, shim/bbport_pacing.h, videoout/driver.cpp tick slew; bbport.ini
+  even_frames, BB_FRAME_PACING, BB_PACING_LOCK, BB_PACING_TARGET_MS, BB_PACING_TRACE); bbport::Yield (shim/bbport_threads.h).
+Local additions 2026-11-10 (0.5.1-g): hot-read asynchronous write-back limited to steady small rewrites (buffer_cache;
+  BB_ASYNC_MAX_BYTES, BB_ONESHOT_WRITES: stale light-probe records, dark player bodies); copy-dispatch records keep the
+  shader's own swizzle and compose it with the bound destination at draw time (red/blue swapped mips, "blue face");
+  TextureCache::FindImage keeps the resolved mip level and slice across later overlaps (BB_FIND_MIP_RESET=1 restores; the
+  loop is the same in upstream shadPS4); the pacing lock measures from the game's flip (vk_presenter.h Frame::flip_ns,
+  videoout/driver.cpp SubmitFlipInternal, vk_presenter.cpp PacingLock; default target 50 ms, BB_PACING_FROM=gpu restores);
+  120 Hz game tick mode (BB_VBLANK_HZ=120: no heartbeat, no paced presents, lock target 26 ms; ignored on displays under
+  100 Hz, shim/core/emulator_settings.h + shim/bbgpu.cpp BbMaxDisplayRefreshHz, BB_VBLANK_FORCE=1 keeps it).

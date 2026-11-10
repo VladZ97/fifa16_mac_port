@@ -172,4 +172,41 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     DrawFullscreen(scheduler, pass, pipeline, no_depth_state, std::move(src_view));
 }
 
+void BlitHelper::CopyDispatch(u32 width, u32 height, void* dest, void* source, void* sampler,
+                              std::array<float, 2> scale, bool remap, u32 swizzle) {
+    void* const pipeline = GetPipeline({
+        .fragment = Metal::BlitShaders::CopyDispatch,
+        .color_format = Metal::TexturePixelFormat(dest),
+        .depth_format = 0,
+        .stencil_format = 0,
+        .samples = 1,
+    });
+    Metal::RenderPassDesc pass{};
+    pass.colors[0].texture = dest;
+    pass.colors[0].clear = true; // every pixel is written: no load
+    pass.width = width;
+    pass.height = height;
+    struct Params {
+        float scale[2];
+        u32 remap, swizzle;
+    } const params{{scale[0], scale[1]}, remap ? 1u : 0u, swizzle};
+    scheduler.EndRendering();
+    scheduler.Record([pass, pipeline, state = no_depth_state, source, sampler,
+                      params](Metal::Encoder& e) {
+        e.BeginRenderPass(pass);
+        e.SetRenderPipeline(pipeline, Metal::Access::None); // textures and inline constants only
+        e.SetDepthStencil(state);
+        e.SetCullMode(Metal::CullMode::None);
+        e.SetDepthBias(0.0f, 0.0f, 0.0f);
+        e.SetViewport({0.0f, 0.0f, float(pass.width), float(pass.height), 0.0f, 1.0f});
+        e.SetScissor({0, 0, pass.width, pass.height});
+        e.SetTexture(Metal::Stage::Fragment, 0, source);
+        e.SetSampler(Metal::Stage::Fragment, 0, sampler);
+        e.SetBytes(Metal::Stage::Fragment, 0, &params, sizeof params);
+        e.Draw(Metal::Primitive::Triangle, 3);
+        e.EndRenderPass();
+    });
+    scheduler.GetDynamicState().Invalidate();
+}
+
 } // namespace VideoCore

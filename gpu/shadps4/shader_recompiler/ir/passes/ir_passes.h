@@ -33,6 +33,8 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& sharp
                           const Profile& profile);
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile);
 void LowerBufferFormatToRaw(IR::Program& program);
+/// 0.5.1-c: see copy_dispatch_detect_pass.cpp.
+void CopyDispatchDetectPass(IR::Program& program, const RuntimeInfo& runtime_info);
 void LowerUserClipPlanes(IR::Program& program, const RuntimeInfo& runtime_info);
 void LowerFp64ToFp32(IR::Program& program);
 void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtime_info);

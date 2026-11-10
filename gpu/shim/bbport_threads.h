@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <thread>
 
 #ifdef __APPLE__
@@ -44,6 +45,22 @@ inline unsigned Available() {
         return std::max(1, CPU_COUNT(&set));
     }
     return std::max(1u, std::thread::hardware_concurrency());
+#endif
+}
+
+/// The calling thread is on the frame's critical path (GPU command thread, recording thread,
+/// presenter): user-interactive QoS, so a wake-up is not queued behind default-priority work
+/// and the guest's threads (same class, shadps4 linker.cpp / thread.cpp) do not outrank it.
+/// BB_HOST_QOS=0 leaves the default class.
+inline void MakeInteractive() {
+#ifdef __APPLE__
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_HOST_QOS");
+        return !(env && env[0] == '0');
+    }();
+    if (enabled) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
 #endif
 }
 

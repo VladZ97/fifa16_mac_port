@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "bbport_cpu.h"
 #include "bbport_copy.h"
 #include "bbport_threads.h"
 
@@ -91,7 +92,7 @@ public:
             if (task.run) {
                 RunAsync(task);
             } else {
-                std::this_thread::yield();
+                bbport::Yield();
             }
         }
     }
@@ -109,7 +110,7 @@ public:
         Work(*job);
         // Workers only call the task for indices below count, all done before this returns.
         while (job->done.load(std::memory_order_acquire) < count) {
-            std::this_thread::yield();
+            bbport::Yield();
         }
         std::scoped_lock lk{mutex};
         if (current == job) {
@@ -186,6 +187,7 @@ private:
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("bb:Copy" + std::to_string(index)).c_str());
+        BbThreads::MakeInteractive();
         u64 seen = 0;
         std::unique_lock lk{mutex};
         while (true) {

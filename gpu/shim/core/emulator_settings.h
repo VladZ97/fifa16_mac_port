@@ -2,11 +2,13 @@
 // variables (defaults match shadPS4 except the pipeline cache, which is on).
 #pragma once
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include "common/types.h"
 
 u32 BbDisplayRefreshHz(); // bbgpu.cpp: the game display's refresh rate, 60 when unknown
+u32 BbMaxDisplayRefreshHz(); // bbgpu.cpp: the fastest active display's refresh rate, 0 unknown
 
 enum GpuReadbacksMode : int { Disabled, Relaxed, Precise };
 
@@ -37,6 +39,17 @@ public:
     u32 GetVblankFrequency() {
         static const u32 value = [] {
             const long hz = Number("BB_VBLANK_HZ", 60);
+            // fifa-hybrid (0.5.1-g): the 120 Hz mode needs a display that shows 120 frames a
+            // second. On a 60 Hz display the game would run ahead of it and every frame would
+            // wait in a full queue, so the tick stays at 60 there (BB_VBLANK_FORCE=1 keeps it).
+            if (hz >= 100 && !Flag("BB_VBLANK_FORCE", false)) {
+                const u32 display = BbMaxDisplayRefreshHz();
+                if (display != 0 && display < 100) {
+                    std::printf("GPU: BB_VBLANK_HZ=%ld ignored, the display runs at %u Hz\n", hz,
+                                display);
+                    return 60u;
+                }
+            }
             return hz > 0 ? u32(hz) : 480u;
         }();
         return value;

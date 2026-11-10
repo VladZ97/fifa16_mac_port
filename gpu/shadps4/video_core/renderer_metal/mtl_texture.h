@@ -55,6 +55,10 @@ Object CreateSampler(Device& device, const SamplerDesc& desc);
 /// hold the texture (sample counts may have been clamped to what the device supports).
 u32 TexturePixelFormat(void* texture);
 u32 TextureSampleCount(void* texture);
+/// 0.5.1-c: a texture's (or view's) level-0 size and whether it is a plain 2D texture.
+u32 TextureWidth(void* texture);
+u32 TextureHeight(void* texture);
+bool TextureIs2D(void* texture);
 
 /// [MTLDevice supportsTextureSampleCount:].
 bool SupportsSampleCount(Device& device, u32 samples);

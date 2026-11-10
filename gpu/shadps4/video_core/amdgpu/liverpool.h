@@ -78,9 +78,10 @@ struct Liverpool {
         u64 data;
         u32 num_bytes;
         u64 position;
+        u64 signal_seq; ///< 0.5.1-c: deferred signals issued when listed (recorder fences), else ~0
     };
     std::deque<PendingFence> pending_fences;
-    void NotePendingFences(const auto& event);
+    void NotePendingFences(const auto& event, bool recorder_deferred = false);
     bool PendingFenceValue(VAddr address, u32& value);
     void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);
     /// bbport: running checksum of graphics-register packets (see ApplyGraphicsRegisterPacket).
@@ -138,6 +139,8 @@ public:
         vo_port = port;
     }
 
+    /// 0.5.1-b: prints the pending fences and the renderer's queues (stall dump).
+    void DumpStall();
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
     }

@@ -1,3 +1,4 @@
+#include "bbport_threads.h"
 #include <mutex>
 #include <map>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
@@ -276,6 +277,7 @@ static void DumpBadPacket(const u32* packet, uintptr_t base, size_t remaining) {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    BbThreads::MakeInteractive();
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -450,27 +452,47 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 
 // bbport: end-of-pipe/-shader events run in order with the draws (Rasterizer::RunInOrder: on
 // the draw recording thread when the draw pipeline is in use).
-void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
-    rasterizer.ProcessDownloadImages();
-    // Guest memory copies on the copy threads precede the fence the guest sees.
-    // BB_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
-    // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
-    // than the wait costs.
-    static const bool async_fences = [] {
+// Guest memory copies on the copy threads precede the fence the guest sees.
+// BB_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
+// slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
+// than the wait costs.
+bool AsyncFences() {
+    static const bool v = [] {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
-    // bbport (FIFA): without the draw pipe the GPU thread waited here for the recording thread
-    // to encode everything before the fence (most of its time in matches). The recording thread
-    // signals it instead; BB_RECORDER_FENCES=0 restores the wait.
-    static const bool recorder_fences = [] {
+    return v && !BbToggle::Disabled(BbToggle::AsyncFences);
+}
+// bbport (FIFA): without the draw pipe the GPU thread waited here for the recording thread
+// to encode everything before the fence (most of its time in matches). The recording thread
+// signals it instead; BB_RECORDER_FENCES=0 restores the wait.
+bool RecorderFences() {
+    static const bool v = [] {
         const char* env = std::getenv("BB_RECORDER_FENCES");
         return !env || env[0] != '0';
     }();
-    if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
+    return v;
+}
+// 0.5.1-c: an EOP fence the recording thread will write (RunEventWriteEop below, draw pipe off)
+// is listed as pending like one handed to the draw pipe, so a WaitRegMem on it is answered from
+// the list (PendingFenceValue) instead of spinning until the recorder catches up: FIFA waited
+// so 70-130 times a frame, 10-20% of the command thread (BB_SPIN_PROF wrm-yield).
+// BB_PENDING_RECORDER_FENCES=0 restores the spin.
+bool RecorderFenceDeferred() {
+    static const bool pending = [] {
+        const char* env = std::getenv("BB_PENDING_RECORDER_FENCES");
+        return !env || env[0] != '0';
+    }();
+    return pending && !AsyncFences() && !Vulkan::DrawPipe::OnStageB() && RecorderFences() &&
+           !BbToggle::Disabled(BbToggle::RecorderFences);
+}
+
+void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
+    rasterizer.ProcessDownloadImages();
+    if (AsyncFences()) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
-    } else if ((Vulkan::DrawPipe::OnStageB() || recorder_fences) &&
+    } else if ((Vulkan::DrawPipe::OnStageB() || RecorderFences()) &&
                !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
@@ -546,6 +568,8 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     Vulkan::VbNoteWrite(write_data->Address<u64>(), (header->type3.count.Value() - 2) * sizeof(u32), 'W');
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
+    rasterizer.NoteHostWrite(write_data->Address<u64>(), (header->type3.count.Value() - 2) * sizeof(u32),
+                             "writedata");
     std::memcpy(write_data->Address<u64*>(), write_data->data,
                 (header->type3.count.Value() - 2) * sizeof(u32));
 }
@@ -588,15 +612,21 @@ static bool LabelHolds(VAddr address, u64 data, u32 num_bytes) {
     return (now & mask) == (data & mask);
 }
 
-void Liverpool::NotePendingFences(const auto& event) {
+void Liverpool::NotePendingFences(const auto& event, bool recorder_deferred) {
     const u64 position = rasterizer->DrawPipeHead();
+    // 0.5.1-c: a fence the recorder signals (RecorderFenceDeferred) is written once the
+    // recorder's done count reaches the issued count at listing time; pruning by that keeps the
+    // list short (a label the game rewrites never "holds" its value, and the list grew to the
+    // 4096 cap: PendingFenceValue scans were 4% of the command thread in cutscenes).
+    const u64 signal_seq = recorder_deferred ? rasterizer->DeferredSignalsIssued() : ~u64{0};
+    const u64 signals_done = rasterizer->DeferredSignalsDone();
     if (FencePositionMode()) {
         while (!pending_fences.empty() && rasterizer->DrawPipeReached(pending_fences.front().position)) {
             pending_fences.pop_front();
         }
     } else {
         while (!pending_fences.empty() &&
-               (pending_fences.size() > 4096 ||
+               (pending_fences.size() > 4096 || pending_fences.front().signal_seq <= signals_done ||
                 (rasterizer->DrawPipeReached(pending_fences.front().position) &&
                  LabelHolds(pending_fences.front().address, pending_fences.front().data,
                             pending_fences.front().num_bytes)))) {
@@ -607,13 +637,38 @@ void Liverpool::NotePendingFences(const auto& event) {
     const auto note = [&](void* address, u64 data, u32 num_bytes) {
         BbWriteLog::NoteIntent(reinterpret_cast<u64>(address), &data, num_bytes,
                                is_eop ? BbWriteLog::FenceIntent : BbWriteLog::EosIntent);
-        pending_fences.push_back({reinterpret_cast<VAddr>(address), data, num_bytes, position});
+        pending_fences.push_back({reinterpret_cast<VAddr>(address), data, num_bytes, position, signal_seq});
         rasterizer->NotePendingGpuWrite(reinterpret_cast<VAddr>(address), num_bytes);
     };
     if constexpr (requires { event.SignalFence(note, [] {}); }) {
         event.SignalFence(note, [] {});
     } else {
         event.SignalFence(note);
+    }
+}
+
+// 0.5.1-b stall dump (bbgpu.cpp WatchStalls): what the command processor and the renderer are
+// waiting for when the game stops flipping. Read without locks: a diagnostic of a stuck state.
+void Liverpool::DumpStall() {
+    std::fprintf(stderr, "[STALL] pending fences %zu (pipe head %llu, pipe idle %d)\n",
+                 pending_fences.size(), (unsigned long long)(rasterizer ? rasterizer->DrawPipeHead() : 0),
+                 rasterizer ? int(rasterizer->DrawPipeIdle()) : -1);
+    size_t shown = 0;
+    for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) { // newest first
+        const auto& f = *it;
+        if (shown++ >= 8) {
+            break;
+        }
+        const bool holds = LabelHolds(f.address, f.data, f.num_bytes);
+        u64 now = 0;
+        std::memcpy(&now, reinterpret_cast<const void*>(f.address), std::min<u32>(f.num_bytes, 8));
+        std::fprintf(stderr, "[STALL]   fence %#llx expects %#llx (%u bytes) now %#llx %s, position %llu %s\n",
+                     (unsigned long long)f.address, (unsigned long long)f.data, f.num_bytes,
+                     (unsigned long long)now, holds ? "HOLDS" : "pending", (unsigned long long)f.position,
+                     rasterizer && rasterizer->DrawPipeReached(f.position) ? "reached" : "not reached");
+    }
+    if (rasterizer) {
+        rasterizer->DumpStall();
     }
 }
 
@@ -624,7 +679,7 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
     u64 data = 0;
     std::memcpy(&data, write_data.data, num_bytes);
     pending_fences.push_back(
-        {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
+        {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead(), ~u64{0}});
 }
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
@@ -1461,6 +1516,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
+                    } else if (RecorderFenceDeferred()) { // 0.5.1-c: see RecorderFenceDeferred
+                        NotePendingFences(*event_eop, true);
                     }
                 } else {
                     SignalEop(*event_eop);
@@ -1602,7 +1659,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (g_spin_on && waited) {
                     const u64 ns = (std::chrono::steady_clock::now() - t0).count();
                     // kind 0: drained only; 1: yielded (external writer); 2: pending value fails test
-                    SpinAdd(yielded ? 1 : 0, ns, 0);
+                    SpinAdd(yielded ? 1 : 0, ns,
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                ? wait_reg_mem->Address<VAddr>() : 0); // 0.5.1-c: by address
                     if (in_pending) {
                         SpinAdd(2, ns, 0);
                     }
@@ -2092,6 +2151,10 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    BbStats::last_submit_ns.store(
+        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()),
+        std::memory_order_relaxed);
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);

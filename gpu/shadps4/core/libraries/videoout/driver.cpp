@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_pacing.h"
+#include "bbport_threads.h"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -101,6 +103,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
 
 void VideoOutDriver::SwapThread(std::stop_token token) {
     Common::SetCurrentThreadName("bb:Present");
+    BbThreads::MakeInteractive();
     while (true) {
         std::function<void()> work;
         {
@@ -420,8 +423,11 @@ struct SpikeCounters {
 // fifa-hybrid latency stats (BB_FRAME_STATS=1): per-window sums of each stage of the flip path
 // (ns): game flip call -> host arrival -> flip packet -> queued -> flip -> submitted -> display.
 std::atomic<u64> lat_stage_ns[6], lat_stage_n;
+std::atomic<u32> flip_credits_used{0};
 std::atomic<u32> spikes_game, spikes_flip, spikes_present, spikes_display, spikes_printed,
     frames_not_displayed;
+/// On-screen interval histogram in quarter periods of a 60 Hz frame (4.17 ms, ProMotion's grid).
+std::array<std::atomic<u32>, 12> display_hist;
 /// vkQueuePresent to the screen (display timing), for the 5 s summary.
 std::atomic<u64> latency_sum_ns, latency_count, latency_max_ns;
 
@@ -583,6 +589,10 @@ private:
         spikes_flip += late_flip;
         spikes_present += late_present;
         spikes_display += late_display;
+        if (display > 0) {
+            const int slot = std::clamp(int(display / (1e3 / 240.0) + 0.5), 0, 11);
+            display_hist[slot].fetch_add(1, std::memory_order_relaxed);
+        }
         if ((late_game || late_flip || late_present || late_display) &&
             spikes_printed.fetch_add(1, std::memory_order_relaxed) < 20) {
             const auto mark = [](bool late) { return late ? "!" : ""; };
@@ -954,13 +964,22 @@ void VideoOutDriver::Flip(const Request& req) {
                     gpu_frames ? BbStats::gpu_done_gap_ns.exchange(0) / (gpu_frames * 1e6) : 0.0;
                 const double gpu_latency =
                     gpu_frames ? BbStats::gpu_latency_ns.exchange(0) / (gpu_frames * 1e6) : 0.0;
+                {
+                    // fifa-hybrid 0.5.1-b: page protection round trips (host -> game process -> host)
+                    // on the command thread, per frame of this window.
+                    static u64 last_pc, last_tp;
+                    const u64 pc = BbStats::protect_calls.load(), tp = BbStats::t_protect.load();
+                    std::printf("Protects: %.1f per frame, %.2f ms per frame on the command thread\n",
+                                double(pc - last_pc) / frames, (tp - last_tp) / (frames * 1e6));
+                    last_pc = pc; last_tp = tp;
+                }
                 std::printf("Frame timeline (ms/frame): recording thread busy %.2f (flip submit "
                             "%.2f, frames-ahead wait %.2f), waiting for packets %.2f; "
                             "vkQueueSubmit %.2f in %.1f calls; command thread waiting for "
                             "recording %.2f; flip submit -> GPU done %.2f, GPU done every %.2f; "
                             "per frame %.1f tessellated, %.1f rect/quad-list draws; hoisted "
                             "%.1f uploads, copy shader %.1f hoisted / %.1f inline / %.1f deferred (%.1f "
-                            "conflicts); arena ordering "
+                            "conflicts); dispatches hoisted %.1f, deferred %.1f (%.1f conflicts), %.1f drawn as copy passes; arena ordering "
                             "requests %.1f naming render passes, %.1f others; %.1f not hoisted (in "
                             "flight); busy-slot reuses %.1f guest memory, %.1f motion; ordering "
                             "fence waits %.1f per frame on %.1f encoders, at most %llu on one\n",
@@ -972,6 +991,10 @@ void VideoOutDriver::Flip(const Request& req) {
                             double(BbStats::inline_shader_copies.exchange(0)) / frames,
                             double(BbStats::deferred_shader_copies.exchange(0)) / frames,
                             double(BbStats::deferred_copy_conflicts.exchange(0)) / frames,
+                            double(BbStats::hoisted_dispatches.exchange(0)) / frames,
+                            double(BbStats::deferred_dispatches.exchange(0)) / frames,
+                            double(BbStats::deferred_dispatch_conflicts.exchange(0)) / frames,
+                            double(BbStats::copy_dispatch_passes.exchange(0)) / frames,
                             double(BbStats::arena_barriers.exchange(0)) / frames,
                             double(BbStats::arena_other_barriers.exchange(0)) / frames,
                             double(BbStats::hoists_in_flight.exchange(0)) / frames,
@@ -984,12 +1007,14 @@ void VideoOutDriver::Flip(const Request& req) {
             if (const u64 built = BbStats::background_builds.exchange(0)) {
                 std::printf("Pipelines: %llu built in the background (%.1f ms on the creation "
                             "threads); render path waited %.1f ms; %llu draws skipped while "
-                            "compiling\n",
+                            "compiling, %llu kept (targets not redrawn every frame)\n",
                             static_cast<unsigned long long>(built),
                             BbStats::background_build_ns.exchange(0) / 1e6,
                             BbStats::compile_wait_ns.exchange(0) / 1e6,
                             static_cast<unsigned long long>(
-                                BbStats::compile_skipped_draws.exchange(0)));
+                                BbStats::compile_skipped_draws.exchange(0)),
+                            static_cast<unsigned long long>(
+                                BbStats::compile_kept_draws.exchange(0)));
             }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
@@ -1011,6 +1036,9 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             if (BbStats::enabled) {
                 const u32 shown = spikes_printed.exchange(0);
+                if (const u32 credits = flip_credits_used.exchange(0)) {
+                    std::printf("Flip credit: %u flips completed on arrival\n", credits);
+                }
                 const u64 latency_frames = std::max<u64>(1, latency_count.exchange(0));
                 std::printf("Spikes (frames later than 1.25 periods): game %u, flip %u, present "
                             "%u, display %u%s; %u frames never displayed; present->display "
@@ -1021,6 +1049,19 @@ void VideoOutDriver::Flip(const Request& req) {
                             frames_not_displayed.exchange(0),
                             latency_sum_ns.exchange(0) / 1e6 / double(latency_frames),
                             latency_max_ns.exchange(0) / 1e6);
+                {
+                    char line[256];
+                    int at = 0;
+                    for (int i = 0; i < 12; ++i) {
+                        if (const u32 n = display_hist[i].exchange(0)) {
+                            at += std::snprintf(line + at, sizeof(line) - at, " %.1f%s:%u",
+                                                i * (1e3 / 240.0), i == 11 ? "+" : "", n);
+                        }
+                    }
+                    if (at) {
+                        std::printf("Display intervals (ms:frames):%s\n", line);
+                    }
+                }
                 spike_counters.Rebase();
                 if (const u64 n = lat_stage_n.exchange(0)) {
                     double st[6];
@@ -1125,6 +1166,15 @@ void VideoOutDriver::DrawLastFrame() {
     }, true);
 }
 
+void VideoOutDriver::DumpStall() {
+    std::unique_lock lock{main_port.port_mutex};
+    const auto& fs = main_port.flip_status;
+    std::fprintf(stderr, "[STALL] video out: flips done %llu, pending %d (gc queue %d), current buffer %d, "
+                 "requests queued %zu, swap queue %zu\n",
+                 (unsigned long long)fs.count, fs.flip_pending_num, fs.gc_queue_num, fs.current_buffer,
+                 requests.size(), swap_queue.size());
+}
+
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     {
@@ -1139,6 +1189,11 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+        BbStats::last_flip_ns.store(
+            u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()),
+            std::memory_order_relaxed);
+        BbStats::frame_serial.fetch_add(1, std::memory_order_relaxed);
         if (BbSplit::Host() && is_eop) {
             const BbGpuFlipEvent event{{BBGPU_EV_EOP_FLIP_QUEUED, sizeof(BbGpuFlipEvent)},
                                        1,
@@ -1167,6 +1222,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     const u64 flip_packet_ns = BbStats::enabled ? NowNs() : 0;
+    const u64 flip_uptime_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -1175,6 +1231,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+    }
+    if (frame) {
+        frame->flip_ns = flip_uptime_ns; // before the wait for a free frame: the queue counts
     }
 
     {
@@ -1228,6 +1287,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                                  EmulatorSettings.GetVblankFrequency());
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
+    BbThreads::MakeInteractive();
     Common::SetCurrentThreadRealtime(vblank_period);
 
     Common::AccurateTimer timer{vblank_period};
@@ -1257,10 +1317,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // frame-limit slot pacing (ProMotion shows it at the next adaptive refresh).
     const bool asap_flips = AsapFlips();
     const bool immediate_flips = frame_limit != 0 || asap_flips;
+    // BB_FLIP_CREDIT=0: every completion waits for a vblank tick (0.5.1-e behaviour).
+    const bool flip_credit_on = [] {
+        const char* env = std::getenv("BB_FLIP_CREDIT");
+        return !(env && env[0] == '0');
+    }();
+    bool flip_credit = false;
 
     while (!token.stop_requested()) {
         timer.Start();
-        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+        // fifa-hybrid: the presenter's phase lock stretches or shortens the tick by up to
+        // 0.25 ms so finished frames reach the display just ahead of their slot (PacingLock).
+        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period +
+                                   std::chrono::nanoseconds(asap_flips ? BbPacing::TickSlewNs()
+                                                                       : 0);
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -1345,6 +1415,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             if (done) {
                 CompleteFlip(done);
+                flip_credit = false;
+            } else {
+                // fifa-hybrid: this tick had no flip to complete (the game's flip reached the
+                // host just after it). The game flips right after the completion event, so
+                // holding that flip to the next tick made a 30-33 ms frame out of an 18 ms one.
+                // The unused completion is kept as a credit, one at most: the next flip
+                // completes on arrival, and the rate stays bounded by the tick rate.
+                flip_credit = flip_credit_on && main_port.flip_rate == 0;
             }
         }
         if (!immediate_flips || (main_port.flip_rate != 0 && !asap_flips)) {
@@ -1377,6 +1455,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     // flip completes at once, so no 33 ms slot is added to its chain (holding
                     // those to the flip-rate grid gave 10-13 fps when the chain missed a slot).
                     complete_now = SlowCadence();
+                    if (!complete_now && flip_credit) {
+                        complete_now = true;
+                        flip_credits_used.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    flip_credit = false;
                 }
                 Flip(request);
                 complete_now = false;

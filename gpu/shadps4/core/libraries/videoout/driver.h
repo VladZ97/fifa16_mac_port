@@ -95,6 +95,8 @@ public:
                               const BufferAttribute* attribute);
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    /// 0.5.1-b stall dump: the main port's flip status and the request queues.
+    void DumpStall();
 
     /// bbport: game side of the process split: a flip, queued end-of-pipe flip or vblank the
     /// host reported (a BbGpuRecord from the event ring, host/bbgpu_shared.h).

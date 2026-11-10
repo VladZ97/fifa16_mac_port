@@ -2,10 +2,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <filesystem>
+#include "common/elf_info.h"
 #include "common/hash.h"
+#include "common/path_util.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -26,14 +30,34 @@ namespace Serialization {
 static constexpr u32 ShaderBinaryVersion = 8u; // bbport: Metal shader profile (native Metal)
 // bbport: 9 no NoContraction in FS/CS; 10 GCN legacy/clamped float ops (0 * Inf = 0, Inf
 // clamped to FLT_MAX) and NaN/Inf tests on the bit pattern, so a stored cache is rebuilt once.
-static constexpr u32 ShaderMetaVersionBase = 11u;
+static constexpr u32 ShaderMetaVersionBase = 13u; // 0.5.1-e: FMASK emulation word per format (resolve AA)
 // bbport: cached SPIR-V depends on BB_SPIRV_PRECISE, which the keys do not record (mode 0,
 // "vertex", keeps the base version; the invariant default since 0.5.4 adds the mode).
+// 0.5.1-e: BB_FMASK and BB_MSAA change the SPIR-V (the emulated FMASK word, image sample counts)
+// without touching the keys: their values enter the version, so a run with either recompiles
+// instead of reusing shaders built without them (the sample-isolation runs of 2026-11-09 did).
+static u32 ShaderEnvBits() {
+    const char* fmask = std::getenv("BB_FMASK");
+    const char* msaa = std::getenv("BB_MSAA");
+    if (!fmask && !msaa) {
+        return 0; // the default build: no env bits (an env value never maps to 0 below)
+    }
+    u32 h = 2166136261u; // FNV-1a (a multiplicative hash collided for "00" and "55")
+    for (const char* e : {fmask, msaa}) {
+        if (e) {
+            for (const char* c = e; *c; ++c) {
+                h = (h ^ u32(u8(*c))) * 16777619u;
+            }
+            h = (h ^ 0xFFu) * 16777619u;
+        }
+    }
+    return ((h ^ (h >> 16) ^ (h >> 8)) & 0x1Eu) | 1u; // nonzero, distinct from the default
+}
 static u32 ShaderMetaVersion() {
     return ShaderMetaVersionBase | (u32(Shader::Backend::SPIRV::PreciseMode()) << 8) |
            (u32(Shader::Backend::SPIRV::LoopGuardOn()) << 16) |
            (u32(std::bit_width(Shader::Backend::SPIRV::LoopGuardLimit())) << 20) |
-           (u32(Shader::Backend::SPIRV::BoundsCheckOn()) << 26);
+           (u32(Shader::Backend::SPIRV::BoundsCheckOn()) << 26) | (ShaderEnvBits() << 27);
 }
 // bbport: 7 Metal vertex attributes; 8 depth/stencil formats only while the pass binds the
 // depth buffer (Metal-native M5; a game's stored cache is rebuilt once).
@@ -413,6 +437,34 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     return true;
 }
 
+// 0.5.1-h: the blobs of the cache shipped with the app (BB_SHADER_SEED_DIR/<serial>, written by
+// this build) copied over a cache that was just cleared for its older format. The session after
+// an update then preloads what the seed holds instead of compiling every pipeline while the
+// game draws with it (hitches, and draws left out while their pipeline compiles). Returns the
+// number of files copied; 0 without a seed, with BB_SHADER_SEED=0 or with an archived cache.
+static u32 CopySeedBlobs() {
+    const char* seed = std::getenv("BB_SHADER_SEED_DIR");
+    const char* off = std::getenv("BB_SHADER_SEED");
+    if (!seed || !seed[0] || (off && off[0] == '0') ||
+        EmulatorSettings.IsPipelineCacheArchived()) {
+        return 0;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
+    const fs::path src = fs::path{seed} / serial;
+    const fs::path dst = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
+    u32 files = 0;
+    for (const auto& entry : fs::directory_iterator(src, ec)) {
+        if (entry.is_regular_file(ec) &&
+            fs::copy_file(entry.path(), dst / entry.path().filename(),
+                          fs::copy_options::overwrite_existing, ec)) {
+            ++files;
+        }
+    }
+    return files;
+}
+
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
@@ -459,39 +511,43 @@ void PipelineCache::WarmUp() {
     u32 num_old_format{};
     const auto warm_start = std::chrono::steady_clock::now();
 
-    Storage::DataBase::Instance().ForEachBlob(
-        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
-            ++num_total_pipelines;
+    const auto preload = [&] {
+        num_pipelines = num_total_pipelines = num_old_format = 0;
+        Storage::DataBase::Instance().ForEachBlob(
+            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                ++num_total_pipelines;
 
-            Serialization::Archive ar{std::move(data)};
-            Serialization::Reader pldata{ar};
+                Serialization::Archive ar{std::move(data)};
+                Serialization::Reader pldata{ar};
 
-            u32 version{};
-            pldata.Read(version);
-            if (version != Serialization::PipelineKeyVersion) {
-                ++num_old_format;
-                return;
-            }
+                u32 version{};
+                pldata.Read(version);
+                if (version != Serialization::PipelineKeyVersion) {
+                    ++num_old_format;
+                    return;
+                }
 
-            u32 is_compute{};
-            pldata.Read(is_compute);
+                u32 is_compute{};
+                pldata.Read(is_compute);
 
-            bool result{};
-            load_old_meta = false;
-            if (is_compute) {
-                result = LoadComputePipeline(ar);
-            } else {
-                result = LoadGraphicsPipeline(ar);
-            }
+                bool result{};
+                load_old_meta = false;
+                if (is_compute) {
+                    result = LoadComputePipeline(ar);
+                } else {
+                    result = LoadGraphicsPipeline(ar);
+                }
 
-            if (result) {
-                ++num_pipelines;
-            } else if (load_old_meta) {
-                // A shader from another BB_SPIRV_PRECISE mode or build: it could never preload
-                // again, so the cache migrates like one with old pipeline keys.
-                ++num_old_format;
-            }
-        });
+                if (result) {
+                    ++num_pipelines;
+                } else if (load_old_meta) {
+                    // A shader from another BB_SPIRV_PRECISE mode or build: it could never
+                    // preload again, so the cache migrates like one with old pipeline keys.
+                    ++num_old_format;
+                }
+            });
+    };
+    preload();
 
     std::printf("Pipeline cache: preloaded %u of %u pipelines in %.0f ms\n", num_pipelines,
                 num_total_pipelines,
@@ -505,7 +561,32 @@ void PipelineCache::WarmUp() {
     if (num_old_format) {
         LOG_WARNING(Render, "{} pipelines of an older cache format: clearing the cache",
                     num_old_format);
+        const bool nothing_loaded = num_pipelines == 0;
         Storage::DataBase::Instance().Clear();
+        // 0.5.1-h: refill from the seed shipped with this build (only when nothing of the old
+        // cache was loaded: a pipeline may not be loaded twice).
+        if (nothing_loaded && CopySeedBlobs() > 0) {
+            std::vector<u8> seed_profile{};
+            Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile",
+                                               seed_profile);
+            if (seed_profile.size() == sizeof(profile) &&
+                std::memcmp(seed_profile.data(), &profile, sizeof(profile)) == 0) {
+                const auto seed_start = std::chrono::steady_clock::now();
+                preload();
+                std::printf("Pipeline cache: preloaded %u of %u pipelines of the bundled seed in "
+                            "%.0f ms\n",
+                            num_pipelines, num_total_pipelines,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - seed_start)
+                                .count());
+                if (num_old_format == 0) {
+                    Storage::DataBase::Instance().FinishPreload();
+                    return;
+                }
+            }
+            // A seed of another build or GPU: not usable either.
+            Storage::DataBase::Instance().Clear();
+        }
         // Clear removes the profile too: without it the next session would not preload.
         std::vector<u8> profile_blob(sizeof(profile));
         std::memcpy(profile_blob.data(), &profile, sizeof(profile));

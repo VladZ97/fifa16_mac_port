@@ -26,7 +26,7 @@ bool OwnedKey(const std::string& key) {
     static constexpr const char* owned[] = {
         "upscaler", "preset", "sharpen", "sharpness", "jitter", "reactive", "object_motion",
         "reactive_scale", "reactive_threshold", "reactive_max", "debug_view", "show_fps",
-        "frame_pacing",
+        "frame_pacing", "even_frames",
         "model_lod", "output_res",
         "live_resolution", "shader_compile", "renderer",
         "mouse_look", "mouse_sensitivity", "mouse_vertical", "mouse_invert_y"};
@@ -78,7 +78,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
-    } else if (key == "frame_pacing") {
+    } else if (key == "even_frames") {
         v.frame_pacing = i != 0;
     } else if (key == "mouse_look") {
         v.mouse_look = i != 0;
@@ -296,7 +296,7 @@ void Save() {
                  "# bbport settings (in-game menu: " BBPORT_MENU_KEYS " / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
-                 "debug_view=%d\nshow_fps=%d\nframe_pacing=%d\nmouse_look=%d\n"
+                 "debug_view=%d\nshow_fps=%d\neven_frames=%d\nmouse_look=%d\n"
                  "mouse_sensitivity=%.2f\nmouse_vertical=%.2f\nmouse_invert_y=%d\n",
                  UpscalerName(saved_upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),

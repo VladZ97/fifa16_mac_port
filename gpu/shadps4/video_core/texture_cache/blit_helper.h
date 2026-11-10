@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -39,6 +41,13 @@ public:
     /// an MSAA source copies sample by sample, a 1-sample source fills every sample.
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, void* source, void* dest);
+
+    /// 0.5.1-c: a full-screen copy dispatch (Shader::InfoPersistent::CopyDispatch) as a render
+    /// pass over `dest` (a view texture, its level 0): each pixel samples `source` with `sampler`
+    /// at (pixel + 0.5) * scale, optionally remapped from [0, 1] to [-1, 1], then swizzled
+    /// (4-bit codes per output component: 0-3 sample.xyzw, 4 zero, 5 one).
+    void CopyDispatch(u32 width, u32 height, void* dest, void* source, void* sampler,
+                      std::array<float, 2> scale, bool remap, u32 swizzle);
 
 private:
     struct PipelineKey {

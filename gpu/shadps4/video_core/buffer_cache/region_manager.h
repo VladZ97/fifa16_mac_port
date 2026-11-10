@@ -234,6 +234,20 @@ public:
         UpdateProtection<false, true>();
     }
 
+    /// fifa-hybrid: the reverse of SetHotRead (the page holds a GPU write that is not a steady
+    /// rewrite: it is read-protected again until that write is written back).
+    void ClearHotRead(u64 offset, size_t size) {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            size_t(NUM_PAGES_PER_REGION));
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+        hot_read.UnsetRange(start_page, end_page);
+        UpdateProtection<true, true>();
+    }
+
 private:
 
     // bbport: pages the guest writes again and again (per-frame constants, skinning output)

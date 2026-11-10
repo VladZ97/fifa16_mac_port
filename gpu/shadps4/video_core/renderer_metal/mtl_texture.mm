@@ -238,6 +238,18 @@ u32 TextureSampleCount(void* texture) {
     return u32(((__bridge id<MTLTexture>)texture).sampleCount);
 }
 
+u32 TextureWidth(void* texture) {
+    return u32(((__bridge id<MTLTexture>)texture).width);
+}
+
+u32 TextureHeight(void* texture) {
+    return u32(((__bridge id<MTLTexture>)texture).height);
+}
+
+bool TextureIs2D(void* texture) {
+    return ((__bridge id<MTLTexture>)texture).textureType == MTLTextureType2D;
+}
+
 bool SupportsSampleCount(Device& device, u32 samples) {
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)device.NativeDevice();
     return [mtl_device supportsTextureSampleCount:samples];

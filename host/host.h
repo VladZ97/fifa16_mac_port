@@ -14,6 +14,9 @@ extern BbGpuShared *g_shared;
 
 /* Guest view mirror (host_runtime.c). */
 void host_runtime_init(mach_port_t guest_entry, uint64_t guest_entry_size);
+/* 0.5.1-c: takes the game's task port (task_for_pid) so the host protects the game's pages itself;
+ * returns 1 when it did, 0 when protection stays relayed through the game's thread. */
+int host_protect_direct_init(int game_pid);
 void host_view_apply(uint32_t op, uint32_t prot, uint64_t address, uint64_t size, uint64_t phys);
 int host_view_covered(uint64_t start, uint64_t end);
 void host_view_stats(uint64_t *count, uint64_t *bytes, uint64_t *applied, uint64_t *failed);

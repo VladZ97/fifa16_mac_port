@@ -20,6 +20,7 @@ struct Target {
     VAddr address{};
     vk::Format format{};
     u32 width{}, height{};
+    u32 levels{}, samples{}; ///< bbport(fifa): mip levels and samples, for filtering diagnosis
     bool operator==(const Target&) const = default;
 };
 
@@ -60,14 +61,16 @@ std::array<std::atomic<VAddr>, 16> display_list{};
 std::atomic<u32> display_count{0};
 
 Target ToTarget(const VideoCore::ImageInfo& info) {
-    return {info.guest_address, info.pixel_format, info.size.width, info.size.height};
+    return {info.guest_address, info.pixel_format, info.size.width, info.size.height,
+            u32(info.resources.levels), u32(info.num_samples)};
 }
 
 std::string Describe(const Target& t) {
     if (!t.address) {
         return "-";
     }
-    return std::format("{:#x} {} {}x{}", t.address, vk::to_string(t.format), t.width, t.height);
+    return std::format("{:#x} {} {}x{} mips {} samples {}", t.address, vk::to_string(t.format),
+                       t.width, t.height, t.levels, t.samples);
 }
 
 void AddSampled(Entry& entry) {
@@ -212,7 +215,30 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     // Frame boundaries in the command stream: the pass that writes a display buffer.
     const bool new_pass = !(pass_open && !entries.empty() && !entries.back().compute &&
                             entries.back().colors == targets);
-    if (display && new_pass) {
+    // bbport(fifa): FIFA 16 never opens a pass on a registered display buffer (its last pass
+    // goes to an intermediate that the flip presents), so an armed capture never started.
+    // After three flips without such a pass, the flips themselves are the frame boundaries.
+    static u64 armed_flip = ~0ull;
+    static u64 record_flip = 0;
+    static bool flip_bounds = false;
+    const u64 flip_now = flips.load(std::memory_order_acquire);
+    const u32 st = state.load(std::memory_order_relaxed);
+    bool boundary = display && new_pass;
+    if (boundary) {
+        flip_bounds = false;
+    } else if (st == Armed) {
+        if (armed_flip == ~0ull) {
+            armed_flip = flip_now;
+        } else if (flip_now >= armed_flip + 3) {
+            boundary = true;
+            flip_bounds = true;
+        }
+    } else if (st == Recording && flip_bounds && flip_now != record_flip) {
+        boundary = true;
+    }
+    if (boundary) {
+        armed_flip = ~0ull;
+        record_flip = flip_now;
         if (state.load(std::memory_order_relaxed) == Recording) {
             Write(last_presented.load(std::memory_order_relaxed));
             written.fetch_add(1, std::memory_order_release);
@@ -295,7 +321,9 @@ void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* d
 }
 
 void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {
-    Trace(std::format("T {:#x} {} {}", info.guest_address, info.guest_size, storage ? 1 : 0));
+    Trace(std::format("T {:#x} {} {} {}x{} mips {}", info.guest_address, info.guest_size,
+                      storage ? 1 : 0, info.size.width, info.size.height,
+                      u32(info.resources.levels)));
     if (pending_sampled.size() < 64) {
         pending_sampled.emplace_back(ToTarget(info), storage);
     }

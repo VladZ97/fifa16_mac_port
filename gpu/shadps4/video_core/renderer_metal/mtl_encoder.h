@@ -59,6 +59,8 @@ struct ColorAttachment {
     void* texture{}; ///< id<MTLTexture>; null: slot unused
     u32 level{}, slice{};
     bool clear{};
+    /// The pass writes every pixel: the old contents are not loaded (MTLLoadActionDontCare).
+    bool discard{};
     std::array<double, 4> clear_color{};
     u32 depth_plane{};         ///< 3D targets
     void* resolve_texture{};   ///< MSAA resolve target (StoreAndMultisampleResolve)

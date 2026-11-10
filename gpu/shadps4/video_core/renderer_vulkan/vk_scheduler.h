@@ -683,6 +683,14 @@ public:
     /// copies within one).
     /// The upload encoder's encoders are chained; the arena accesses after a barrier on the
     /// uploads wait for them (Runtime::HoistCopy marks their ranges).
+    /// fifa-hybrid: records into the upload (ahead) encoder under its lock: a small guest
+    /// dispatch hoisted ahead of the submission (Rasterizer::TryHoistDispatch).
+    template <typename F>
+    void RecordAhead(F&& f) {
+        std::scoped_lock lk{upload_mutex};
+        upload_open = true;
+        f(upload_encoder);
+    }
     void RecordHoistedCopy(Metal::BufferRef src, Metal::BufferRef dst,
                            std::span<const VideoCore::BufferCopy> copies, bool ordered = false);
 
@@ -792,6 +800,14 @@ public:
     void SetOrderCommand(u64 command) noexcept {
         order_command = command;
     }
+    /// 0.5.1-b stall dump: the recorder queue and the deferred signals.
+    void DumpStall() {
+        std::fprintf(stderr, "[STALL] recorder: queued chunks %zu, busy %d, sleeping %d; deferred signals issued %llu done %llu; rendering %d; tick %llu\n",
+                     queued_chunks.load(std::memory_order_relaxed), int(recorder_busy), int(recorder_sleeping),
+                     (unsigned long long)deferred_signals_issued.load(std::memory_order_relaxed),
+                     (unsigned long long)deferred_signals_done->load(std::memory_order_relaxed),
+                     int(IsRendering()), (unsigned long long)CurrentTick());
+    }
 
 private:
     u64 order_command{};
@@ -873,6 +889,13 @@ public:
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
     void WaitDeferredSignals();
+    /// 0.5.1-c: progress counters of those signals (liverpool.cpp prunes its pending fences).
+    [[nodiscard]] u64 DeferredSignalsIssued() const noexcept {
+        return deferred_signals_issued.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] u64 DeferredSignalsDone() const noexcept {
+        return deferred_signals_done->load(std::memory_order_acquire);
+    }
 
     /// Whether a render pass is open.
     [[nodiscard]] bool IsRendering() const {

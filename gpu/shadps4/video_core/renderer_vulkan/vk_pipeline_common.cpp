@@ -137,6 +137,7 @@ struct Pool {
             ++running;
             lk.unlock();
             job();
+            BbStats::pipeline_jobs_done.fetch_add(1, std::memory_order_relaxed);
             lk.lock();
             --running;
             if (jobs.empty() && running == 0) {
@@ -166,6 +167,7 @@ bool Enabled() {
 
 void Submit(std::function<void()> job) {
     auto& pool = GetPool();
+    BbStats::pipeline_jobs_submitted.fetch_add(1, std::memory_order_relaxed);
     {
         std::scoped_lock lk{pool.mutex};
         pool.jobs.push_back(std::move(job));

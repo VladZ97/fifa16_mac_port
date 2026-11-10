@@ -13,6 +13,7 @@
 #include <mach/mach_vm.h>
 #include <pthread.h>
 #include <tuple>
+#include "bbport_gametrace.h"
 #include "bbport_cpu.h"
 #include <type_traits>
 #include <vector>
@@ -646,6 +647,9 @@ static s32 RemoteSubmit(u32 count, const u32* dcb_gpu_addrs[], const u32* dcb_si
                 std::memcpy(shared->game_busiest_name, name, sizeof(name));
                 __atomic_store_n(&shared->game_busiest_ns, busiest, __ATOMIC_RELAXED);
                 __atomic_store_n(&shared->game_frame_cpu_ns, total, __ATOMIC_RELEASE);
+                if (BbGameTrace::Enabled()) {
+                    BbGameTrace::OnFlip(main_cpu, runtime_thread_cpu_ns(1), total, busiest, name);
+                }
             }
         }
         for (u32 i = 0; i < n; ++i) {

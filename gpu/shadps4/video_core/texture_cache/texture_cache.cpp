@@ -10,6 +10,7 @@
 #include <set>
 #include <string_view>
 #include <xxhash.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
@@ -26,16 +27,61 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_metal/mtl_device.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h" // fifa-hybrid: deferred dispatches
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include <vulkan/vulkan_format_traits.hpp>
+
+namespace Vulkan {
+extern std::atomic<bool> g_bb_diag_window; // vk_rasterizer.cpp: BB_DRAWLOG_TRIGGER window
+}
+using Vulkan::g_bb_diag_window;
 
 namespace VideoCore {
 
 std::set<VAddr> g_bb_dump_volume_addrs; // fifa-hybrid: volumes to dump (BB_TONE_LOG fills it)
 
+// fifa-hybrid diagnostics (BB_BCSEQ=1): the images of the GPU texture compression pipeline.
+static bool BbSeqOn() {
+    static const bool v = std::getenv("BB_BCSEQ") != nullptr;
+    return v;
+}
+static bool BbSeqImg(const Image& image) {
+    return BbSeqOn() && (image.info.props.is_block ||
+                         image.info.pixel_format == vk::Format::eR16G16B16A16Uint ||
+                         image.info.pixel_format == vk::Format::eR32G32B32A32Uint);
+}
+static void BbSeqLine(const char* what, u32 id, const Image& image) {
+    std::fprintf(stderr, "[SEQ] %s id %u %#llx %s %ux%u lv%u fl %#x serial %llu\n", what, id,
+                 (unsigned long long)image.info.guest_address,
+                 vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                 image.info.size.height, image.info.resources.levels, u32(image.flags),
+                 (unsigned long long)image.write_serial);
+}
+// BB_BCSEQ=1: a download that lands in guest memory after a newer download of the same address.
+static std::atomic<u64> g_bb_dl_seq{0};
+static std::mutex g_bb_land_mutex;
+static std::unordered_map<u64, std::pair<u64, u64>> g_bb_landed;
+static std::unordered_map<u64, u64> g_bb_work_seq;
+static void BbNoteLanding(const char* kind, u64 addr, u64 size, u64 seq) {
+    if (!BbSeqOn() || seq == 0) {
+        return;
+    }
+    std::scoped_lock lk{g_bb_land_mutex};
+    auto& e = g_bb_landed[addr];
+    if (e.first > seq) {
+        std::fprintf(stderr, "[SEQ] stale-land %s %#llx size %#llx seq %llu after seq %llu size %#llx\n",
+                     kind, (unsigned long long)addr, (unsigned long long)size,
+                     (unsigned long long)seq, (unsigned long long)e.first,
+                     (unsigned long long)e.second);
+        return;
+    }
+    e = {seq, size};
+}
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
@@ -77,6 +123,216 @@ TextureCache::~TextureCache() = default;
 static std::atomic<u64> g_odt_pending{0}, g_odt_inflight{0}, g_odt_done{0}, g_odt_direct_n{0},
     g_odt_direct_us{0}, g_odt_wait_n{0}, g_odt_wait_us{0};
 
+// 0.5.1-e: tail release (see texture_cache.h ReleaseOndemandTails).
+static std::atomic<u64> g_tail_release{0}, g_tail_reprotect{0}, g_tail_land{0}, g_tail_kept{0},
+    g_tail_skip{0};
+
+static bool OndemandTailEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_ODW_TAIL");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool TextureCache::ReleaseOndemandTails(VAddr addr, u64 size) {
+    if (!OndemandTailEnabled() || size == 0) {
+        return false;
+    }
+    constexpr VAddr PageSize = PageManager::PM_PAGE_SIZE_PUBLIC;
+    const VAddr page = PageManager::GetPageAddr(addr);
+    if (PageManager::GetPageAddr(addr + size - 1) != page) {
+        return false;
+    }
+    bool any = false;
+    std::unique_lock lk{download_images_mutex};
+    for (auto& [index, range] : ondemand_ranges) {
+        const VAddr begin = range.first, end = range.first + range.second;
+        if (range.second == 0 || !ondemand_images.contains(ImageId{index})) {
+            continue;
+        }
+        // The write lies wholly outside the image's bytes, on the image's last or first page, and
+        // the image has other pages (those stay watched).
+        int which;
+        VAddr edge_addr;
+        u32 edge_size;
+        if (addr >= end && PageManager::GetPageAddr(end - 1) == page && begin < page) {
+            which = 1;
+            edge_addr = page;
+            edge_size = u32(end - page);
+        } else if (addr + size <= begin && PageManager::GetPageAddr(begin) == page &&
+                   end > page + PageSize) {
+            which = 0;
+            edge_addr = begin;
+            edge_size = u32(page + PageSize - begin);
+        } else {
+            if (static const bool fstats = std::getenv("BB_FAULT_STATS") != nullptr; fstats) {
+                static std::atomic<int> lines{0};
+                if (PageManager::GetPageAddr(begin) <= page && page < PageManager::GetNextPageAddr(end - 1) &&
+                    lines++ < 12) {
+                    std::fprintf(stderr, "[ODTAIL] no release: write %#llx+%llu beside image range %#llx..%#llx\n",
+                                 (unsigned long long)addr, (unsigned long long)size,
+                                 (unsigned long long)begin, (unsigned long long)end);
+                }
+            }
+            continue;
+        }
+        {
+            std::scoped_lock tl{ondemand_tail_mutex};
+            OndemandEdge& edge = ondemand_tails[index].edge[which];
+            if (!edge.released) {
+                ondemand_tails_released.fetch_add(1, std::memory_order_relaxed);
+            }
+            edge.addr = edge_addr;
+            edge.size = edge_size;
+            edge.released = true;
+            edge.snapshot.resize(edge_size);
+            Core::Memory::Instance()->CopySparseMemory(edge_addr, edge.snapshot.data(), edge_size);
+        }
+        ProtectForCpuRead(edge_addr, edge_size, false, range.droppable);
+        if (which == 1) {
+            range.second = page - begin;
+        } else {
+            range.first = page + PageSize;
+            range.second = end - range.first;
+        }
+        tail_downloads.insert(ImageId{index});
+        g_tail_release.fetch_add(1, std::memory_order_relaxed);
+        if (static const bool fstats = std::getenv("BB_FAULT_STATS") != nullptr; fstats) {
+            static std::atomic<int> lines{0};
+            if (lines++ < 12) {
+                std::fprintf(stderr, "[ODTAIL] release %s: write %#llx, image bytes %#llx+%u\n",
+                             which ? "tail" : "head", (unsigned long long)addr,
+                             (unsigned long long)edge_addr, edge_size);
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
+void TextureCache::ReprotectOndemandTail(u32 index) {
+    if (ondemand_tails_released.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::array<std::pair<VAddr, u32>, 2> edges{};
+    {
+        std::scoped_lock tl{ondemand_tail_mutex};
+        const auto it = ondemand_tails.find(index);
+        if (it == ondemand_tails.end()) {
+            return;
+        }
+        for (int which = 0; which < 2; ++which) {
+            OndemandEdge& edge = it->second.edge[which];
+            if (edge.released) {
+                edge.released = false;
+                ondemand_tails_released.fetch_sub(1, std::memory_order_relaxed);
+                edges[which] = {edge.addr, edge.size};
+            }
+        }
+    }
+    const auto it = ondemand_ranges.find(index);
+    if (it == ondemand_ranges.end()) {
+        return;
+    }
+    if (edges[0].second != 0) {
+        it->second.second += it->second.first - edges[0].first;
+        it->second.first = edges[0].first;
+        ProtectForCpuRead(edges[0].first, edges[0].second, true, it->second.droppable);
+        g_tail_reprotect.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (edges[1].second != 0) {
+        it->second.second = edges[1].first + edges[1].second - it->second.first;
+        ProtectForCpuRead(edges[1].first, edges[1].second, true, it->second.droppable);
+        g_tail_reprotect.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TextureCache::EraseOndemandTail(u32 index) {
+    std::scoped_lock tl{ondemand_tail_mutex};
+    const auto it = ondemand_tails.find(index);
+    if (it == ondemand_tails.end()) {
+        return;
+    }
+    for (const OndemandEdge& edge : it->second.edge) {
+        if (edge.released) {
+            ondemand_tails_released.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    ondemand_tails.erase(it);
+}
+
+bool TextureCache::OndemandTailReleased(u32 index) {
+    if (ondemand_tails_released.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::scoped_lock tl{ondemand_tail_mutex};
+    const auto it = ondemand_tails.find(index);
+    return it != ondemand_tails.end() && (it->second.edge[0].released || it->second.edge[1].released);
+}
+
+bool TextureCache::OndemandTailHit(VAddr addr, u64 size) {
+    if (ondemand_tails_released.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::scoped_lock tl{ondemand_tail_mutex};
+    for (const auto& [index, tail] : ondemand_tails) {
+        for (const OndemandEdge& edge : tail.edge) {
+            if (edge.released && addr < edge.addr + edge.size && edge.addr < addr + size) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool TextureCache::WriteBackImage(u32 index, VAddr addr, const u8* data, u64 size,
+                                  bool only_if_pending) {
+    auto* memory = Core::Memory::Instance();
+    std::unique_lock tl{ondemand_tail_mutex};
+    const auto it = ondemand_tails.find(index);
+    if (it == ondemand_tails.end()) {
+        tl.unlock();
+        if (only_if_pending) {
+            // The image left the pending set since (a CPU fault downloaded or dropped it): its
+            // guest bytes are the CPU's now.
+            g_tail_skip.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        memory->TryWriteBacking(std::bit_cast<u8*>(addr), data, size);
+        return true;
+    }
+    // The bytes on a released page are written only while guest memory still holds what was
+    // there at release time (or what the last landing wrote); the rest unconditionally.
+    VAddr lo = addr, hi = addr + size;
+    const auto guarded = [&](OndemandEdge& edge, VAddr seg_lo, VAddr seg_hi) {
+        const u64 n = seg_hi - seg_lo;
+        std::array<u8, 4096> current;
+        memory->CopySparseMemory(seg_lo, current.data(), n);
+        if (std::memcmp(current.data(), edge.snapshot.data(), n) == 0) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(seg_lo), data + (seg_lo - addr), n);
+            std::memcpy(edge.snapshot.data(), data + (seg_lo - addr), n);
+            g_tail_land.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_tail_kept.fetch_add(1, std::memory_order_relaxed); // the CPU wrote there: kept
+        }
+    };
+    OndemandEdge& head = it->second.edge[0];
+    if (head.released && head.addr == addr && head.size < size && head.size <= 4096 &&
+        head.size <= head.snapshot.size()) {
+        guarded(head, addr, addr + head.size);
+        lo = addr + head.size;
+    }
+    OndemandEdge& tail = it->second.edge[1];
+    if (tail.released && tail.addr > lo && tail.addr < hi && hi - tail.addr <= 4096 &&
+        hi - tail.addr <= tail.snapshot.size()) {
+        guarded(tail, tail.addr, hi);
+        hi = tail.addr;
+    }
+    memory->TryWriteBacking(std::bit_cast<u8*>(lo), data + (lo - addr), hi - lo);
+    return true;
+}
+
 void TextureCache::ProcessDownloadImages() {
     if (static const char* pe = std::getenv("BB_PROBE_ADDR"); pe) {
         static int pn = 0;
@@ -103,6 +359,14 @@ void TextureCache::ProcessDownloadImages() {
         return env && env[0] == '1';
     }();
     std::unique_lock lk{download_images_mutex};
+    // 0.5.1-e: images whose tail page was released by a page-sharing CPU write.
+    for (const ImageId image_id : tail_downloads) {
+        if (!download_images.contains(image_id) && ondemand_images.contains(image_id) &&
+            slot_images.is_allocated(image_id)) {
+            DownloadImageMemory(image_id, false, nullptr, true);
+        }
+    }
+    tail_downloads.clear();
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, sync);
     }
@@ -204,6 +468,7 @@ void TextureCache::QueueReadback(ImageId image_id, Image& image) {
     // write order, so the latest write wins; re-queues of a pending image move it last.
     ondemand_seq[image_id.index] = ondemand_seq_next++;
     if (!ondemand_images.insert(image_id).second) {
+        ReprotectOndemandTail(image_id.index); // 0.5.1-e: a released tail is watched again
         return; // already protected and pending
     }
     static const bool vb_log = std::getenv("BB_VB_LOG") != nullptr;
@@ -247,30 +512,63 @@ void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect, bool
     auto& refs = droppable ? ondemand_page_refs : ondemand_page_refs_plain;
     const VAddr first = PageManager::GetPageAddr(addr);
     const VAddr last = PageManager::GetNextPageAddr(addr + size - 1);
-    for (VAddr page = first; page < last; page += PageManager::PM_PAGE_SIZE_PUBLIC) {
+    // 0.5.1-b: the pages whose count crosses zero are (un)watched in contiguous runs, one page
+    // manager call (one protection round trip to the game process) per run instead of per page.
+    const auto apply = [&](VAddr run_begin, VAddr run_end) {
+        if (run_begin == run_end) {
+            return;
+        }
+        const u64 bytes = run_end - run_begin;
         if (protect) {
-            if (refs[page]++ == 0) {
-                if (droppable) {
-                    tracker.UpdateReadWatchers<true, true>(page, PageManager::PM_PAGE_SIZE_PUBLIC);
-                } else {
-                    tracker.UpdateReadWatchers<true, false>(page, PageManager::PM_PAGE_SIZE_PUBLIC);
+            if (droppable) {
+                tracker.UpdateReadWatchers<true, true>(run_begin, bytes);
+            } else {
+                tracker.UpdateReadWatchers<true, false>(run_begin, bytes);
+            }
+        } else if (droppable) {
+            tracker.UpdateReadWatchers<false, true>(run_begin, bytes);
+        } else {
+            tracker.UpdateReadWatchers<false, false>(run_begin, bytes);
+        }
+    };
+    VAddr run_begin = 0, run_end = 0;
+    for (VAddr page = first; page < last; page += PageManager::PM_PAGE_SIZE_PUBLIC) {
+        bool edge = false;
+        if (protect) {
+            edge = refs[page]++ == 0;
+            if (edge) { // 0.5.1-c: HasOndemandIn's chunk pre-check
+                const u64 chunk = page >> OndemandChunkShift;
+                if (chunk < OndemandChunks) {
+                    ondemand_chunks[chunk >> 6].fetch_or(u64{1} << (chunk & 63),
+                                                         std::memory_order_relaxed);
                 }
             }
         } else {
             auto it = refs.find(page);
-            if (it == refs.end()) {
-                continue;
-            }
-            if (--it->second == 0) {
+            if (it != refs.end() && --it->second == 0) {
                 refs.erase(it);
-                if (droppable) {
-                    tracker.UpdateReadWatchers<false, true>(page, PageManager::PM_PAGE_SIZE_PUBLIC);
-                } else {
-                    tracker.UpdateReadWatchers<false, false>(page, PageManager::PM_PAGE_SIZE_PUBLIC);
-                }
+                edge = true;
             }
         }
+        if (!edge) {
+            continue;
+        }
+        if (run_end == page) {
+            run_end = page + PageManager::PM_PAGE_SIZE_PUBLIC;
+        } else {
+            apply(run_begin, run_end);
+            run_begin = page;
+            run_end = page + PageManager::PM_PAGE_SIZE_PUBLIC;
+        }
     }
+    apply(run_begin, run_end);
+    const bool any = !ondemand_page_refs.empty() || !ondemand_page_refs_plain.empty();
+    if (!any) {
+        for (auto& word : ondemand_chunks) {
+            word.store(0, std::memory_order_relaxed);
+        }
+    }
+    ondemand_any.store(any, std::memory_order_release);
 }
 
 void TextureCache::FinishCpuReadWork(CpuReadWork& work) {
@@ -281,6 +579,21 @@ void TextureCache::FinishCpuReadWork(CpuReadWork& work) {
         g_odt_wait_us.fetch_add(u64(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
                                 std::memory_order_relaxed);
         for (const auto& copy : work.copies) {
+            if (BbSeqOn()) {
+                u64 seq = 0;
+                {
+                    std::scoped_lock lk{g_bb_land_mutex};
+                    if (const auto it = g_bb_work_seq.find(copy.addr); it != g_bb_work_seq.end()) {
+                        seq = it->second;
+                        g_bb_work_seq.erase(it);
+                    }
+                }
+                BbNoteLanding("work", copy.addr, copy.size, seq); NoteLanding(copy.addr, copy.size);
+            }
+            if (BbSeqOn() && copy.size >= 0x8000) {
+                std::fprintf(stderr, "[SEQ] work-land %#llx size %#llx\n",
+                             (unsigned long long)copy.addr, (unsigned long long)copy.size);
+            }
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(copy.addr), copy.download.mapped,
                                                       copy.size);
             runtime.GetStagingPool().FreeDeferred(copy.download);
@@ -338,6 +651,7 @@ void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_wr
         for (const auto& [id, _] : ids) {
             ondemand_images.erase(id);
             ondemand_seq.erase(id.index);
+            EraseOndemandTail(id.index);
         }
     }
     static const bool log_images = std::getenv("BB_LOG_IMAGES") != nullptr;
@@ -428,6 +742,10 @@ void TextureCache::PrintOndemandWriteCounts() {
         line += fmt::format(" {}x{}", rows[i].second, rows[i].first);
     }
     std::printf("%s\n", line.c_str());
+    std::printf("[ODTAIL] released %llu reprotected %llu | landings: tail written %llu, tail kept %llu, skipped %llu\n",
+                (unsigned long long)g_tail_release.exchange(0), (unsigned long long)g_tail_reprotect.exchange(0),
+                (unsigned long long)g_tail_land.exchange(0), (unsigned long long)g_tail_kept.exchange(0),
+                (unsigned long long)g_tail_skip.exchange(0));
     std::printf("[ODT] last write pending %llu in-flight %llu done %llu | direct %llu (%.1f ms) ordered wait %llu (%.1f ms)\n",
                 (unsigned long long)g_odt_pending.exchange(0), (unsigned long long)g_odt_inflight.exchange(0),
                 (unsigned long long)g_odt_done.exchange(0), (unsigned long long)g_odt_direct_n.exchange(0),
@@ -493,8 +811,27 @@ bool TextureCache::HasOndemandOverlapping(VAddr addr, u64 size) {
 }
 
 bool TextureCache::HasOndemandIn(VAddr addr, u64 size) {
+    // 0.5.1-b: no on-demand image at all (most of a match) answers without the mutex; the
+    // command thread asked this under every buffer bind.
+    if (size == 0 || !ondemand_any.load(std::memory_order_acquire)) {
+        return false;
+    }
+    { // 0.5.1-c: no on-demand page in the 4 MiB chunks the range touches
+        const u64 first_chunk = addr >> OndemandChunkShift;
+        const u64 last_chunk = (addr + size - 1) >> OndemandChunkShift;
+        if (last_chunk < OndemandChunks) {
+            bool hit = false;
+            for (u64 chunk = first_chunk; chunk <= last_chunk && !hit; ++chunk) {
+                hit = (ondemand_chunks[chunk >> 6].load(std::memory_order_relaxed) &
+                       (u64{1} << (chunk & 63))) != 0;
+            }
+            if (!hit) {
+                return false;
+            }
+        }
+    }
     std::unique_lock lk{download_images_mutex};
-    if ((ondemand_page_refs.empty() && ondemand_page_refs_plain.empty()) || size == 0) {
+    if (ondemand_page_refs.empty() && ondemand_page_refs_plain.empty()) {
         return false;
     }
     const VAddr first = PageManager::GetPageAddr(addr);
@@ -549,6 +886,7 @@ void TextureCache::ForgetOndemandImage(ImageId image_id) {
     }
     if (ondemand_images.erase(image_id)) {
         ondemand_seq.erase(image_id.index);
+        EraseOndemandTail(image_id.index);
         if (auto it = ondemand_ranges.find(image_id.index); it != ondemand_ranges.end()) {
             ProtectForCpuRead(it->second.first, it->second.second, false, it->second.droppable);
             ondemand_ranges.erase(it);
@@ -556,12 +894,34 @@ void TextureCache::ForgetOndemandImage(ImageId image_id) {
     }
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork* work) {
+void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork* work,
+                                       bool only_if_pending) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    if (g_bb_diag_window.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[DLD] image %#llx %ux%u fmt %s sync=%d pending_only=%d\n",
+                     (unsigned long long)image.info.guest_address, image.info.size.width,
+                     image.info.size.height, vk::to_string(image.info.pixel_format).c_str(), int(sync),
+                     int(only_if_pending));
+    }
+    if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }()) && (image.info.props.is_block || image.info.size.width <= 1024)) {
+        std::fprintf(stderr, "[SEQ] download %#llx %s %ux%u fl %#x sync=%d newer=%d id %u lv%u serial %llu landed %llu lastw %llu tick %llu work=%d\n",
+                     (unsigned long long)image.info.guest_address,
+                     vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                     image.info.size.height, u32(image.flags), int(sync), int(image.shadow_newer),
+                     image_id.index, image.info.resources.levels,
+                     (unsigned long long)image.write_serial,
+                     (unsigned long long)(image.prefetch_landed ? image.prefetch_landed->load() : 0),
+                     (unsigned long long)image.last_write_tick,
+                     (unsigned long long)scheduler.CurrentTick(), int(work != nullptr));
+    }
     SyncBlockShadow(image); // the newest blocks may sit in the one-texel-per-block shadow
+    if (auto* r = liverpool ? liverpool->GetRasterizer() : nullptr; r && r->HasDeferredDispatches() &&
+        (r->NoteDeferredConflictSite("image-download"), r->DeferredDispatchTouchesImage(image, false))) {
+        r->FlushDeferredDispatches(); // fifa-hybrid: a deferred dispatch may have written it
+    }
     // fifa-hybrid: every mip through the tile manager (tiled images are re-tiled on the GPU).
     const auto image_addr = image.info.guest_address;
     const auto image_mips = image.info.resources.levels;
@@ -602,6 +962,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork*
     }
     auto download =
         runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, !sync || work);
+    const u64 dl_seq = BbSeqOn() ? g_bb_dl_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     // fifa-hybrid: a CPU fault's download of a linear colour image goes through the device's
     // read-back queue: it waits on the GPU for the ticks committed so far (BB_RB_DIRECT=2, the
     // default; 1 waits only for the image's last recorded write) instead of flushing the pending
@@ -630,6 +991,14 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork*
                                                           download.mapped, copy_size);
             }
             runtime.GetStagingPool().FreeDeferred(download);
+            if (ok) {
+                BbNoteLanding("direct", image_addr, copy_size, dl_seq); NoteLanding(image_addr, copy_size);
+            }
+            if (BbSeqImg(image)) {
+                std::fprintf(stderr, "[SEQ] direct-land %#llx size %#x ok=%d wait_tick %llu\n",
+                             (unsigned long long)image_addr, copy_size, int(ok),
+                             (unsigned long long)wait_tick);
+            }
             g_odt_direct_n.fetch_add(1, std::memory_order_relaxed);
             g_odt_direct_us.fetch_add(u64(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()),
                                       std::memory_order_relaxed);
@@ -642,21 +1011,38 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, CpuReadWork*
     tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
     if (work) {
         work->copies.push_back({image_addr, copy_size, download});
+        if (dl_seq) {
+            std::scoped_lock lk{g_bb_land_mutex};
+            g_bb_work_seq[image_addr] = dl_seq;
+        }
     } else if (sync) {
         scheduler.Finish();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
                                                   copy_size);
+        BbNoteLanding("sync", image_addr, copy_size, dl_seq); NoteLanding(image_addr, copy_size);
     } else {
         if (!image.prefetch_landed) {
             image.prefetch_landed = std::make_shared<std::atomic<u64>>(0);
         }
         scheduler.DeferPriorityOperation([this, image_addr, download, copy_size,
                                           landed = image.prefetch_landed,
-                                          serial = image.write_serial] {
-            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
-                                                      download.mapped, copy_size);
+                                          serial = image.write_serial,
+                                          index = image_id.index, only_if_pending, dl_seq] {
+            // 0.5.1-e: a released tail page is written only while the CPU left it alone.
+            const bool written =
+                WriteBackImage(index, image_addr, download.mapped, copy_size, only_if_pending);
+            if (written) {
+                BbNoteLanding("async", image_addr, copy_size, dl_seq); NoteLanding(image_addr, copy_size);
+            }
+            if (BbSeqOn() && copy_size >= 0x8000) {
+                std::fprintf(stderr, "[SEQ] wb-land id %u %#llx size %#x serial %llu written=%d\n",
+                             index, (unsigned long long)image_addr, copy_size,
+                             (unsigned long long)serial, int(written));
+            }
             runtime.GetStagingPool().FreeDeferred(download);
-            landed->store(serial, std::memory_order_release);
+            if (written) {
+                landed->store(serial, std::memory_order_release);
+            }
         });
     }
 }
@@ -697,6 +1083,7 @@ bool TextureCache::ResolvePrefetchedOndemand(VAddr addr, size_t size) {
     for (const ImageId id : ids) {
         ondemand_images.erase(id);
         ondemand_seq.erase(id.index);
+        EraseOndemandTail(id.index);
         if (auto it = ondemand_ranges.find(id.index); it != ondemand_ranges.end()) {
             ProtectForCpuRead(it->second.first, it->second.second, false, it->second.droppable);
             ondemand_ranges.erase(it);
@@ -1047,9 +1434,78 @@ static inline u64 MaybeDirtyHash(const Image& image) {
     return XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
 }
 
+// 0.5.1-g: images whose only source is guest memory (never written by the GPU and not paired
+// with a GPU-compressed shadow). Only these are re-read after an unseen write.
+static inline bool BbCpuOnly(const Image& image) {
+    return False(image.flags & ImageFlagBits::GpuModified) && !image.block_shadow &&
+           !image.shadow_of;
+}
+
+static const bool g_bb_edge_hash = [] {
+    const char* e = std::getenv("BB_EDGE_HASH");
+    return !e || e[0] != '0';
+}();
+static std::atomic<u64> g_bb_edge_released{0}, g_bb_edge_changed{0}, g_bb_land_marked{0};
+
+static inline u64 BbEdgeHash(const Image& image, int which) {
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    if (which == 0) {
+        const VAddr stop = std::min<VAddr>(PageManager::GetNextPageAddr(begin), end);
+        return XXH3_64bits(std::bit_cast<const u8*>(begin), stop - begin);
+    }
+    const VAddr start = std::max<VAddr>(PageManager::GetPageAddr(end), begin);
+    return XXH3_64bits(std::bit_cast<const u8*>(start), end - start);
+}
+
+// Called while the page is still write-protected: remembers what the image holds there.
+static inline void BbEdgeRelease(Image& image, int which) {
+    if (!g_bb_edge_hash || !BbCpuOnly(image) ||
+        True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+        image.edge_valid[which] = false;
+        return;
+    }
+    image.edge_hash[which] = BbEdgeHash(image, which);
+    image.edge_valid[which] = true;
+    g_bb_edge_released.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Called once the page is protected again (or the image is about to be hashed as a whole):
+// true when the image's bytes on that page changed while nothing watched them.
+static inline bool BbEdgeChanged(Image& image, int which) {
+    if (!image.edge_valid[which]) {
+        return false;
+    }
+    image.edge_valid[which] = false;
+    if (BbEdgeHash(image, which) == image.edge_hash[which]) {
+        return false;
+    }
+    const u64 n = g_bb_edge_changed.fetch_add(1, std::memory_order_relaxed);
+    if (static const bool log = std::getenv("BB_AUDIT") != nullptr; log && n < 400) {
+        std::fprintf(stderr, "[EDGE] image %#llx %ux%u %s mips %u size %llu flags %#x uid %llu: %s page "
+                             "changed while released\n",
+                     (unsigned long long)image.info.guest_address, image.info.size.width,
+                     image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                     image.info.resources.levels, (unsigned long long)image.info.guest_size,
+                     u32(image.flags), (unsigned long long)image.image_uid,
+                     which == 0 ? "first" : "last");
+    }
+    return true;
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
-    if (image.hash == 0) {
-        // Initialize hash
+    // 0.5.1-g: a page released earlier may already hold new bytes: then the whole-image hash
+    // taken now would call them unchanged.
+    for (int which = 0; which < 2; ++which) {
+        if (BbEdgeChanged(image, which)) {
+            image.flags |= ImageFlagBits::CpuDirty;
+        }
+    }
+    // The hash describes what the GPU holds: taken on every clean -> maybe-dirty edge (it used
+    // to be taken once, and went stale after an upload through the CPU-dirty path).
+    if (image.hash == 0 ||
+        (g_bb_edge_hash &&
+         False(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty)))) {
         image.hash = MaybeDirtyHash(image);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
@@ -1067,7 +1523,15 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             std::fprintf(stderr, "[RBQ] inval img=%u addr=%#llx+%#zx\n", image_id.index,
                          (unsigned long long)addr, size);
         }
-        ForgetOndemandImage(image_id);
+        // 0.5.1-e: a write beside an image whose tail page was released keeps the readback.
+        if (BbSeqImg(image) && True(image.flags & ImageFlagBits::GpuModified)) {
+            std::fprintf(stderr, "[SEQ] cpu-write %#llx+%#zx overlaps=%d ", (unsigned long long)addr,
+                         size, int(image.Overlaps(addr, size)));
+            BbSeqLine("on", image_id.index, image);
+        }
+        if (image.Overlaps(addr, size) || !OndemandTailReleased(image_id.index)) {
+            ForgetOndemandImage(image_id);
+        }
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
@@ -1092,6 +1556,378 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             MarkAsMaybeDirty(image_id, image);
         }
     });
+}
+
+void TextureCache::NoteLanding(VAddr addr, u64 size) {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_LAND_NOTIFY");
+        return !e || e[0] != '0';
+    }();
+    if (!on || size == 0) {
+        return;
+    }
+    std::scoped_lock lk{land_mutex};
+    land_ranges.emplace_back(addr, size);
+    land_pending.store(true, std::memory_order_release);
+}
+
+void TextureCache::DrainLandings() {
+    boost::container::small_vector<std::pair<VAddr, u64>, 16> ranges;
+    {
+        std::scoped_lock lk{land_mutex};
+        ranges.assign(land_ranges.begin(), land_ranges.end());
+        land_ranges.clear();
+        land_pending.store(false, std::memory_order_release);
+    }
+    for (const auto& [addr, size] : ranges) {
+        ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
+            if (!image.Overlaps(addr, size) || !image.IsTracked() || !BbCpuOnly(image) ||
+                True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+                return;
+            }
+            const u64 n = g_bb_land_marked.fetch_add(1, std::memory_order_relaxed);
+            if (static const bool log = std::getenv("BB_HOSTW_LOG") != nullptr; log && n < 2000) {
+                std::fprintf(stderr, "[HOSTW] land %#llx+%llu: clean image %#llx %ux%u %s mips %u flags %#x uid %llu\n",
+                             (unsigned long long)addr, (unsigned long long)size,
+                             (unsigned long long)image.info.guest_address, image.info.size.width,
+                             image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                             image.info.resources.levels, u32(image.flags),
+                             (unsigned long long)image.image_uid);
+            }
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
+        });
+    }
+}
+
+u32 TextureCache::NoteHostWrite(VAddr addr, u64 size, bool notify, std::string* first) {
+    std::scoped_lock lock{mutex};
+    u32 clean = 0;
+    ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
+        if (!image.Overlaps(addr, size) || !image.IsTracked() ||
+            True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) {
+            return; // not written, or its next bind looks at guest memory anyway
+        }
+        ++clean;
+        if (first && first->empty()) {
+            *first = fmt::format("{:#x} {}x{} {} mips {} flags {:#x} uid {}", image.info.guest_address,
+                                 image.info.size.width, image.info.size.height,
+                                 vk::to_string(image.info.pixel_format), image.info.resources.levels,
+                                 u32(image.flags), image.image_uid);
+        }
+        // GPU-written images keep their GPU contents: guest memory may be behind them.
+        if (notify && BbCpuOnly(image)) {
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
+        }
+    });
+    return clean;
+}
+
+void TextureCache::AuditImages() {
+    std::unique_lock lock{mutex};
+    DrainLandings();
+    static const bool gpu_audit = std::getenv("BB_AUDIT_GPU") != nullptr;
+    static u32 gpu_pass = 0;
+    ++gpu_pass;
+    struct GpuCheck {
+        ImageId id;
+        u32 last_pass;
+        u64 bytes;
+    };
+    std::vector<GpuCheck> gpu_checks;
+    std::vector<ImageId> stale_ids;
+    u32 checked = 0, suspects = 0, stale = 0, prot_checked = 0, prot_loss = 0;
+    u64 bytes = 0;
+    // g28: the host (bbgpu-host, host_runtime.c) answers what the game may write right now.
+    using DebugWritable = long long (*)(uintptr_t, uintptr_t, uintptr_t*, int*);
+    static const DebugWritable debug_writable =
+        reinterpret_cast<DebugWritable>(dlsym(RTLD_DEFAULT, "runtime_memory_gpu_debug_writable"));
+    const auto t0 = std::chrono::steady_clock::now();
+    ForEachImageInRegion(0x400000000ull, 0x100000000ull, [&](ImageId image_id, Image& image) {
+        // g28: every page of a tracked range must be read-only in the game.
+        if (debug_writable && image.IsTracked() && !image.audit_prot_reported &&
+            image.track_addr < image.track_addr_end) {
+            uintptr_t first = 0;
+            ++prot_checked;
+            const long long w = debug_writable(image.track_addr, image.track_addr_end, &first, nullptr);
+            if (w > 0) {
+                image.audit_prot_reported = true;
+                ++prot_loss;
+                int kind = -1;
+                debug_writable(first, first + 1, nullptr, &kind);
+                static int lines = 0;
+                if (lines++ < 300) {
+                    std::fprintf(stderr,
+                                 "[AUDIT] PROTLOSS image %#llx %ux%u %s mips %u size %llu flags %#x uid %llu: "
+                                 "tracked %#llx..%#llx but %lld bytes are writable in the game, first %#llx "
+                                 "(watchers %#x kind %#x)\n",
+                                 (unsigned long long)image.info.guest_address, image.info.size.width,
+                                 image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                                 image.info.resources.levels, (unsigned long long)image.info.guest_size,
+                                 u32(image.flags), (unsigned long long)image.image_uid,
+                                 (unsigned long long)image.track_addr, (unsigned long long)image.track_addr_end,
+                                 w, (unsigned long long)first, tracker.DebugState(first), u32(kind));
+                }
+            }
+        }
+        if (image.audit_reported) {
+            return;
+        }
+        if (!image.IsTracked() || True(image.flags & (ImageFlagBits::Dirty | ImageFlagBits::GpuModified)) ||
+            image.info.guest_size == 0) {
+            image.audit_suspect = false;
+            return;
+        }
+        if (image.audit_hash == 0) {
+            return;
+        }
+        ++checked;
+        bytes += image.info.guest_size;
+        const int bad =
+            (XXH3_64bits(std::bit_cast<u8*>(image.info.guest_address), image.info.guest_size) | 1) !=
+                    image.audit_hash
+                ? 0
+                : -1;
+        if (bad < 0) {
+            image.audit_suspect = false;
+            // BB_AUDIT_GPU: guest bytes are those of the upload: is the GPU copy the same?
+            if (gpu_audit && !image.audit_gpu_reported && image.info.props.is_block &&
+                !image.shadow_of && image.info.size.depth == 1) {
+                const auto be = vk::blockExtent(image.info.pixel_format);
+                const u32 bw = image.info.size.width / be[0], bh = image.info.size.height / be[1];
+                if (bw >= 8 && bh >= 8 && bw % 8 == 0 && bh % 8 == 0 &&
+                    image.info.size.width % be[0] == 0 && image.info.size.height % be[1] == 0) {
+                    gpu_checks.push_back({image_id, image.audit_gpu_pass,
+                                          u64(bw) * bh * vk::blockSize(image.info.pixel_format)});
+                }
+            }
+            return;
+        }
+        if (!image.audit_suspect) {
+            image.audit_suspect = true; // a write whose fault is still on its way: look again
+            ++suspects;
+            return;
+        }
+        image.audit_reported = true;
+        ++stale;
+        const u8* p = std::bit_cast<u8*>(image.info.guest_address);
+        u64 nonzero = 0;
+        const u64 probe = std::min<u64>(image.info.guest_size, 1u << 16);
+        for (u64 i = 0; i < probe; ++i) {
+            nonzero += p[i] != 0;
+        }
+        std::fprintf(stderr,
+                     "[AUDIT] stale image %#llx %ux%u %s mips %u layers %u flags %#x uid %llu serial %llu: "
+                     "guest bytes changed since the upload (first mip %d), tracked %#llx..%#llx, guest "
+                     "non-zero %llu of first %llu\n",
+                     (unsigned long long)image.info.guest_address, image.info.size.width,
+                     image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                     image.info.resources.levels, image.info.resources.layers, u32(image.flags),
+                     (unsigned long long)image.image_uid, (unsigned long long)image.write_serial, bad,
+                     (unsigned long long)image.track_addr, (unsigned long long)image.track_addr_end,
+                     (unsigned long long)nonzero, (unsigned long long)probe);
+        { // g28: which pages changed, and may the game write them now?
+            const VAddr b = image.info.guest_address, e = b + image.info.guest_size;
+            u32 changed = 0, first_pg = 0, last_pg = 0, i = 0;
+            std::string list;
+            for (VAddr a = b; a < e; ++i) {
+                const VAddr n = std::min<VAddr>((a | 0xFFF) + 1, e);
+                if (i < image.audit_pages.size() &&
+                    XXH3_64bits(std::bit_cast<u8*>(a), n - a) != image.audit_pages[i]) {
+                    if (changed++ == 0) {
+                        first_pg = i;
+                    }
+                    last_pg = i;
+                    if (changed <= 24) {
+                        list += fmt::format(" {}", i);
+                    }
+                }
+                a = n;
+            }
+            const VAddr first_addr = first_pg == 0 ? b : ((b & ~VAddr{0xFFF}) + VAddr{first_pg} * 0x1000);
+            uintptr_t wfirst = 0;
+            int kind = -1;
+            const long long w = debug_writable ? debug_writable(b, e, &wfirst, nullptr) : -1;
+            if (debug_writable) {
+                debug_writable(first_addr, first_addr + 1, nullptr, &kind);
+            }
+            std::fprintf(stderr,
+                         "[AUDIT] stale pages: image %#llx uid %llu: %u of %u pages changed (first %u last %u:%s), "
+                         "first changed at %#llx watchers %#x kind %#x; writable in the game now: %lld bytes, "
+                         "first %#llx\n",
+                         (unsigned long long)b, (unsigned long long)image.image_uid, changed, i, first_pg,
+                         last_pg, list.c_str(), (unsigned long long)first_addr, tracker.DebugState(first_addr),
+                         u32(kind), w, (unsigned long long)wfirst);
+        }
+        if (stale_ids.size() < 6 && image.info.size.depth == 1 && image.info.num_samples == 1 &&
+            !image.shadow_of && (image.info.props.is_block || !image.info.props.is_depth)) {
+            stale_ids.push_back(image_id);
+        }
+    });
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr,
+                 "[AUDIT] pass: %u clean images, %.1f MB hashed in %.1f ms, %u new suspects, %u stale, "
+                 "%u tracked ranges checked, %u writable\n",
+                 checked, bytes / 1e6, ms, suspects, stale, prot_checked, prot_loss);
+    if (gpu_checks.empty() && stale_ids.empty()) {
+        return;
+    }
+    // BB_AUDIT_GPU: level 0 of layer 0 is read back from the GPU and compared with the guest
+    // bytes as a multiset of blocks (tiling only permutes whole blocks). Least recently compared
+    // images first, BB_AUDIT_GPU megabytes a pass (default 48).
+    static const u64 budget = [] {
+        const int mb = std::atoi(std::getenv("BB_AUDIT_GPU"));
+        return u64(mb > 1 ? mb : 48) << 20;
+    }();
+    std::stable_sort(gpu_checks.begin(), gpu_checks.end(),
+                     [](const GpuCheck& a, const GpuCheck& b) { return a.last_pass < b.last_pass; });
+    struct Pending {
+        ImageId id;
+        u64 uid;
+        u64 size;
+        u32 block;
+        const u8* mapped;
+    };
+    std::vector<Pending> pending;
+    std::vector<Pending> stale_pending; // g28: level 0 as uploaded (the GPU copy) beside the guest now
+    static int stale_dumps = 0;
+    if (const char* dir = std::getenv("BB_DUMP_DIR"); dir) {
+        for (const ImageId id : stale_ids) {
+            if (stale_dumps >= 40) {
+                break;
+            }
+            ++stale_dumps;
+            Image& image = slot_images[id];
+            const auto be = vk::blockExtent(image.info.pixel_format);
+            const u64 size = u64((image.info.size.width + be[0] - 1) / be[0]) *
+                             ((image.info.size.height + be[1] - 1) / be[1]) *
+                             vk::blockSize(image.info.pixel_format);
+            if (size == 0 || size > (64u << 20)) {
+                continue;
+            }
+            std::array<vk::BufferImageCopy, 1> copy{vk::BufferImageCopy{
+                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0,
+                                  .baseArrayLayer = 0, .layerCount = 1},
+                .imageExtent = {image.info.size.width, image.info.size.height, 1}}};
+            const auto dl = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16, false);
+            copy[0].bufferOffset = dl.offset;
+            runtime.DownloadImage(&image, dl.buffer, copy);
+            stale_pending.push_back({id, u64(image.image_uid), size, u32(vk::blockSize(image.info.pixel_format)),
+                                     static_cast<const u8*>(dl.mapped)});
+        }
+    }
+    u64 total = 0;
+    const auto t1 = std::chrono::steady_clock::now();
+    for (const auto& c : gpu_checks) {
+        if (total + c.bytes > budget && !pending.empty()) {
+            break;
+        }
+        Image& image = slot_images[c.id];
+        std::array<vk::BufferImageCopy, 1> copy{vk::BufferImageCopy{
+            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0,
+                              .baseArrayLayer = 0, .layerCount = 1},
+            .imageExtent = {image.info.size.width, image.info.size.height, 1}}};
+        const auto dl = runtime.GetStagingPool().Request(c.bytes, MemoryType::HostCached, 16, false);
+        copy[0].bufferOffset = dl.offset;
+        runtime.DownloadImage(&image, dl.buffer, copy);
+        pending.push_back({c.id, u64(image.image_uid), c.bytes, u32(vk::blockSize(image.info.pixel_format)),
+                           static_cast<const u8*>(dl.mapped)});
+        image.audit_gpu_pass = gpu_pass;
+        total += c.bytes;
+    }
+    lock.unlock();
+    scheduler.Finish();
+    lock.lock();
+    for (const auto& p : stale_pending) {
+        if (!slot_images.is_allocated(p.id) || u64(slot_images[p.id].image_uid) != p.uid) {
+            continue;
+        }
+        const Image& image = slot_images[p.id];
+        const std::string path =
+            fmt::format("{}/stale_{:x}_{}_{}x{}_{}_l0off{}", std::getenv("BB_DUMP_DIR"), image.info.guest_address,
+                        image.image_uid, image.info.size.width, image.info.size.height,
+                        vk::to_string(image.info.pixel_format), image.info.mips_layout[0].offset);
+        if (FILE* f = std::fopen((path + ".gpu0").c_str(), "wb")) {
+            std::fwrite(p.mapped, 1, p.size, f);
+            std::fclose(f);
+        }
+        if (FILE* f = std::fopen((path + ".guest").c_str(), "wb")) {
+            std::fwrite(std::bit_cast<const u8*>(image.info.guest_address), 1, image.info.guest_size, f);
+            std::fclose(f);
+        }
+    }
+    if (gpu_checks.empty()) {
+        return;
+    }
+    u32 mismatches = 0, skipped = 0;
+    const auto multiset = [](const u8* p, u64 size, u32 block, u64* zero_blocks) {
+        u64 sum = 0, zeros = 0;
+        for (u64 i = 0; i + block <= size; i += block) {
+            u64 a, b = 0;
+            std::memcpy(&a, p + i, 8);
+            if (block == 16) {
+                std::memcpy(&b, p + i + 8, 8);
+            }
+            zeros += (a | b) == 0;
+            sum += XXH3_64bits(p + i, block);
+        }
+        *zero_blocks = zeros;
+        return sum;
+    };
+    for (const auto& p : pending) {
+        if (!slot_images.is_allocated(p.id) || u64(slot_images[p.id].image_uid) != p.uid) {
+            ++skipped; // deleted meanwhile
+            continue;
+        }
+        Image& image = slot_images[p.id];
+        const u8* guest = std::bit_cast<const u8*>(image.info.guest_address) + image.info.mips_layout[0].offset;
+        if (!image.IsTracked() || True(image.flags & (ImageFlagBits::Dirty | ImageFlagBits::GpuModified)) ||
+            image.audit_hash == 0 || image.audit_gpu_pass != gpu_pass ||
+            (XXH3_64bits(std::bit_cast<u8*>(image.info.guest_address), image.info.guest_size) | 1) !=
+                image.audit_hash) {
+            ++skipped; // changed while the read-back was on its way
+            continue;
+        }
+        u64 gpu_zero = 0, guest_zero = 0;
+        const u64 gpu_sum = multiset(p.mapped, p.size, p.block, &gpu_zero);
+        const u64 guest_sum = multiset(guest, p.size, p.block, &guest_zero);
+        if (gpu_sum == guest_sum) {
+            continue;
+        }
+        ++mismatches;
+        image.audit_gpu_reported = true;
+        std::fprintf(stderr,
+                     "[AUDITGPU] MISMATCH image %#llx %ux%u %s mips %u layers %u flags %#x uid %llu serial %llu: "
+                     "level 0 on the GPU is not the guest's (%llu blocks, zero blocks gpu %llu guest %llu)\n",
+                     (unsigned long long)image.info.guest_address, image.info.size.width,
+                     image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                     image.info.resources.levels, image.info.resources.layers, u32(image.flags),
+                     (unsigned long long)image.image_uid, (unsigned long long)image.write_serial,
+                     (unsigned long long)(p.size / p.block), (unsigned long long)gpu_zero,
+                     (unsigned long long)guest_zero);
+        static int dumps = 0;
+        if (const char* dir = std::getenv("BB_DUMP_DIR"); dir && dumps < 12) {
+            ++dumps;
+            const std::string path = fmt::format("{}/auditgpu_{:x}_{}x{}_{}.raw", dir, image.info.guest_address,
+                                                 image.info.size.width, image.info.size.height,
+                                                 vk::to_string(image.info.pixel_format));
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(p.mapped, 1, p.size, f);
+                std::fclose(f);
+            }
+            if (FILE* f = std::fopen((path + ".guest").c_str(), "wb")) {
+                std::fwrite(std::bit_cast<const u8*>(image.info.guest_address), 1, image.info.guest_size, f);
+                std::fclose(f);
+            }
+        }
+    }
+    const double gms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    std::fprintf(stderr,
+                 "[AUDITGPU] pass %u: %zu of %zu images read back, %.1f MB in %.1f ms, %u skipped, %u mismatches\n",
+                 gpu_pass, pending.size(), gpu_checks.size(), total / 1e6, gms, skipped, mismatches);
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, u64 writer) {
@@ -1255,6 +2091,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             static const bool bc_log = std::getenv("BB_BCVIEW_LOG") != nullptr;
             static int bc_logged = 0;
+            if (BbSeqImg(cache_image)) {
+                std::fprintf(stderr, "[SEQ] overlap-mismatch req %s %ux%u lv%u safe=%d ",
+                             vk::to_string(image_info.pixel_format).c_str(), image_info.size.width,
+                             image_info.size.height, image_info.resources.levels,
+                             int(safe_to_delete));
+                BbSeqLine("cache", cache_image_id.index, cache_image);
+            }
             if (bc_log && (image_info.props.is_block || cache_image.info.props.is_block) &&
                 bc_logged < 200) {
                 ++bc_logged;
@@ -1584,8 +2427,68 @@ void TextureCache::DebugProbeImage(ImageId id, const char* tag) {
     }
 }
 
+void TextureCache::DebugDumpImage(ImageId id, const char* path) {
+    Image& img = slot_images[id];
+    const u32 w = img.info.size.width, h = img.info.size.height;
+    const auto format = img.info.pixel_format;
+    const auto be = vk::blockExtent(format);
+    const u64 per_layer = u64((w + be[0] - 1) / be[0]) * ((h + be[1] - 1) / be[1]) * vk::blockSize(format);
+    const bool depth = format == vk::Format::eD32Sfloat || format == vk::Format::eD16Unorm ||
+                       format == vk::Format::eD32SfloatS8Uint;
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    for (u32 layer = 0; layer < img.info.resources.layers; ++layer) {
+        std::array<vk::BufferImageCopy, 1> c{vk::BufferImageCopy{
+            .imageSubresource{.aspectMask = depth ? vk::ImageAspectFlagBits::eDepth
+                                                  : vk::ImageAspectFlagBits::eColor,
+                              .mipLevel = 0, .baseArrayLayer = layer, .layerCount = 1},
+            .imageExtent = {w, h, 1}}};
+        const auto dl = runtime.GetStagingPool().Request(per_layer, MemoryType::HostCached, 16, false);
+        c[0].bufferOffset = dl.offset;
+        runtime.DownloadImage(&img, dl.buffer, c);
+        scheduler.Finish();
+        std::fwrite(dl.mapped, 1, per_layer, f);
+    }
+    std::fclose(f);
+    // The guest memory behind the image (still tiled when the image is), for comparing with the GPU copy.
+    if (FILE* g = std::fopen((std::string(path) + ".guest").c_str(), "wb")) {
+        std::fwrite(std::bit_cast<const u8*>(img.info.guest_address), 1, img.info.guest_size, g);
+        std::fclose(g);
+    }
+    std::fprintf(stderr, "[DUMPBIND] %s (%llu bytes a layer) guest %#llx size %llu flags %#x tiled %d tile_mode %u\n", path,
+                 (unsigned long long)per_layer, (unsigned long long)img.info.guest_address,
+                 (unsigned long long)img.info.guest_size, unsigned(img.flags), int(img.info.props.is_tiled),
+                 unsigned(img.info.tile_mode));
+}
+
+void TextureCache::DebugDumpGpuCompressed(const char* dir) {
+    // fifa-hybrid debug (BB_DUMP_ALL_TRIGGER): the state of every GPU-written block-compressed
+    // image at one moment, bound or not, as all_<addr>_<w>x<h>x<layers>_<format>_f<flags>.raw.
+    std::vector<ImageId> ids;
+    ForEachImageInRegion(0x400000000ull, 0x100000000ull, [&](ImageId id, Image& img) {
+        if (True(img.flags & ImageFlagBits::GpuModified) && img.info.props.is_block &&
+            !img.shadow_of) {
+            ids.push_back(id);
+        }
+    });
+    for (const ImageId id : ids) {
+        Image& img = slot_images[id];
+        SyncBlockShadow(img);
+        const std::string path = fmt::format(
+            "{}/all_{:x}_{}x{}x{}_{}_f{:x}.raw", dir, img.info.guest_address, img.info.size.width,
+            img.info.size.height, img.info.resources.layers, vk::to_string(img.info.pixel_format),
+            u32(img.flags));
+        DebugDumpImage(id, path.c_str());
+    }
+    std::fprintf(stderr, "[DUMPALL] %zu images\n", ids.size());
+}
+
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     const auto new_image_id = slot_images.insert(device, runtime, slot_image_views, info);
+    if (BbSeqImg(slot_images[image_id]) || BbSeqImg(slot_images[new_image_id])) {
+        BbSeqLine("expand from", image_id.index, slot_images[image_id]);
+        BbSeqLine("expand to", new_image_id.index, slot_images[new_image_id]);
+    }
     // bbport: the larger image keeps the lazy usages the old one got (the game grows mip
     // chains one level at a time).
     slot_images[new_image_id].ApplyNewUsage(slot_images[image_id].CurrentUsage());
@@ -1734,12 +2637,39 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     block_seed = {};
     if (!image_id) {
         for (const auto& cache_id : image_ids) {
-            view_mip = -1;
-            view_slice = -1;
-
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
                 ResolveOverlap(merged_info, desc.type, cache_id, image_id);
+            // fifa-hybrid: the level and slice belong to the image the request resolved to. A later
+            // overlap that leaves that image in place (it returns the same id, or nothing) must
+            // not drop them: the request is a view of a level of a larger image, and reading
+            // level 0 of that image instead hands the shader another texture's contents. Seen
+            // when the game reuses the memory of a mip of a finished texture for a new one
+            // (BB_FIND_MIP_RESET=1 restores the old behaviour).
+            static const bool reset_view = std::getenv("BB_FIND_MIP_RESET") != nullptr;
+            if (!reset_view && (!overlap_image_id || overlap_image_id == image_id)) {
+                if (BbSeqOn() && image_id && (view_mip > 0 || view_slice > 0)) {
+                    const Image& kept = slot_images[image_id];
+                    const Image& other = slot_images[cache_id];
+                    std::fprintf(stderr,
+                                 "[SEQ] mipkeep req %#llx %s %ux%u lv%u -> id %u %#llx %ux%u lv%u "
+                                 "mip %d slice %d (after id %u %#llx %ux%u lv%u)\n",
+                                 (unsigned long long)info.guest_address,
+                                 vk::to_string(info.pixel_format).c_str(), info.size.width,
+                                 info.size.height, info.resources.levels, image_id.index,
+                                 (unsigned long long)kept.info.guest_address, kept.info.size.width,
+                                 kept.info.size.height, kept.info.resources.levels, view_mip,
+                                 view_slice, cache_id.index,
+                                 (unsigned long long)other.info.guest_address,
+                                 other.info.size.width, other.info.size.height,
+                                 other.info.resources.levels);
+                }
+                continue;
+            }
+            if (reset_view) {
+                view_mip = -1;
+                view_slice = -1;
+            }
             if (overlap_image_id) {
                 image_id = overlap_image_id;
                 view_mip = overlap_view_mip;
@@ -1781,6 +2711,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             }
         }
         image_id = slot_images.insert(device, runtime, slot_image_views, info);
+        if (BbSeqImg(slot_images[image_id])) {
+            BbSeqLine(block_seed ? "create seeded" : "create", image_id.index, slot_images[image_id]);
+        }
         // bbport: the creating binding's lazy usages from the start (a texture first bound as
         // storage, or in another pixel format), instead of an upgrade copy at its first view.
         auto& created = slot_images[image_id];
@@ -1960,6 +2893,13 @@ ImageId TextureCache::ResolveBlockShadow(ImageId image_id, const ImageDesc& desc
         Image& shadow = slot_images[image.block_shadow];
         if (shadow.info.pixel_format != req.pixel_format ||
             shadow.info.resources.levels < req.resources.levels) {
+            if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }())) {
+                std::fprintf(stderr, "[SEQ] shadow regrow %#llx %s lv%u -> %s lv%u newer=%d\n",
+                             (unsigned long long)image.info.guest_address,
+                             vk::to_string(shadow.info.pixel_format).c_str(),
+                             shadow.info.resources.levels, vk::to_string(req.pixel_format).c_str(),
+                             req.resources.levels, int(image.shadow_newer));
+            }
             // The game grows the chain a level per dispatch: keep what the old shadow got.
             SyncBlockShadow(image);
             DeleteImage(image.block_shadow);
@@ -1994,8 +2934,19 @@ ImageId TextureCache::ResolveBlockShadow(ImageId image_id, const ImageDesc& desc
                              desc.type == BindingType::Storage ? "storage" : "sampled");
             }
         }
+        if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }())) {
+            std::fprintf(stderr, "[SEQ] to-shadow %#llx fl %#x\n",
+                         (unsigned long long)bc.info.guest_address, u32(bc.flags));
+        }
         runtime.CopyBlockBytes(&bc, &shadow);
         bc.shadow_current = true;
+    }
+    if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }())) {
+        std::fprintf(stderr, "[SEQ] resolve %#llx %s shadow %u %s lv%u req L%u\n",
+                     (unsigned long long)bc.info.guest_address,
+                     desc.type == BindingType::Storage ? "storage" : "sampled", bc.block_shadow.index,
+                     vk::to_string(shadow.info.pixel_format).c_str(), shadow.info.resources.levels,
+                     desc.view_info.range.base.level);
     }
     if (desc.type == BindingType::Storage) {
         bc.shadow_newer = true;
@@ -2012,6 +2963,11 @@ void TextureCache::SyncBlockShadow(Image& image) {
     if (image.block_shadow && image.shadow_newer) {
         image.shadow_newer = false;
         image.shadow_current = true;
+        if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }())) {
+            std::fprintf(stderr, "[SEQ] from-shadow %#llx shadow %u lv%u\n",
+                         (unsigned long long)image.info.guest_address, image.block_shadow.index,
+                         slot_images[image.block_shadow].info.resources.levels);
+        }
         if (([] { static const bool v = std::getenv("BB_BCVIEW_LOG") != nullptr; return v; }())) {
             static int n = 0;
             if (n++ < 200) {
@@ -2224,6 +3180,10 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty)) {
         return;
     }
+    if (auto* r = liverpool ? liverpool->GetRasterizer() : nullptr; r && r->HasDeferredDispatches() &&
+        (r->NoteDeferredConflictSite("image-refresh"), r->DeferredDispatchTouchesImage(image, true))) {
+        r->FlushDeferredDispatches(); // fifa-hybrid: the upload lands after the pending dispatch
+    }
     if (static const bool slog = std::getenv("BB_STENCIL_LOG") != nullptr; slog && image.info.props.is_depth) {
         std::fprintf(stderr, "[SREFRESH] depth image %#llx %ux%u refreshed (dirty)\n",
                      (unsigned long long)image.info.guest_address, image.info.size.width, image.info.size.height);
@@ -2355,6 +3315,17 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     scheduler.EndRendering();
+    if (([] { static const bool v = std::getenv("BB_BCSEQ") != nullptr; return v; }()) && (image.info.props.is_block || image.info.size.width <= 1024) &&
+        (is_gpu_modified || image.block_shadow || image.info.props.is_block)) {
+        u32 mask = 0;
+        for (const auto& c : image_copies) {
+            mask |= 1u << c.imageSubresource.mipLevel;
+        }
+        std::fprintf(stderr, "[SEQ] upload %#llx %s %ux%u fl %#x mips %#x newer=%d\n",
+                     (unsigned long long)image.info.guest_address,
+                     vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                     image.info.size.height, u32(image.flags), mask, int(image.shadow_newer));
+    }
 
     // bbport: BB_LOG_UPLOAD_MB=<n> logs every image refresh of at least n MB (diagnostics).
     static const double log_upload_mb = [] {
@@ -2394,6 +3365,38 @@ void TextureCache::RefreshImage(Image& image) {
         }
     }
 
+    if (static const bool audit = std::getenv("BB_AUDIT") != nullptr; audit) {
+        image.audit_suspect = false;
+        image.audit_reported = false;
+        image.audit_gpu_pass = 0;
+        image.audit_gpu_reported = false;
+        image.audit_hash =
+            buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)
+                ? 0
+                : (XXH3_64bits(std::bit_cast<u8*>(image.info.guest_address), image.info.guest_size) | 1);
+        image.audit_prot_reported = false;
+        image.audit_pages.clear();
+        if (image.audit_hash != 0) {
+            const VAddr b = image.info.guest_address, e = b + image.info.guest_size;
+            for (VAddr a = b; a < e;) {
+                const VAddr n = std::min<VAddr>((a | 0xFFF) + 1, e);
+                image.audit_pages.push_back(XXH3_64bits(std::bit_cast<u8*>(a), n - a));
+                a = n;
+            }
+        }
+        if (image.audit_hash == 0 && !True(image.flags & ImageFlagBits::GpuModified)) {
+            static std::atomic<int> lines{0};
+            if (lines++ < 300) {
+                std::fprintf(stderr,
+                             "[AUDIT] arena upload: image %#llx %ux%u %s mips %u size %llu flags %#x uid %llu "
+                             "is uploaded through the arena (GPU-written buffer data in its range)\n",
+                             (unsigned long long)image.info.guest_address, image.info.size.width,
+                             image.info.size.height, vk::to_string(image.info.pixel_format).c_str(),
+                             image.info.resources.levels, (unsigned long long)image.info.guest_size,
+                             u32(image.flags), (unsigned long long)image.image_uid);
+            }
+        }
+    }
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
@@ -2500,6 +3503,9 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     const auto size = image.track_addr - image_begin;
     image.track_addr = image_begin;
     tracker.UpdatePageWatchers<1>(image_begin, size);
+    if (BbEdgeChanged(image, 0)) {
+        image.flags |= ImageFlagBits::CpuDirty; // written while the page was released
+    }
 }
 
 void TextureCache::TrackImageTail(ImageId image_id) {
@@ -2516,6 +3522,9 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     const auto size = image_end - image.track_addr_end;
     image.track_addr_end = image_end;
     tracker.UpdatePageWatchers<1>(addr, size);
+    if (BbEdgeChanged(image, 1)) {
+        image.flags |= ImageFlagBits::CpuDirty; // written while the page was released
+    }
 }
 
 void TextureCache::UntrackImage(ImageId image_id) {
@@ -2527,6 +3536,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
     image.track_addr_end = 0;
+    image.edge_valid[0] = image.edge_valid[1] = false;
     if (size != 0) {
         tracker.UpdatePageWatchers<false>(addr, size);
     }
@@ -2540,6 +3550,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     }
     const auto addr = tracker.GetNextPageAddr(image_begin);
     const auto size = addr - image_begin;
+    BbEdgeRelease(image, 0);
     image.track_addr = addr;
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
@@ -2559,6 +3570,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     ASSERT(image.track_addr_end != 0);
     const auto addr = tracker.GetPageAddr(image_end);
     const auto size = image_end - addr;
+    BbEdgeRelease(image, 1);
     image.track_addr_end = addr;
     if (image.track_addr == image.track_addr_end) {
         // This image spans only 2 pages and both are modified,
@@ -2630,6 +3642,15 @@ void TextureCache::GarbageCollectImages() {
             trigger_gc_memory = base_mem / 100 * trig_pct;
             pressure_gc_memory = base_mem / 100 * pres_pct;
             critical_gc_memory = base_mem / 100 * crit_pct;
+            // fifa-hybrid: under system memory pressure (bbgpu.cpp WatchMemoryPressure) the marks
+            // come down (warning: 70%, critical: 50%), so the cache gives memory back to the
+            // system before the GPU's own pages go.
+            if (const int level = BbStats::system_memory_pressure.load(std::memory_order_relaxed)) {
+                const u64 pct = level >= 2 ? 50 : 70;
+                trigger_gc_memory = trigger_gc_memory / 100 * pct;
+                pressure_gc_memory = pressure_gc_memory / 100 * pct;
+                critical_gc_memory = critical_gc_memory / 100 * pct;
+            }
             if (!marks_logged && layout != 0) {
                 marks_logged = true;
                 std::printf("Texture budget: resident buffers charged as %.0f MiB (%.0f resident, "
@@ -2846,6 +3867,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
     {
         std::unique_lock lk{download_images_mutex};
         pending = ondemand_images.contains(image_id);
+    }
+    if (BbSeqImg(slot_images[image_id])) {
+        BbSeqLine(pending ? "delete pending" : "delete", image_id.index, slot_images[image_id]);
     }
     if (pending) {
         DownloadImageMemory(image_id, false);

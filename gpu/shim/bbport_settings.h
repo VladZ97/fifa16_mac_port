@@ -73,9 +73,11 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
-    /// Frame pacing at the FPS cap (vk_presenter.cpp PacingSeconds): even frame times on
-    /// variable-refresh displays, about one frame more input latency. bbport.ini frame_pacing; live.
-    std::atomic<bool> frame_pacing{false};
+    /// Even frame times (vk_presenter.cpp PacingSeconds and PacingLock): each frame is shown for
+    /// one period of the frame cap on 120 Hz displays, and the game's tick is held in step with
+    /// the display. bbport.ini even_frames (default on since 0.5.1-f; the older frame_pacing key,
+    /// default off, is no longer read); live.
+    std::atomic<bool> frame_pacing{true};
     /// Mouse look (bbport_mouse.cpp): bbport.ini mouse_look, mouse_sensitivity (0.1-10),
     /// mouse_vertical (vertical speed relative to horizontal, 0.25-4), mouse_invert_y.
     /// Off by default: on, the first left click in the window captures the cursor, for gamepad

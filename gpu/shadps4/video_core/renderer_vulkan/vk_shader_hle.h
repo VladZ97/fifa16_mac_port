@@ -32,5 +32,7 @@ void FlushDeferredCopies(Rasterizer& rasterizer);
 /// Whether an access by a command of the pass must wait for the deferred copies: it reads or
 /// writes one of their destinations, or writes one of their sources.
 bool DeferredCopiesConflict(const VideoCore::Buffer* buffer, u64 offset, u64 size, bool write);
+/// fifa-hybrid: whether copies are deferred right now (deferred dispatches keep apart from them).
+bool DeferredCopiesPending();
 
 } // namespace Vulkan

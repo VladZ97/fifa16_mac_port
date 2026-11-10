@@ -236,6 +236,10 @@ bool DeferredCopiesConflict(const VideoCore::Buffer* buffer, u64 offset, u64 siz
            (write && Overlaps(deferred_src, buffer, offset, offset + size));
 }
 
+bool DeferredCopiesPending() {
+    return any_deferred.load(std::memory_order_acquire);
+}
+
 static void Defer(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                   const VideoCore::Buffer* dst, std::span<const VideoCore::BufferCopy> copies) {
     DeferredCopy d{src, dst, {copies.begin(), copies.end()}, false, {}};

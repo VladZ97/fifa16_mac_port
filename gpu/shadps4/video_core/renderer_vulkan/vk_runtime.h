@@ -56,6 +56,22 @@ public:
     /// before it (they may have uploaded its ranges). The caller marks both ranges used.
     bool HoistCopy(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                    std::span<const VideoCore::BufferCopy> copies, bool shader_copy = false);
+    /// fifa-hybrid: whether an access of [offset, offset + size) may run ahead of the submission
+    /// (a hoisted dispatch): no command not known complete, in this submission or in flight,
+    /// wrote it (or, for a write, touched it); earlier hoisted work runs before it in order. A
+    /// write must target a registered (arena) buffer.
+    [[nodiscard]] bool AheadSafe(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                                 bool write) const;
+    [[nodiscard]] bool Ordering() const noexcept {
+        return ordering;
+    }
+    /// Numbers the hoisted dispatch as a command of this submission before its MarkAccess calls
+    /// (as HoistCopy does for its copies).
+    void BeginAheadCommand() {
+        if (ordering) {
+            BeginCommand();
+        }
+    }
 
     Scheduler& GetScheduler() {
         return scheduler;
@@ -136,6 +152,8 @@ public:
     /// contents copied (all levels and layers); the old texture and its views are released once
     /// that copy has run.
     void UpgradeUsage(VideoCore::Image* image, u32 needed);
+    /// 0.5.1-c: the texture cache's draw-based copies (Rasterizer's copy dispatch pass).
+    VideoCore::BlitHelper& GetBlitHelper() { return *blit_helper; }
 
     /// bbport: ordering of the untracked arena, per command (mtl_buffer_barriers.h): right
     /// before a command is recorded, IsBufferAccessed for each range it reads or writes, then

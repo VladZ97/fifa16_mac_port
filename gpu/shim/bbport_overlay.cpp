@@ -16,6 +16,7 @@
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include "bbport_toggles.h"
 #include "bbport_overlay_metal.h"
 #include "imgui.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -97,6 +98,64 @@ bool IsMenuToggle(const SDL_KeyboardEvent& key) {
 bool dirty = false; // settings changed: saved shortly after the last change, and on close
 std::chrono::steady_clock::time_point last_change{};
 float base_scale = 1.0f;
+
+// fifa 0.5.1-i: "Building shaders" bar. The game's shaders are compiled the first time each is
+// drawn (nothing is shipped with the app), mostly in the first sessions: while the creation pool
+// gets builds, a small bar at the bottom shows finished / requested of the current burst. A burst
+// ends 1.2 s after its last build was requested or finished (most builds take a few ms and are
+// over before the next present, so "pending" alone is never seen). It is shown from 4 builds on,
+// or when builds have been pending for 0.4 s: one new effect in a warm session shows nothing.
+struct ShaderBurst {
+    bool active = false, primed = false;
+    u64 base = 0;           // builds requested before the burst
+    u64 seen_submitted = 0; // at the last present
+    std::chrono::steady_clock::time_point last_activity{}, pending_since{};
+    bool pending = false;
+    u64 done = 0, total = 0; // of the burst
+};
+ShaderBurst shader_burst;            // present thread
+std::atomic<bool> shader_bar{false}; // read by Visible()
+
+void UpdateShaderBurst(std::chrono::steady_clock::time_point now) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_SHADER_PROGRESS");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled) {
+        return;
+    }
+    // "done" first: read the other way round a build finishing in between shows as pending.
+    const u64 done = BbStats::pipeline_jobs_done.load(std::memory_order_relaxed);
+    const u64 submitted = BbStats::pipeline_jobs_submitted.load(std::memory_order_relaxed);
+    auto& b = shader_burst;
+    if (!b.primed) {
+        // What was requested before the first present is the stored cache being loaded.
+        b.primed = true;
+        b.seen_submitted = submitted;
+    }
+    const bool pending = submitted > done;
+    if (pending || submitted != b.seen_submitted) {
+        if (!b.active) {
+            b.active = true;
+            b.base = b.seen_submitted;
+        }
+        b.last_activity = now;
+    } else if (b.active && now - b.last_activity > std::chrono::milliseconds(1200)) {
+        b.active = false;
+    }
+    if (pending && !b.pending) {
+        b.pending_since = now;
+    }
+    b.pending = pending;
+    b.seen_submitted = submitted;
+    if (b.active) {
+        b.total = submitted - b.base;
+        b.done = done > b.base ? std::min(done - b.base, b.total) : 0;
+    }
+    shader_bar.store(b.active && (b.total >= 4 || (pending && now - b.pending_since >
+                                                                  std::chrono::milliseconds(400))),
+                     std::memory_order_relaxed);
+}
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
@@ -815,9 +874,9 @@ void DisplayTab(BbSettings::Values& s) {
 
     BeginCard("Frame pacing");
     Toggle("Even frame times", s.frame_pacing);
-    HintBelow("Shows each frame for one period of the FPS cap. Smoother camera motion on "
-              "ProMotion displays when the game holds the cap, but about one frame more input "
-              "lag. No effect below the cap.");
+    HintBelow("Shows each frame for one period of the FPS cap and keeps the game in step with "
+              "the display. Smooth camera motion on 120 Hz and 60 Hz displays; about 20 ms more "
+              "input lag than off on a 120 Hz display, less lag than off on a 60 Hz one.");
     EndCard();
 
     BeginCard("Overlay");
@@ -1229,6 +1288,37 @@ void FpsCounter() {
     ImGui::PopStyleVar(4);
 }
 
+/// fifa 0.5.1-i: shader builds in flight (UpdateShaderBurst), a small bar at the bottom centre.
+void ShaderProgress() {
+    const auto& b = shader_burst;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y - 26.0f * base_scale),
+                            ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.72f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 9.0f) * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 5.0f) * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f * base_scale);
+    ImGui::Begin("##shaders", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.86f);
+    ImGui::Text("Building shaders");
+    ImGui::SameLine();
+    ImGui::TextColored(kSecondary, "%llu / %llu  \xC2\xB7  first time only, kept for later",
+                       (unsigned long long)b.done, (unsigned long long)b.total);
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kAccent);
+    ImGui::ProgressBar(b.total ? float(double(b.done) / double(b.total)) : 0.0f,
+                       ImVec2(300.0f * base_scale, 5.0f * base_scale), "");
+    ImGui::PopStyleColor();
+    ImGui::End();
+    ImGui::PopStyleVar(5);
+}
+
 /// The game's text dialog: prompt, the text typed so far and the keys, centred over the frame.
 void TextPrompt() {
     std::string title, text;
@@ -1565,7 +1655,8 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps ||
+                           shader_bar.load(std::memory_order_relaxed));
 }
 
 void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
@@ -1697,6 +1788,7 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
     if (!initialized) {
         return;
     }
+    UpdateShaderBurst(now);
     std::scoped_lock lock{imgui_mutex};
     // Save 0.3 s after the last change (a slider drag writes once), not only when the menu
     // closes: closing the window or a crash with the menu open used to lose the changes. Under
@@ -1739,6 +1831,9 @@ void Render(void* command_buffer, void* target, u32 width, u32 height) {
         }
         if (BbSettings::Get().show_fps && !menu_open) {
             FpsCounter();
+        }
+        if (shader_bar.load(std::memory_order_relaxed) && !menu_open) {
+            ShaderProgress();
         }
         if (prompt_active && !menu_open) {
             TextPrompt();

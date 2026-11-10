@@ -41,6 +41,16 @@ struct PostProcessSettings {
     u32 srgb_input{};
 };
 
+/// 0.5.1-e: the edge anti-aliasing pass (FXAA quality) over the display image. `split` > 0 leaves
+/// the part of the picture left of that fraction untouched (same-frame comparison).
+struct EdgeAaSettings {
+    float subpix{0.5f};
+    float edge_threshold{0.125f};
+    float edge_threshold_min{0.0312f};
+    float split{0.0f};
+    u32 quality{2}; ///< 0: 5 search steps along an edge, 1: 8, 2: 12
+};
+
 /// Pipelines and sampler for the post-process pass and the present blit (compiled once).
 class PresentPasses {
 public:
@@ -55,6 +65,13 @@ public:
     /// format; linear filter) over the whole `output` (render target of frame_format).
     void PostProcess(Encoder& encoder, void* input, void* output, u32 out_width, u32 out_height,
                      const PostProcessSettings& settings);
+    /// 0.5.1-e: the pipeline of the edge anti-aliasing pass for outputs of `pixel_format`
+    /// (MTLPixelFormat), created on first use. Call on the thread that records.
+    void* EdgeAaPipeline(u32 pixel_format);
+    /// Encodes the edge anti-aliasing pass: `input` (id<MTLTexture>) filtered into `output`
+    /// (render target of the same size; `pipeline` from EdgeAaPipeline for its pixel format).
+    void EdgeAa(Encoder& encoder, void* pipeline, void* input, void* output, u32 width,
+                u32 height, const EdgeAaSettings& settings);
     /// Encodes into a raw id<MTLCommandBuffer> (present queue): clears `target` black, then if
     /// `frame` is non-null draws it into FitImage(frame size, target size), linear.
     void Present(void* command_buffer, void* frame, u32 frame_width, u32 frame_height,
@@ -74,6 +91,20 @@ struct LayerConfig {
 /// Configures a CAMetalLayer (void* = CAMetalLayer*, e.g. SDL_Metal_GetLayer): device, pixel
 /// format, sRGB colorspace, maximumDrawableCount, displaySyncEnabled, framebufferOnly.
 void ConfigureLayer(Device& device, void* layer, const LayerConfig& config);
+/// 0.5.1-f: on a variable-refresh display (ProMotion) the system follows a lone 60 fps layer in
+/// 4.17 ms steps, so frames produced 16.7 ms apart are shown 12.5 and 20.8 ms apart. Two ways to
+/// a steady picture, chosen by `fixed_60`:
+///  - false: a one-point sublayer that changes every refresh keeps the display on its steady
+///    grid (8.33 ms at 120 Hz), where a 60 fps stream lands on every second refresh;
+///  - true: the display is switched to its 60 Hz mode of the same size for the life of this
+///    process (the system restores the user's mode when the process ends).
+/// No-op on displays under 100 Hz.
+void StartSteadyRefresh(void* layer, bool fixed_60, bool by_link = false);
+
+/// The refresh rate frames are shown against once StartSteadyRefresh has looked at the display:
+/// 120 (or 240) with the heartbeat layer, 60 for a 60 Hz display or the fixed 60 Hz mode, the
+/// display's own rate otherwise. 0 until known.
+int SteadyRefreshHz();
 /// maximumDrawableCount (2 or 3) after ConfigureLayer, e.g. when the window enters full screen.
 void SetMaximumDrawables(void* layer, u32 count);
 
@@ -125,9 +156,10 @@ public:
     /// `min_duration` > 0 (seconds): presentDrawable:afterMinimumDuration: (the previous drawable
     /// stays on screen at least that long), for even frame pacing on variable-refresh displays.
     /// `on_presented` (fifa-hybrid latency stats): called from the drawable's presented handler
-    /// with the time it reached the display (CLOCK_UPTIME_RAW ns; 0 when it was never shown).
+    /// with the time it reached the display (CLOCK_UPTIME_RAW ns; 0 when it was never shown) and
+    /// the time the GPU finished the command buffer (same clock; 0 when not known yet).
     void Commit(void* command_buffer, void* drawable, std::function<void()> on_complete,
-                double min_duration = 0, std::function<void(u64)> on_presented = {});
+                double min_duration = 0, std::function<void(u64, u64)> on_presented = {});
     /// Blocks until nothing is in flight.
     void WaitIdle();
     /// Blocks until nothing is in flight or `milliseconds` passed; true when idle.

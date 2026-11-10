@@ -241,7 +241,16 @@ typedef struct {
      * trip cost ~0.6 ms per relayed fault (the host's handling itself ~10 us). Appended last and
      * set by the host at setup from BB_RELAY_SPIN_US (default 100; the game's gpu_process.c
      * copy predates the field and leaves it zero). 0: the old 200-iteration spin. */
-    BBGPU_ALIGNAS(BBGPU_CACHE_LINE) uint32_t relay_spin_ns, pad3;
+    BBGPU_ALIGNAS(BBGPU_CACHE_LINE) uint32_t relay_spin_ns;
+    /* 0.5.1-b: spin window (ns) of the page-protection round trip on both sides (BB_PROTECT_SPIN_US). */
+    uint32_t protect_spin_ns;
+    /* 0.5.1-c: direct page protection (host_runtime.c host_protect_direct_init). protect_direct: the
+     * host holds the game's task port and changes the game's page protection itself (no relay);
+     * protect_lock: spinlock over protection changes and the game's per-page kind table, taken by
+     * the host around each change and by the game's fault handler (bbport_split.cpp);
+     * page_kind_addr/bytes: that table in the game (mmap'd, published by the game's shim). */
+    uint32_t protect_direct, protect_lock;
+    uint64_t page_kind_addr, page_kind_bytes;
 } BbGpuShared;
 
 #define BBGPU_SUBMIT_RING_OFFSET (UINT64_C(64) << 10)

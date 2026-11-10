@@ -53,6 +53,9 @@ public:
 
     static constexpr u64 PM_PAGE_SIZE_PUBLIC = PM_PAGE_SIZE; // fifa-hybrid
 
+    /// g28 diagnostic: write | read << 8 | image << 16 | image read << 24 watchers of a page.
+    u32 DebugState(VAddr addr) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);
