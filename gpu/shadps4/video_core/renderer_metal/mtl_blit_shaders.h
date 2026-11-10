@@ -35,6 +35,7 @@ inline constexpr const char* ScaleNearest[3] = {"scale_nearest_fs", "scale_neare
                                                 "scale_nearest_int_fs"};
 /// 0.5.1-e: edge anti-aliasing of the display image before it is scaled to the window (FXAA 3.11
 /// quality, 5 to 12 search steps): texture 0, sampler 0 (linear), EdgeAaParams at buffer 0.
+/// Ported from NVIDIA FXAA 3.11 (BSD-3-Clause): the notice is in gpu/third_party/fxaa/LICENSE.txt.
 inline constexpr const char* EdgeAa = "edge_aa_fs";
 /// 0.5.1-c: a full-screen copy dispatch as a fragment pass (BlitHelper::CopyDispatch).
 inline constexpr const char* CopyDispatch = "copy_dispatch_fs";
@@ -159,8 +160,9 @@ fragment float4 post_process_fs(FsTriOut in [[stage_in]], texture2d<float> tex [
     return float4(pp_gamma(c.rgb, pp.gamma), c.a);
 }
 
-// 0.5.1-e edge anti-aliasing: FXAA 3.11 quality (Timothy Lottes, public domain), luma computed
-// per tap. FIFA's 2-sample scene leaves full-pixel stair-steps on the 1080p display image, which
+// 0.5.1-e edge anti-aliasing: a port of the quality path of FXAA 3.11 by Timothy Lottes
+// (Copyright (c) 2014-2015, NVIDIA CORPORATION; BSD-3-Clause, gpu/third_party/fxaa/LICENSE.txt),
+// luma computed per tap. FIFA's 2-sample scene leaves full-pixel stair-steps on the 1080p display image, which
 // the scale to a Retina window then magnifies; this pass runs at the game's resolution, before
 // the scaler. `linear_input`: the texture view decodes sRGB, so luma takes a square root.
 struct EdgeAaParams {

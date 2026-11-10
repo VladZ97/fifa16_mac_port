@@ -12,7 +12,7 @@ Upstream survey 2026-11-09 (shadPS4 origin/main, 78 commits past the emulator fo
   Renderer changes are either equivalent here already (2831b681), micro-optimisations off FIFA's hot paths
   (914e78c3, 145932bf, 6add101d) or Vulkan-side refactors of code the Metal path replaced (c6b24ec1, 8e23388a,
   1eab1796, 99e33b7e); recompiler fixes target other games and would force a shader-cache rebuild.
-Local additions 2026-11-09 (0.5.1-e): edge anti-aliasing pass before scaling (FXAA 3.11, host_passes/pp_pass,
+Local additions 2026-11-09 (0.5.1-e): edge anti-aliasing pass before scaling (port of NVIDIA FXAA 3.11, BSD-3-Clause, notice in third_party/fxaa/LICENSE.txt; host_passes/pp_pass,
   renderer_metal/mtl_blit_shaders.h; BB_AA=0 disables); on-demand read-back edge-page release
   (texture_cache.cpp ReleaseOndemandTails / WriteBackImage, vk_rasterizer.cpp ResolveOndemandImages; BB_ODW_TAIL=0 disables).
 Local additions 2026-11-10 (0.5.1-f): forced anisotropy skipped on samplers with a positive LOD bias (vk_rasterizer.cpp;
